@@ -67,6 +67,5 @@ jobs:
           gh release create "$TAG" client/src-tauri/target/release/bundle/dmg/*.dmg \
             --repo "${{ github.repository }}" \
             --title "Airhand macOS arm64 ($TAG)" \
-            --notes "自动构建：$(uname -m) / macOS $(sw_vers -productVersion) / commit ${{ github.sha }}
-安装：拖动 Airhand.app 到「应用程序」。未签名（ad-hoc），首次打开请右键 →「打开」。"
+            --notes "自动构建 $(uname -m) / macOS $(sw_vers -productVersion) / commit ${GITHUB_SHA::7}。未签名（ad-hoc），首次打开请右键→打开。"
           gh release view "$TAG" --repo "${{ github.repository }}" --json url -q .url
