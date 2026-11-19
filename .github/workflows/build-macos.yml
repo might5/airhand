@@ -14,9 +14,16 @@ on:
 jobs:
   macos:
     name: macOS dmg (Apple Silicon)
-    runs-on: macos-14
+    runs-on: macos-15
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+
+      - name: 环境信息
+        run: |
+          uname -m
+          sw_vers
+          xcodebuild -version
 
       - uses: actions/setup-node@v4
         with:
