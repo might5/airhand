@@ -1,0 +1,3 @@
+label=macos-15
+arch=arm64
+sw=15.8.2
