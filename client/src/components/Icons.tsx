@@ -116,6 +116,37 @@ export const IconPower = (p: P) => base(p, <path d="M12 3v8M6.4 6.6a8 8 0 1 0 11
 export const IconRefresh = (p: P) =>
   base(p, <path d="M20 11a8 8 0 0 0-14.6-4.5M4 4v4h4M4 13a8 8 0 0 0 14.6 4.5M20 20v-4h-4" />);
 export const IconChevron = (p: P) => base(p, <path d="M6 9l6 6 6-6" />);
+/** 悬浮球里的四个点 */
+export const IconOrb = (p: P) =>
+  base(
+    p,
+    <>
+      <circle cx="9.2" cy="9.2" r="1.85" />
+      <circle cx="14.8" cy="9.2" r="1.85" />
+      <circle cx="9.2" cy="14.8" r="1.85" />
+      <circle cx="14.8" cy="14.8" r="1.85" />
+    </>,
+  );
+/** 收起顶栏，只看画面（专注模式） */
+export const IconCompact = (p: P) =>
+  base(
+    p,
+    <>
+      <rect x="3" y="4.5" width="18" height="15" rx="2.4" />
+      <path d="M3 9.5h18" opacity="0.4" />
+      <path d="M9.2 14.4l2.8 2.6 2.8-2.6" />
+    </>,
+  );
+/** 重新显示顶栏（退出专注模式） */
+export const IconRestoreBar = (p: P) =>
+  base(
+    p,
+    <>
+      <rect x="3" y="4.5" width="18" height="15" rx="2.4" />
+      <path d="M3 9.5h18" />
+      <path d="M9.2 16.4l2.8-2.6 2.8 2.6" />
+    </>,
+  );
 export const IconSwap = (p: P) => base(p, <path d="M7 4L3 8l4 4M3 8h14M17 20l4-4-4-4M21 16H7" />);
 export const IconFit = (p: P) =>
   base(

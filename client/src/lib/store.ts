@@ -22,6 +22,12 @@ export interface Draft {
   error: Problem | null;
 }
 
+/**
+ * 会话里的界面密度。
+ * full = 标签栏 + 工具栏都在；compact = 顶部两条都收起来，只剩远程画面和一个悬浮球，点悬浮球弹出工具栏。
+ */
+export type Chrome = "full" | "compact";
+
 /** 本次关闭的会话（Ctrl+Shift+T 重新打开最近关闭的一个） */
 export interface Recent {
   code: string;
@@ -53,6 +59,8 @@ interface State {
   app: AppInfo | null;
   decoders: Codec[];
   immersive: boolean;
+  /** 会话里的界面密度：记在本地，下次打开还是上次选的 */
+  chrome: Chrome;
   /** 画面增强（所有会话通用，见 enhance.ts） */
   enhance: EnhanceLevel;
   /**
@@ -65,6 +73,16 @@ interface State {
 const MAX_RECENT = 8;
 const ENHANCE_KEY = "airhand.enhance";
 const LOCAL_CURSOR_KEY = "airhand.localCursor";
+const CHROME_KEY = "airhand.chrome";
+
+/** 上次选的界面密度（读不到就是完整界面） */
+export function loadChrome(): Chrome {
+  try {
+    return globalThis.localStorage?.getItem(CHROME_KEY) === "compact" ? "compact" : "full";
+  } catch {
+    return "full";
+  }
+}
 
 /** 上次选的画面增强（读不到就是关） */
 export function loadEnhance(): EnhanceLevel {
@@ -115,6 +133,7 @@ let state: State = {
   app: null,
   decoders: ["h264"],
   immersive: false,
+  chrome: loadChrome(),
   enhance: loadEnhance(),
   localCursor: loadLocalCursor(),
 };
@@ -175,6 +194,12 @@ export const store = {
     set({ view, immersive: view === "new" || view === "grid" ? false : state.immersive });
   },
   setImmersive: (immersive: boolean) => set({ immersive }),
+  /** 界面密度：记在本机，下次打开控制台还是上次选的 */
+  setChrome: (chrome: Chrome) => {
+    if (chrome === state.chrome) return;
+    saveLocal(CHROME_KEY, chrome);
+    set({ chrome });
+  },
   /** 画面增强：记下来，所有会话马上按它重画 */
   setEnhance: (enhance: EnhanceLevel) => {
     if (enhance === state.enhance) return;

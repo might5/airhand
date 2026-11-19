@@ -7,39 +7,42 @@
  * 每一帧都要重算），只有临时出现的弹出层、全屏时的悬浮工具栏会这样。
  */
 :root {
-  /* 窗口最底层 */
-  --bg: #07080e;
-  /* 玻璃：由浅到深三档填充 */
-  --glass-1: rgba(255, 255, 255, 0.035);
-  --glass-2: rgba(255, 255, 255, 0.06);
-  --glass-3: rgba(255, 255, 255, 0.095);
-  /* 玻璃的描边 */
-  --edge: rgba(255, 255, 255, 0.08);
-  --edge-2: rgba(255, 255, 255, 0.12);
-  --edge-3: rgba(255, 255, 255, 0.2);
-  /* 玻璃顶部的高光 */
-  --sheen: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  /* 窗口最底层：中性石墨黑，不带蓝紫倾向 */
+  --bg: #0a0a0b;
+  /* 面：由浅到深三档填充（不用半透明玻璃，用实色叠出来的层次） */
+  --glass-1: rgba(255, 255, 255, 0.03);
+  --glass-2: rgba(255, 255, 255, 0.05);
+  --glass-3: rgba(255, 255, 255, 0.08);
+  /* 描边：细、克制 */
+  --edge: rgba(255, 255, 255, 0.07);
+  --edge-2: rgba(255, 255, 255, 0.11);
+  --edge-3: rgba(255, 255, 255, 0.18);
+  /* 顶部一道极细的高光 */
+  --sheen: inset 0 1px 0 rgba(255, 255, 255, 0.06);
   /* 输入框、地址栏：比周围更深 */
-  --well: rgba(0, 0, 0, 0.26);
-  /* 弹出层：不透明度要够，盖在任何东西上（包括没有模糊效果的地方）都看得清 */
-  --pop: rgba(21, 24, 36, 0.86);
-  --blur: blur(24px) saturate(165%);
-  --line: rgba(255, 255, 255, 0.06);
-  --line-2: rgba(255, 255, 255, 0.1);
-  --line-3: rgba(255, 255, 255, 0.18);
-  --hover: rgba(255, 255, 255, 0.06);
-  --hover-2: rgba(255, 255, 255, 0.1);
-  --text: #eef0f8;
-  --text-2: #a7aec5;
-  --text-3: #6e7693;
-  --brand-1: #7b5cff;
-  --brand-2: #4c7dff;
-  --brand-3: #12d3ee;
-  --brand: linear-gradient(135deg, var(--brand-1), var(--brand-2) 55%, var(--brand-3));
-  --accent: #7c95ff;
-  --good: #35d49a;
-  --ok: #f5b84a;
-  --bad: #ff5d6c;
+  --well: rgba(0, 0, 0, 0.34);
+  /* 弹出层：实色，盖在任何东西上都看得清 */
+  --pop: #17171a;
+  --blur: none;
+  --line: rgba(255, 255, 255, 0.055);
+  --line-2: rgba(255, 255, 255, 0.09);
+  --line-3: rgba(255, 255, 255, 0.16);
+  --hover: rgba(255, 255, 255, 0.055);
+  --hover-2: rgba(255, 255, 255, 0.09);
+  /* 文字：暖白 / 暖灰，纯中性，不用偏冷的蓝白 */
+  --text: #f1f0ed;
+  --text-2: #a2a19c;
+  --text-3: #6b6a65;
+  /* 品牌色收敛成一层「白金属」：主按钮、图标底用它，不再是紫蓝青渐变 */
+  --brand-1: #faf9f6;
+  --brand-2: #dedcd6;
+  --brand-3: #b9b7b0;
+  --brand: linear-gradient(180deg, var(--brand-1), var(--brand-2));
+  /* 唯一的彩色：极克制的暖沙，只用在焦点环和几处强调上 */
+  --accent: #cbb896;
+  --good: #4fb98a;
+  --ok: #e0a94a;
+  --bad: #f26574;
   --danger: #e5484d;
   --shadow: 0 22px 56px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.3);
   --shadow-soft: 0 10px 30px rgba(0, 0, 0, 0.28);
@@ -132,12 +135,9 @@ h3 {
   display: flex;
   flex-direction: column;
   height: 100%;
-  /* 极光：左上紫、右上蓝、右下青。都很淡，只是给玻璃一点可以透出来的颜色 */
+  /* 一层很淡的中性顶光，只是让纯黑不至于死平；没有彩色 */
   background:
-    radial-gradient(1100px 640px at 10% -14%, rgba(123, 92, 255, 0.2), transparent 62%),
-    radial-gradient(900px 560px at 98% -8%, rgba(76, 125, 255, 0.15), transparent 60%),
-    radial-gradient(1000px 720px at 90% 120%, rgba(18, 211, 238, 0.1), transparent 62%),
-    radial-gradient(800px 600px at -10% 108%, rgba(123, 92, 255, 0.1), transparent 60%),
+    radial-gradient(880px 400px at 50% -12%, rgba(255, 255, 255, 0.04), transparent 72%),
     var(--bg);
 }
 /* 全屏只看远程画面。macOS 带刘海的屏幕：刘海那一条留黑边，内容放到它下面（高度由 src-tauri/src/fullscreen.rs 给出） */
@@ -183,7 +183,7 @@ html.os-linux:not(.maximized) .app:not(.immersive)::after {
   flex-shrink: 0;
   display: grid;
   place-items: center;
-  filter: drop-shadow(0 2px 8px rgba(76, 125, 255, 0.4));
+  filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.55));
 }
 
 .tabstrip {
@@ -474,7 +474,7 @@ html.os-web .title-actions {
 }
 .am-head > svg {
   flex-shrink: 0;
-  filter: drop-shadow(0 6px 16px rgba(76, 125, 255, 0.35));
+  filter: drop-shadow(0 4px 12px rgba(0, 0, 0, 0.5));
 }
 .am-name {
   font-weight: 700;
@@ -840,11 +840,11 @@ kbd {
   border-radius: 13px;
   font-weight: 600;
   font-size: 15px;
-  color: #fff;
+  color: #0b0b0c;
   background: var(--brand);
   box-shadow:
-    0 10px 30px rgba(76, 125, 255, 0.32),
-    inset 0 1px 0 rgba(255, 255, 255, 0.28);
+    0 1px 0 rgba(255, 255, 255, 0.25) inset,
+    0 6px 18px rgba(0, 0, 0, 0.45);
   transition:
     transform 0.12s,
     box-shadow 0.2s,
@@ -852,10 +852,10 @@ kbd {
     background 0.2s;
 }
 .primary-btn:hover:not(:disabled) {
-  filter: brightness(1.08);
+  filter: brightness(1.05);
   box-shadow:
-    0 14px 38px rgba(76, 125, 255, 0.45),
-    inset 0 1px 0 rgba(255, 255, 255, 0.28);
+    0 1px 0 rgba(255, 255, 255, 0.35) inset,
+    0 10px 26px rgba(0, 0, 0, 0.5);
 }
 .primary-btn:active:not(:disabled) {
   transform: translateY(1px);
@@ -988,11 +988,11 @@ kbd {
   background: var(--hover);
 }
 .segmented button.active {
-  color: #fff;
-  background: linear-gradient(135deg, rgba(123, 92, 255, 0.85), rgba(76, 125, 255, 0.85));
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.12);
   box-shadow:
-    0 4px 14px rgba(76, 125, 255, 0.3),
-    inset 0 1px 0 rgba(255, 255, 255, 0.22);
+    inset 0 0 0 1px rgba(255, 255, 255, 0.13),
+    0 1px 0 rgba(0, 0, 0, 0.2);
 }
 .segmented button:disabled:not(.active) {
   opacity: 0.35;
@@ -1030,10 +1030,11 @@ kbd {
   transition: transform 0.15s;
 }
 .switch:checked {
-  background: linear-gradient(135deg, var(--brand-1), var(--brand-2));
+  background: linear-gradient(180deg, var(--brand-1), var(--brand-2));
 }
 .switch:checked::after {
   transform: translateX(16px);
+  background: #141415;
 }
 
 /* ───────── 弹出层 ───────── */
@@ -1092,8 +1093,9 @@ kbd {
   color: var(--text);
 }
 .dd-item.active {
-  color: #fff;
-  background: rgba(91, 124, 255, 0.2);
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 .dd-item.toggle {
   cursor: pointer;
@@ -1190,27 +1192,16 @@ kbd {
   flex-direction: column;
   gap: 22px;
 }
-/* 卡片后面的两团光：透过毛玻璃隐约看得到 */
-.nt-wrap::before,
-.nt-wrap::after {
+/* 卡片后面不再放光团；留一条极淡的竖向辅助线，只是让版面有个骨架 */
+.nt-wrap::before {
   content: "";
   position: absolute;
-  border-radius: 50%;
+  left: -28px;
+  top: 8px;
+  bottom: 8px;
+  width: 1px;
+  background: linear-gradient(180deg, transparent, rgba(255, 255, 255, 0.07), transparent);
   pointer-events: none;
-}
-.nt-wrap::before {
-  width: 360px;
-  height: 360px;
-  left: -120px;
-  top: -70px;
-  background: radial-gradient(circle, rgba(123, 92, 255, 0.42), transparent 68%);
-}
-.nt-wrap::after {
-  width: 340px;
-  height: 340px;
-  right: -130px;
-  top: 230px;
-  background: radial-gradient(circle, rgba(18, 211, 238, 0.24), transparent 68%);
 }
 .nt-wrap > * {
   position: relative;
@@ -1221,14 +1212,12 @@ kbd {
   flex-direction: column;
   gap: 18px;
   padding: 30px 32px 28px;
-  border-radius: 22px;
-  background: linear-gradient(155deg, rgba(255, 255, 255, 0.085), rgba(255, 255, 255, 0.03) 45%, rgba(255, 255, 255, 0.02));
-  border: 1px solid var(--edge-2);
-  -webkit-backdrop-filter: blur(30px) saturate(150%);
-  backdrop-filter: blur(30px) saturate(150%);
+  border-radius: 16px;
+  background: #141416;
+  border: 1px solid rgba(255, 255, 255, 0.075);
   box-shadow:
-    0 30px 70px rgba(0, 0, 0, 0.42),
-    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+    0 1px 0 rgba(255, 255, 255, 0.04) inset,
+    0 24px 56px rgba(0, 0, 0, 0.55);
 }
 .nt-head {
   display: flex;
@@ -1240,13 +1229,15 @@ kbd {
 .hero-icon {
   width: 56px;
   height: 56px;
-  border-radius: 18px;
+  border-radius: 17px;
   display: grid;
   place-items: center;
-  background: var(--brand);
+  color: var(--text);
+  background: linear-gradient(180deg, #26262a, #1a1a1d);
+  border: 1px solid rgba(255, 255, 255, 0.09);
   box-shadow:
-    0 14px 36px rgba(76, 125, 255, 0.4),
-    inset 0 1px 0 rgba(255, 255, 255, 0.35);
+    0 1px 0 rgba(255, 255, 255, 0.07) inset,
+    0 10px 24px rgba(0, 0, 0, 0.45);
 }
 .nt-head h1 {
   margin-top: 4px;
@@ -1305,15 +1296,15 @@ kbd {
   margin-left: 12px;
 }
 .code-box:focus {
-  border-color: rgba(124, 149, 255, 0.9);
-  background: rgba(91, 124, 255, 0.08);
+  border-color: rgba(203, 184, 150, 0.75);
+  background: rgba(255, 255, 255, 0.035);
   box-shadow:
-    0 0 0 4px rgba(91, 124, 255, 0.18),
-    inset 0 2px 6px rgba(0, 0, 0, 0.15);
+    0 0 0 3px rgba(203, 184, 150, 0.13),
+    inset 0 2px 6px rgba(0, 0, 0, 0.2);
 }
 .code-box.filled {
-  border-color: rgba(140, 118, 255, 0.5);
-  background: rgba(123, 92, 255, 0.07);
+  border-color: rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.035);
 }
 .code-box:disabled {
   opacity: 0.6;
@@ -1339,8 +1330,8 @@ kbd {
   font-variant-numeric: tabular-nums;
 }
 .pairing-input:focus {
-  border-color: rgba(124, 149, 255, 0.9);
-  box-shadow: 0 0 0 4px rgba(91, 124, 255, 0.18);
+  border-color: rgba(203, 184, 150, 0.75);
+  box-shadow: 0 0 0 3px rgba(203, 184, 150, 0.13);
 }
 .pairing-input.invalid:not(:focus) {
   border-color: rgba(255, 93, 108, 0.45);
@@ -1432,8 +1423,8 @@ kbd {
   gap: 12px;
   padding: 8px 12px;
   border-radius: 11px;
-  background: rgba(91, 124, 255, 0.12);
-  border: 1px solid rgba(91, 124, 255, 0.28);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   font-size: 12.5px;
   color: var(--text-2);
   animation: pop 0.14s ease-out;
@@ -1559,7 +1550,7 @@ kbd {
   align-items: center;
   gap: 10px;
   padding: 0 8px;
-  background: rgba(12, 14, 22, 0.55);
+  background: rgba(13, 13, 14, 0.62);
   border-top: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
   position: relative;
@@ -1677,8 +1668,8 @@ kbd {
   text-overflow: ellipsis;
 }
 .tag.hw {
-  color: #9fd9ff;
-  background: rgba(18, 211, 238, 0.1);
+  color: var(--accent);
+  background: rgba(203, 184, 150, 0.1);
 }
 .tb-right {
   flex: none;
@@ -1740,7 +1731,7 @@ kbd {
   flex: 1;
   min-height: 0;
   position: relative;
-  background: #05060a;
+  background: #08080a;
 }
 .canvas-host {
   position: absolute;
@@ -1846,8 +1837,9 @@ kbd {
   }
 }
 
-/* 全屏（沉浸模式）：标签栏隐藏，工具栏悬浮，鼠标移到屏幕顶端时出现（显示 / 收起见 SessionView 的 useToolbarReveal） */
-.session-view.immersive .toolbar {
+/* 工具栏浮在画面上（.bar-overlay）：全屏时鼠标碰顶端出现，专注模式时点悬浮球出现。
+ * 控制显示 / 收起的是 SessionView 的 useToolbarReveal 和 barOpen。 */
+.session-view.bar-overlay .toolbar {
   position: absolute;
   top: 8px;
   left: 50%;
@@ -1872,9 +1864,61 @@ kbd {
   height: 6px;
   z-index: 6;
 }
-.session-view.immersive .toolbar.revealed,
-.session-view.immersive:has(.popover) .toolbar {
+.session-view.bar-overlay .toolbar.revealed,
+.session-view.bar-overlay:has(.popover) .toolbar {
   transform: translate(-50%, 0);
+}
+/* 专注模式（不是全屏）：工具栏往下挪一点，给窗口边缘留出气息 */
+.session-view.bar-overlay:not(.immersive) .toolbar {
+  top: 10px;
+}
+
+/* ───────── 专注模式的悬浮球 ─────────
+ * 画面上唯一常驻的东西。默认钉在右下角，拖动过就记住位置（见 FloatingBall.tsx）。
+ * 注意：这一层不能用 backdrop-filter —— 它常驻，远程画面每一帧都要重算模糊，白吃性能；
+ * 用够实的底色 + 描边代替，亮背景上也分得清。 */
+.orb {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border-radius: 50%;
+  color: var(--text-2);
+  background: rgba(16, 16, 18, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.35),
+    0 6px 18px rgba(0, 0, 0, 0.5);
+  z-index: 4;
+  opacity: 0.62;
+  touch-action: none;
+  cursor: grab;
+  transition:
+    opacity 0.15s,
+    color 0.15s,
+    background 0.15s,
+    border-color 0.15s,
+    transform 0.12s;
+}
+/* 拖动过：位置改由 left / top 决定 */
+.orb.placed {
+  right: auto;
+  bottom: auto;
+}
+.orb:hover,
+.orb.open {
+  opacity: 1;
+  color: var(--text);
+  background: rgba(26, 26, 29, 0.92);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+.orb:active {
+  cursor: grabbing;
+  transform: scale(0.96);
 }
 
 /* ───────── 画质面板 ─────────
@@ -1989,7 +2033,7 @@ input[type="range"]::-webkit-slider-thumb {
   height: 16px;
   border-radius: 50%;
   background: #fff;
-  box-shadow: 0 0 0 4px rgba(91, 124, 255, 0.45);
+  box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.18);
   cursor: pointer;
 }
 
@@ -2028,17 +2072,17 @@ input[type="range"]::-webkit-slider-thumb {
     box-shadow 0.15s;
 }
 .tile:hover {
-  border-color: rgba(123, 92, 255, 0.6);
+  border-color: rgba(255, 255, 255, 0.22);
   box-shadow:
     0 12px 34px rgba(0, 0, 0, 0.35),
-    0 0 0 1px rgba(123, 92, 255, 0.25),
+    0 0 0 1px rgba(255, 255, 255, 0.08),
     var(--sheen);
 }
 .tile-screen {
   flex: 1;
   min-height: 0;
   position: relative;
-  background: #05060a;
+  background: #08080a;
 }
 .tile-overlay {
   position: absolute;

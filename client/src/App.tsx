@@ -50,6 +50,7 @@ function Console() {
   const view = useStore((s) => s.view);
   const sessions = useStore((s) => s.sessions);
   const immersive = useStore((s) => s.immersive);
+  const chrome = useStore((s) => s.chrome);
 
   useEffect(() => {
     const unLang = api.onLangChanged(setLang);
@@ -112,10 +113,12 @@ function Console() {
   }, [immersive]);
 
   const active = sessions.find((s) => s.id === view);
+  // 专注模式：有会话时把标签栏也收起来（没会话的话还得靠标签栏切换，不能收）
+  const compact = chrome === "compact" && !!active;
 
   return (
-    <div className={`app ${immersive ? "immersive" : ""}`}>
-      {!immersive && <TitleBar />}
+    <div className={`app ${immersive ? "immersive" : ""} ${compact ? "compact" : ""}`}>
+      {!immersive && !compact && <TitleBar />}
       <main className="main">
         {view === "grid" && sessions.length > 0 ? (
           <GridView />

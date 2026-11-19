@@ -9,6 +9,7 @@ import { store, useSession, useSessionTitle, useStore } from "../lib/store";
 import {
   IconChevron,
   IconClipboard,
+  IconCompact,
   IconCpu,
   IconExpand,
   IconFit,
@@ -19,12 +20,14 @@ import {
   IconMouse,
   IconPower,
   IconRefresh,
+  IconRestoreBar,
   IconShrink,
   IconSliders,
   IconVolume,
   IconVolumeOff,
   IconWarn,
 } from "./Icons";
+import { FloatingBall } from "./FloatingBall";
 import { Popover } from "./Popover";
 import { QualityPanel, fmtKbps } from "./QualityPanel";
 
@@ -161,13 +164,33 @@ export function SessionView({ s }: { s: RemoteSession }) {
       s.closedReason?.kind === "pairingUnavailable" ||
       s.closedReason?.kind === "hostKeyChanged");
   const toolbarRef = useRef<HTMLElement>(null);
-  const revealed = useToolbarReveal(immersive, toolbarRef);
+  const reveal = useToolbarReveal(immersive, toolbarRef);
+  // 专注模式：工具栏默认收着，点悬浮球才出来；菜单开着的时候不收起（见下面的 CSS :has(.popover)）
+  const compact = useStore((st) => st.chrome === "compact");
+  // 两种情况下工具栏都浮在画面上：全屏、专注模式
+  const overlay = immersive || compact;
+  const [barOpen, setBarOpen] = useState(false);
+  const shown = overlay ? (immersive ? reveal : barOpen) : true;
   // 菜单关掉后键盘回到远程画面（例如按 Esc 关掉画质面板后接着打字）
   const closeMenu = useCallback(() => {
     setMenu(null);
     s.focus();
   }, [s]);
   const toggleMenu = (m: Menu) => setMenu((cur) => (cur === m ? null : m));
+
+  // 专注模式：按 Esc 收起工具栏，接着就能直接操作远程画面
+  useEffect(() => {
+    if (!compact || !barOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setBarOpen(false);
+      closeMenu();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [compact, barOpen, closeMenu]);
 
   useEffect(() => {
     if (!toast) return;
@@ -209,12 +232,12 @@ export function SessionView({ s }: { s: RemoteSession }) {
   const rttClass = rtt == null ? "" : rtt < 60 ? "good" : rtt < 150 ? "ok" : "bad";
 
   return (
-    <div className={`session-view ${immersive ? "immersive" : ""}`}>
+    <div className={`session-view ${immersive ? "immersive" : ""} ${overlay ? "bar-overlay" : ""}`}>
       {immersive && <div className="hot-edge" />}
-      <header ref={toolbarRef} className={`toolbar ${revealed ? "revealed" : ""}`}>
+      <header ref={toolbarRef} className={`toolbar ${shown ? "revealed" : ""}`}>
         {/* 像浏览器的地址栏：连的是哪台、现在怎么样 */}
         <div className="addr">
-          {immersive && multi ? (
+          {overlay && multi ? (
             // 全屏时看不到标签栏：在这里切换到其它连接
             <div className="menu-anchor addr-switch">
               <button
@@ -494,6 +517,18 @@ export function SessionView({ s }: { s: RemoteSession }) {
           >
             <IconFit size={17} />
           </button>
+          {/* 专注模式：把标签栏和工具栏都收起来，只留画面和一个悬浮球 */}
+          <button
+            className={`tb-btn icon ${compact ? "on" : ""}`}
+            title={compact ? t("session.restoreBar") : t("session.hideBar")}
+            onClick={() => {
+              closeMenu();
+              setBarOpen(false);
+              store.setChrome(compact ? "full" : "compact");
+            }}
+          >
+            {compact ? <IconRestoreBar size={17} /> : <IconCompact size={17} />}
+          </button>
           <button
             className={`tb-btn icon ${immersive ? "on" : ""}`}
             title={immersive ? t("session.exitFullscreen") : t("session.fullscreen")}
@@ -598,6 +633,19 @@ export function SessionView({ s }: { s: RemoteSession }) {
         )}
         {toast && <div className="toast">{toast}</div>}
       </div>
+
+      {/* 专注模式：画面上只留这一个球，点开是工具栏，再点收起。可以拖，位置记在本机 */}
+      {compact && !immersive && (
+        <FloatingBall
+          open={barOpen}
+          title={barOpen ? t("session.collapseBar") : t("session.showBar")}
+          onToggle={() => {
+            setBarOpen((v) => !v);
+            if (barOpen) closeMenu();
+            s.focus();
+          }}
+        />
+      )}
     </div>
   );
 }
