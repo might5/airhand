@@ -7,8 +7,9 @@
  * 每一帧都要重算），只有临时出现的弹出层、全屏时的悬浮工具栏会这样。
  */
 :root {
-  /* 窗口最底层：中性石墨灰（不是死黑，纯黑在暗环境里太扎眼），不带蓝紫倾向 */
-  --bg: #131315;
+  /* 窗口最底层：深蓝灰（参考设计稿主背景 #1a2035，压暗一档到 #171b26 免得整屏发亮）。
+   * 只带一点冷调，不出紫不出青；纯黑在暗环境里太扎眼 */
+  --bg: #171b26;
   /* 面：由浅到深三档填充（不用半透明玻璃，用实色叠出来的层次） */
   --glass-1: rgba(255, 255, 255, 0.03);
   --glass-2: rgba(255, 255, 255, 0.05);
@@ -20,9 +21,9 @@
   /* 顶部一道极细的高光 */
   --sheen: inset 0 1px 0 rgba(255, 255, 255, 0.06);
   /* 输入框、地址栏：比周围更深 */
-  --well: rgba(0, 0, 0, 0.34);
+  --well: rgba(0, 0, 0, 0.42);
   /* 弹出层：实色，盖在任何东西上都看得清 */
-  --pop: #1d1d21;
+  --pop: #20242f;
   --blur: none;
   --line: rgba(255, 255, 255, 0.055);
   --line-2: rgba(255, 255, 255, 0.09);
@@ -1186,6 +1187,11 @@ kbd {
   overflow-y: auto;
   display: flex;
   padding: 36px 24px;
+  /* 设计稿的主背景是深蓝灰（#1a2035 一类）加一层自画面中上部散开的灰蓝光晕，
+   * 静态渐变、没有动效、没有青绿。登录页铺这一层，底就不再是死黑一片 */
+  background:
+    radial-gradient(760px 480px at 50% 16%, rgba(122, 146, 192, 0.22), transparent 70%),
+    linear-gradient(180deg, #1c2233 0%, #171b26 70%);
 }
 .nt-wrap {
   position: relative;
@@ -1216,11 +1222,11 @@ kbd {
   gap: 18px;
   padding: 30px 32px 28px;
   border-radius: 16px;
-  background: #1b1b1e;
-  border: 1px solid rgba(255, 255, 255, 0.075);
+  background: #252a36;
+  border: 1px solid rgba(255, 255, 255, 0.06);
   box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.04) inset,
-    0 24px 56px rgba(0, 0, 0, 0.55);
+    0 1px 0 rgba(255, 255, 255, 0.05) inset,
+    0 24px 56px rgba(0, 0, 0, 0.45);
 }
 .nt-head {
   display: flex;
@@ -1236,7 +1242,7 @@ kbd {
   display: grid;
   place-items: center;
   color: var(--text);
-  background: linear-gradient(180deg, #26262a, #1a1a1d);
+  background: linear-gradient(180deg, #2c3140, #202431);
   border: 1px solid rgba(255, 255, 255, 0.09);
   box-shadow:
     0 1px 0 rgba(255, 255, 255, 0.07) inset,
@@ -1734,7 +1740,7 @@ kbd {
   flex: 1;
   min-height: 0;
   position: relative;
-  background: #131315;
+  background: #12161f;
 }
 .canvas-host {
   position: absolute;
@@ -2090,7 +2096,7 @@ input[type="range"]::-webkit-slider-thumb {
   flex: 1;
   min-height: 0;
   position: relative;
-  background: #131315;
+  background: #12161f;
 }
 .tile-overlay {
   position: absolute;

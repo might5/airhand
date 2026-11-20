@@ -25,6 +25,7 @@ import {
   IconWinMaximize,
   IconWinMinimize,
   IconWinRestore,
+  OsIcon,
 } from "./Icons";
 import { Logo } from "./Logo";
 
@@ -199,7 +200,10 @@ function SessionTab({
         ) : s.state === "closed" ? (
           <IconWarn size={14} className="tab-warn" />
         ) : (
-          <span className={`avatar tiny ${s.state}`}>{name.slice(0, 1).toUpperCase()}</span>
+          // 图标跟设备列表保持一致：按对端上报的系统用品牌图标（不在连接中/已关闭时上面已经换成转圈和警告）
+          <span className={`avatar tiny ${s.state}`} aria-hidden>
+            <OsIcon os={s.hostOs} size={11} />
+          </span>
         )}
       </span>
       <span className="tab-title">{name}</span>
