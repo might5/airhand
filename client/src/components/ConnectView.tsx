@@ -14,7 +14,7 @@ import { store, useSession, useStore, type Draft } from "../lib/store";
 
 /** 这些问题要用户输入配对码（对方的身份变了也是：重新配对才认新的身份） */
 const PAIRING_PROBLEMS = new Set(["pairingRequired", "pairingFailed", "pairingUnavailable", "hostKeyChanged"]);
-import { IconBolt, IconClose, IconMonitor, IconPencil, IconSearch, IconWarn } from "./Icons";
+import { IconBolt, IconClose, IconMonitor, IconPencil, IconSearch, IconWarn, OsIcon } from "./Icons";
 
 export function ConnectView() {
   const t = useT();
@@ -366,7 +366,10 @@ function DeviceItem({
       onClick={() => !off && !editing && onOpen()}
       onKeyDown={(e) => e.key === "Enter" && !off && !editing && onOpen()}
     >
-      <span className="avatar">{title.slice(0, 1).toUpperCase()}</span>
+      {/* 图标按对端系统来（苹果 / Windows / 安卓 / Linux），比白底首字母好认得多 */}
+      <span className="avatar" aria-hidden>
+        <OsIcon os={d.os} size={19} />
+      </span>
       <span className="device-meta">
         {editing ? (
           <input

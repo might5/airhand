@@ -3,12 +3,12 @@
  * 整个窗口铺一层很淡的极光渐变（.app 的背景），标题栏、页面都是透明的，能看到它；
  * 卡片、弹出层、对话框是半透明的"毛玻璃"：浅色描边 + 顶部一道高光 + 背景模糊。
  *
- * 远程画面所在的区域（.stage）始终是不透明的黑底；画面上面尽量不放会模糊的层（backdrop-filter
+ * 远程画面所在的区域（.stage）是不透明的深灰底；画面上面尽量不放会模糊的层（backdrop-filter
  * 每一帧都要重算），只有临时出现的弹出层、全屏时的悬浮工具栏会这样。
  */
 :root {
-  /* 窗口最底层：中性石墨黑，不带蓝紫倾向 */
-  --bg: #0a0a0b;
+  /* 窗口最底层：中性石墨灰（不是死黑，纯黑在暗环境里太扎眼），不带蓝紫倾向 */
+  --bg: #131315;
   /* 面：由浅到深三档填充（不用半透明玻璃，用实色叠出来的层次） */
   --glass-1: rgba(255, 255, 255, 0.03);
   --glass-2: rgba(255, 255, 255, 0.05);
@@ -22,7 +22,7 @@
   /* 输入框、地址栏：比周围更深 */
   --well: rgba(0, 0, 0, 0.34);
   /* 弹出层：实色，盖在任何东西上都看得清 */
-  --pop: #17171a;
+  --pop: #1d1d21;
   --blur: none;
   --line: rgba(255, 255, 255, 0.055);
   --line-2: rgba(255, 255, 255, 0.09);
@@ -135,7 +135,7 @@ h3 {
   display: flex;
   flex-direction: column;
   height: 100%;
-  /* 一层很淡的中性顶光，只是让纯黑不至于死平；没有彩色 */
+  /* 一层很淡的中性顶光，只是让底色不至于死平；没有彩色 */
   background:
     radial-gradient(880px 400px at 50% -12%, rgba(255, 255, 255, 0.04), transparent 72%),
     var(--bg);
@@ -778,6 +778,8 @@ kbd {
     opacity: 0.35;
   }
 }
+/* 设备图标位：中性深底 + 细描边，里面放对端系统的品牌图标（见 Icons.tsx 的 OsIcon）。
+ * 以前是白金属渐变底 + 白色首字母，白底白字几乎看不清，现在换成浅色图标压深底。 */
 .avatar {
   width: 34px;
   height: 34px;
@@ -787,9 +789,10 @@ kbd {
   flex-shrink: 0;
   font-weight: 700;
   font-size: 14px;
-  color: #fff;
-  background: var(--brand);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--edge-2);
+  box-shadow: none;
 }
 .avatar.tiny {
   width: 18px;
@@ -1213,7 +1216,7 @@ kbd {
   gap: 18px;
   padding: 30px 32px 28px;
   border-radius: 16px;
-  background: #141416;
+  background: #1b1b1e;
   border: 1px solid rgba(255, 255, 255, 0.075);
   box-shadow:
     0 1px 0 rgba(255, 255, 255, 0.04) inset,
@@ -1731,7 +1734,7 @@ kbd {
   flex: 1;
   min-height: 0;
   position: relative;
-  background: #08080a;
+  background: #131315;
 }
 .canvas-host {
   position: absolute;
@@ -1850,10 +1853,12 @@ kbd {
   background: var(--pop);
   -webkit-backdrop-filter: var(--blur);
   backdrop-filter: var(--blur);
-  box-shadow:
-    var(--shadow),
-    var(--sheen);
-  transition: transform 0.2s ease;
+  /* 收起态没有投影：元素只是往上平移出可视区，仍然在绘制，
+     带 shadow 的话向下 22px 的偏移 + 56px 的模糊会渗进画面顶部，看起来像蒙了一层灰。 */
+  box-shadow: none;
+  transition:
+    transform 0.2s ease,
+    box-shadow 0.2s ease;
 }
 /* 顶端热区：挡住远程画面，免得点到远端 */
 .hot-edge {
@@ -1867,6 +1872,9 @@ kbd {
 .session-view.bar-overlay .toolbar.revealed,
 .session-view.bar-overlay:has(.popover) .toolbar {
   transform: translate(-50%, 0);
+  box-shadow:
+    var(--shadow),
+    var(--sheen);
 }
 /* 专注模式（不是全屏）：工具栏往下挪一点，给窗口边缘留出气息 */
 .session-view.bar-overlay:not(.immersive) .toolbar {
@@ -2082,7 +2090,7 @@ input[type="range"]::-webkit-slider-thumb {
   flex: 1;
   min-height: 0;
   position: relative;
-  background: #08080a;
+  background: #131315;
 }
 .tile-overlay {
   position: absolute;

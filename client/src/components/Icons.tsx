@@ -217,6 +217,68 @@ export const IconSearch = (p: P) =>
     </>,
   );
 
+// ───────── 平台图标（设备列表用） ─────────
+// 这些是品牌标识，用实心剪影比描边更容易一眼认出；颜色跟着 currentColor。
+function solid(size: number, children: React.ReactNode) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden>
+      {children}
+    </svg>
+  );
+}
+export const IconApple = ({ size = 18 }: { size?: number }) =>
+  solid(
+    size,
+    <>
+      <path d="M16.9 12.6c0-2.5 2-3.7 2.1-3.8-1.2-1.7-3-1.9-3.6-1.9-1.5-.2-3 .9-3.8.9-.8 0-2-.9-3.3-.9-1.7 0-3.2 1-4.1 2.5-1.7 3-.4 7.5 1.3 9.9.8 1.2 1.8 2.5 3.1 2.5 1.2 0 1.7-.8 3.2-.8s1.9.8 3.2.8c1.3 0 2.2-1.2 3-2.4.9-1.4 1.3-2.8 1.3-2.8-.1 0-2.6-1-2.6-4z" />
+      <path d="M14.3 5.3c.7-.8 1.1-2 1-3.2-1 0-2.2.7-2.9 1.5-.6.8-1.2 2-1 3.1 1.1.1 2.2-.6 2.9-1.4z" />
+    </>,
+  );
+export const IconWindows = ({ size = 18 }: { size?: number }) =>
+  solid(
+    size,
+    <path d="M3 4.9l8.3-1.2v8.1H3zm9.4-.2L21 3.2v8.6h-8.6zM3 13.1h8.3v8.1L3 20zM12.4 13.1H21v8.6l-8.6-1.5z" />,
+  );
+export const IconAndroid = ({ size = 18 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={1.7}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    aria-hidden
+  >
+    <path d="M5.4 16.8v-4.6a6.6 6.6 0 0 1 13.2 0v4.6z" />
+    <path d="M7.6 6.9L5.7 4.4M16.4 6.9l1.9-2.5" />
+    <circle cx="9.1" cy="12.6" r=".95" fill="currentColor" stroke="none" />
+    <circle cx="14.9" cy="12.6" r=".95" fill="currentColor" stroke="none" />
+    <path d="M10.6 18.6v1.7M13.4 18.6v1.7" strokeWidth={1.5} />
+  </svg>
+);
+/** Linux：企鹅剪影（眼睛、肚子挖空），比画个终端好认 */
+export const IconLinux = ({ size = 18 }: { size?: number }) =>
+  solid(
+    size,
+    <path
+      fillRule="evenodd"
+      clipRule="evenodd"
+      d="M12 2.9c-2.4 0-3.7 2-3.7 4.4 0 1 .2 1.9.5 2.6-1.4 2-2.7 4.6-2.7 6.7 0 2.3 2.6 3.8 5.9 3.8s5.9-1.5 5.9-3.8c0-2.1-1.3-4.7-2.7-6.7.3-.7.5-1.6.5-2.6 0-2.4-1.3-4.4-3.7-4.4zM10.3 6.1a.95.95 0 1 1 1.9 0 .95.95 0 0 1-1.9 0zm3.4 0a.95.95 0 1 1 1.9 0 .95.95 0 0 1-1.9 0zM12 13.2c1.6 0 2.9 1.1 2.9 2.6s-1.3 2.6-2.9 2.6-2.9-1.1-2.9-2.6 1.3-2.6 2.9-2.6z"
+    />,
+  );
+
+/** 按对端报上来的系统名挑图标；认不出来就退回显示器 */
+export function OsIcon({ os, size = 18 }: { os: string; size?: number }) {
+  const s = (os || "").toLowerCase();
+  if (/mac|darwin|os ?x|apple|ios|ipad/.test(s)) return <IconApple size={size} />;
+  if (/win/.test(s)) return <IconWindows size={size} />;
+  if (/android/.test(s)) return <IconAndroid size={size} />;
+  if (/linux|ubuntu|debian|fedora|centos|arch|unix|bsd|chrome ?os/.test(s)) return <IconLinux size={size} />;
+  return <IconMonitor size={size} />;
+}
+
 // 窗口按钮：细线图标（10×10），与 Windows 11 的标题栏按钮一致
 function win(children: React.ReactNode) {
   return (
