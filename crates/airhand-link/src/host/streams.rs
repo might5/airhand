@@ -17,32 +17,35 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use airhand_proto::SessionLane;
 use airhand_proto::datagram;
 use airhand_proto::framing;
-use airhand_proto::handshake::{Confirm, Negotiated, PublicKey};
+use airhand_proto::handshake::{Confirm, PublicKey};
 use airhand_proto::session::{
     ControllerDatagram, ControllerMsg, DirectOffer, HostDatagram, InputEvent, MAX_CLIPBOARD_TEXT,
-    QualitySettings,
+    QualitySettings, StreamView,
 };
+use airhand_proto::{MAX_STREAMS, SessionLane};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use tokio::sync::{Notify, mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::Incoming;
 use super::clock::InputClock;
 use super::queue::{self, Outbox};
 use super::session::{Acks, MicSink, Request};
-use super::write::{Writers, write_all};
+use super::write::{FrameStreams, Writers, write_all};
 use crate::audio::Unbundler;
 use crate::direct;
+use crate::files::Files;
 use crate::lanes::{Via, first_stream, open_lane};
-use crate::merge::{Merge, Policy};
+use crate::merge::Merge;
 use crate::paths::{DatagramSender, Paths};
 use crate::secure::{self, Admission, Gate, Opener, ResponderParams, STEP_TIMEOUT};
 use crate::tasks::OwnedTask;
 use crate::transport::{next_msg, open_datagram};
+use airhand_proto::files::FileMsg;
+use airhand_proto::session::HostMsg;
 
 /// 被控端一个会话的链路。
 ///
@@ -55,8 +58,8 @@ use crate::transport::{next_msg, open_datagram};
 pub struct HostStreams {
     /// 控制消息（控制通道、大块通道）
     pub out: Outbox,
-    /// 画面包（[`airhand_proto::media::frame`] 编好的）
-    pub video: mpsc::Sender<Bytes>,
+    /// 画面包（[`airhand_proto::media::frame`] 编好的）：第 `i` 项是第 `i` 路（见 `airhand_proto::session` 的"多屏"）
+    pub video: Vec<mpsc::Sender<Bytes>>,
     /// 声音包（同上）
     pub audio: mpsc::Sender<Bytes>,
     /// 控制端的请求、确认
@@ -66,6 +69,9 @@ pub struct HostStreams {
     reader: OwnedTask<Result<()>>,
     /// 直连任务（有直连时才有，见 [`crate::direct::host`]）：会话开始之后（[`HostStreams::started`]）才开始
     direct: Option<OwnedTask<()>>,
+    /// 剪贴板文件处理端和收文件流的任务（见 [`crate::files`]）。
+    pub files: Option<Files>,
+    _files_task: Option<OwnedTask<()>>,
     started: Arc<Notify>,
     /// 在中转连接上的登记：会话结束时注销
     _registration: crate::lanes::Registration,
@@ -134,8 +140,11 @@ impl ControllerReceiver {
 
 /// 读任务自己处理的事（见模块说明）：
 ///
-/// * Ping：马上回 Pong。同意之前也回：控制端不会把等待当成失联；
-/// * 画面确认：马上交给平台的 [`Acks`]；
+/// * Ping：马上回 Pong（会话的主循环忙着的时候也回：控制端不会把它当成失联）；
+/// * 画面确认：马上交给平台的 [`Acks`]（帧流：确认了的帧流不用管了）；
+/// * 等不到帧了（帧流）：马上交给平台的 [`Acks`]，平台要恢复的话放弃之后的帧流；
+/// * 帧流的接收报告直接交给平台的码率控制。
+/// * 和画面有关的都带着是第几路（见 `airhand_proto::session` 的"多屏"），各交各的；没有的路不管；
 /// * 控制端麦克风的声音包：马上交给平台的 [`MicSink`]；
 /// * 任何消息都记下收到的时刻，会话据此发现失联（[`super::PEER_TIMEOUT`]）。
 #[derive(Clone)]
@@ -145,6 +154,8 @@ pub(crate) struct Express {
     mic: Arc<OnceLock<Arc<dyn MicSink>>>,
     /// 上次收到控制端消息的时刻（tokio 的时钟：测试里可以拨）
     heard: Arc<Mutex<tokio::time::Instant>>,
+    /// 每一路在途的帧流
+    frames: Vec<Arc<FrameStreams>>,
 }
 
 impl Express {
@@ -155,7 +166,14 @@ impl Express {
             acks: Arc::default(),
             mic: Arc::default(),
             heard: Arc::new(Mutex::new(tokio::time::Instant::now())),
+            frames: Vec::new(),
         }
+    }
+
+    /// 画面用帧流（每一路一个）：确认了的帧流不用管了，等不到的帧放弃
+    fn with_frames(mut self, frames: Vec<Arc<FrameStreams>>) -> Self {
+        self.frames = frames;
+        self
     }
 
     /// 控制端麦克风的一个声音包（还没有人收时丢掉）
@@ -175,9 +193,39 @@ impl Express {
         self.heard();
         match m {
             ControllerDatagram::Ping { t } => (self.pong)(t),
-            ControllerDatagram::Ack { seq, arrived } => {
+            // 没有这一路：不管
+            ControllerDatagram::Ack { stream, .. }
+            | ControllerDatagram::Lost { stream, .. }
+            | ControllerDatagram::Report { stream, .. }
+                if stream >= MAX_STREAMS => {}
+            ControllerDatagram::Ack {
+                seq,
+                arrived,
+                stream,
+            } => {
                 if let Some(acks) = self.acks.get() {
-                    acks.ack(seq, arrived);
+                    acks.ack(stream, seq, arrived);
+                }
+                if let Some(f) = self.frames.get(stream as usize) {
+                    f.acked(seq);
+                }
+            }
+            ControllerDatagram::Report { report, stream } => {
+                if let Some(acks) = self.acks.get() {
+                    acks.feedback(stream, report);
+                }
+            }
+            // 平台开始恢复时，停止重传已作废的帧。
+            ControllerDatagram::Lost { decoded, stream } => {
+                let recover = self.acks.get().is_some_and(|a| a.lost(stream, decoded));
+                if recover && let Some(f) = self.frames.get(stream as usize) {
+                    let n = f.abandon(decoded);
+                    debug!(
+                        stream,
+                        decoded,
+                        abandoned = n,
+                        "the controller lost a frame, recovering"
+                    );
                 }
             }
             // 直连任务的事（读任务转给它）
@@ -198,8 +246,15 @@ pub(crate) fn request(m: ControllerMsg) -> Option<Request> {
             Request::Input(events)
         }
         ControllerMsg::Settings(s) => Request::Settings(s.sanitized()),
-        ControllerMsg::RequestKeyframe { after } => Request::Keyframe(Some(after)),
-        ControllerMsg::SelectDisplay { index } => Request::SelectDisplay(index),
+        ControllerMsg::RequestKeyframe { after, stream } => {
+            Request::Keyframe(Some((stream, after)))
+        }
+        ControllerMsg::SelectDisplay { index } => Request::View(vec![StreamView::display(index)]),
+        ControllerMsg::View { mut streams } => {
+            // 太长的不要（平台再按自己有几个显示器、能发几路去掉不要的，见 resolve_view）
+            streams.truncate(MAX_STREAMS as usize);
+            Request::View(streams)
+        }
         ControllerMsg::Clipboard { text } if text.len() > MAX_CLIPBOARD_TEXT => {
             warn!(len = text.len(), "ignoring an oversized clipboard text");
             return None;
@@ -207,12 +262,28 @@ pub(crate) fn request(m: ControllerMsg) -> Option<Request> {
         ControllerMsg::Clipboard { text } => Request::Clipboard(text),
         ControllerMsg::Audio { enabled } => Request::Audio(enabled),
         ControllerMsg::Mic { enabled } => Request::Mic(enabled),
-        ControllerMsg::Direct(_) => return None,
+        // 直连的回答交给直连任务，剪贴板里的文件交给 Files（都在读任务里）
+        ControllerMsg::Direct(_) | ControllerMsg::Files(_) => return None,
     })
 }
 
+/// 发给控制端的文件消息（见 [`crate::files::Peer`]）：经会话的 `Outbox`。会话结束时（[`Files::close`]）放开它，
+/// 写任务才知道没有人再发了
+struct HostPeer(Mutex<Option<Outbox>>);
+
+impl crate::files::Peer for HostPeer {
+    fn send(&self, msg: FileMsg) -> bool {
+        let out = self.0.lock().unwrap().clone();
+        out.is_some_and(|o| o.send(&HostMsg::Files(Some(msg))).is_ok())
+    }
+
+    fn close(&self) {
+        self.0.lock().unwrap().take();
+    }
+}
+
 /// 写任务（几条通道一起）
-pub struct Writer(pub(super) OwnedTask<Result<((), (), (), ())>>);
+pub struct Writer(pub(super) OwnedTask<Result<()>>);
 
 impl Writer {
     /// 等到写任务意外结束（可以放在 `select!` 里）
@@ -225,7 +296,7 @@ impl Writer {
 }
 
 /// 端到端握手之后，被控端知道的这个控制端（见 [`crate::secure::respond`]）。它还没有确认
-/// （[`ControllerReceiver::confirmation`]）：确认之前不要在托盘、Android 的列表里显示它，不要请本机用户同意
+/// （[`ControllerReceiver::confirmation`]）：确认之前不要在托盘、Android 的列表里显示它，不要提醒本机用户
 #[derive(Debug, Clone)]
 pub struct Admitted {
     /// 控制端的公钥（它的身份）
@@ -235,14 +306,14 @@ pub struct Admitted {
     pub os: String,
     /// 安全码：控制端显示的是同一个，两边的人可以对一下（见 `airhand_proto::handshake`）
     pub safety: String,
-    /// 为什么让它进来；[`Admission::NeedsApproval`] 时会话要先请本机用户同意
+    /// 为什么让它进来（刚配对的还是配对过的）
     pub admission: Admission,
-    /// 选定的会话版本、双方都支持的会话能力位
-    pub negotiated: Negotiated,
     /// 开始时的画质（已经做过范围校验）：编码管线一开始就按它建
     pub settings: QualitySettings,
     /// 开始时要不要声音
     pub audio: bool,
+    /// 开始时看哪几个显示器（没检查过，见 [`super::resolve_view`]；空的是只看主显示器）
+    pub view: Vec<StreamView>,
 }
 
 impl HostStreams {
@@ -276,23 +347,35 @@ impl HostStreams {
             os: r.intro.os.chars().take(64).collect(),
             safety: r.secured.safety.clone(),
             admission: r.admission,
-            negotiated: r.negotiated,
             settings: r.intro.settings.sanitized(),
             audio: r.intro.audio,
+            view: r
+                .intro
+                .view
+                .into_iter()
+                .take(MAX_STREAMS as usize)
+                .collect(),
         };
         info!(
             session_id,
             admission = ?admitted.admission,
             controller = %secure::hex(&admitted.key),
             safety = %admitted.safety,
-            negotiated = ?admitted.negotiated,
             "end-to-end session established"
         );
-        let secured = r.secured;
+        let mut secured = r.secured;
         let bulk_send = open_lane(conn, session_id, SessionLane::Bulk).await?;
-        let video_send = open_lane(conn, session_id, SessionLane::Video).await?;
+        let frames: Vec<Arc<FrameStreams>> =
+            (0..secured.video.len()).map(|_| Arc::default()).collect();
         let (out, ctl_rx, bulk_rx) = queue::channel();
-        let (video_tx, video_rx) = mpsc::channel(video_queue);
+        let (video_tx, video): (Vec<_>, Vec<_>) = std::mem::take(&mut secured.video)
+            .into_iter()
+            .zip(&frames)
+            .map(|(keys, streams)| {
+                let (tx, rx) = mpsc::channel(video_queue);
+                (tx, (streams.clone(), rx, keys.sealer))
+            })
+            .unzip();
         let (audio_tx, audio_rx) = mpsc::channel(audio_queue);
         // 两条路：直连通了由直连任务接上，画面、声音走哪条也由它决定（没有直连时一直是中转）
         let paths = Paths::new(conn.clone());
@@ -301,37 +384,36 @@ impl HostStreams {
             paths: paths.clone(),
             control: (send, ctl_rx, r.sealer),
             bulk: (bulk_send, bulk_rx, secured.bulk.sealer),
-            video: (video_send, video_rx, secured.video.sealer),
+            video,
             audio: (audio_rx, secured.audio.sealer),
         })));
         // 读任务：读一帧不是取消安全的，单独放在一个任务里，通过信箱交给会话。
         // 控制端的控制通道握手时已经等到了的（Noise_XX）先放进去，没等到的（Noise_IK）之后从信箱来
-        let mut control = Merge::new(
-            SessionLane::Control,
-            Policy::Complete,
-            r.opener,
-            inbox.control,
-        );
+        let mut control = Merge::new(SessionLane::Control, r.opener, inbox.control);
         if let Some(s) = control_in {
             control.add(s, Via::Relay)?;
         }
-        let bulk = Merge::new(
-            SessionLane::Bulk,
-            Policy::Complete,
-            secured.bulk.opener,
-            inbox.bulk,
-        );
+        let bulk = Merge::new(SessionLane::Bulk, secured.bulk.opener, inbox.bulk);
         let capacity = 4 * 1024 * 1024 / SessionLane::Control.max_frame_size();
         let (control_tx, control_rx) = mpsc::channel(capacity);
         let (bulk_tx, bulk_rx) = mpsc::channel(2);
         let (confirm_tx, confirm_rx) = oneshot::channel();
         let datagrams = DatagramSender::new(session_id, paths.clone(), secured.datagrams.sealer);
         let pong = datagrams.clone();
-        let express = Express::new(move |t| pong.send(&HostDatagram::Pong { t }));
+        let express =
+            Express::new(move |t| pong.send(&HostDatagram::Pong { t })).with_frames(frames);
         let incoming = ControllerReceiver::new(control_rx, bulk_rx, confirm_rx, express.clone());
         let (answers_tx, answers) = mpsc::channel(4);
         let (echoes_tx, echoes) = mpsc::channel(ECHO_QUEUE);
         let started = Arc::new(Notify::new());
+        let (files, files_task) = Files::start(
+            session_id,
+            paths.clone(),
+            secured.files,
+            inc.file_limit,
+            HostPeer(Mutex::new(Some(out.clone()))),
+            inbox.files,
+        );
         let direct = inc.direct.as_ref().map(|link| {
             OwnedTask(tokio::spawn(direct::host::run(direct::host::Session {
                 link: link.clone(),
@@ -351,6 +433,7 @@ impl HostStreams {
             session_id,
             control,
             bulk,
+            files: Some(files.clone()),
             datagrams: (inbox.datagrams, secured.datagrams.opener),
             mic: (inbox.audio, secured.audio.opener),
             express,
@@ -369,6 +452,8 @@ impl HostStreams {
                 writer: Writer(writer),
                 reader,
                 direct,
+                files: Some(files),
+                _files_task: Some(files_task),
                 started,
                 _registration: registration,
             },
@@ -376,7 +461,7 @@ impl HostStreams {
         ))
     }
 
-    /// 会话开始了（发了 Hello）时通知它（`notify_one`）：这时才开始建直连，不把本机的地址告诉还没被同意的控制端
+    /// 会话开始了（发了 Hello）时通知它（`notify_one`）：这时才开始建直连
     pub fn started(&self) -> Arc<Notify> {
         self.started.clone()
     }
@@ -392,9 +477,15 @@ impl HostStreams {
             mut writer,
             mut reader,
             direct,
+            files,
+            _files_task,
             started: _,
             _registration,
         } = self;
+        // 剪贴板里的文件手里也有一个 Outbox：停下给到一半的、取到一半的，放开它
+        if let Some(f) = files {
+            f.close();
+        }
         // 直连任务手里也有一个 Outbox（发候选地址）：先停掉它，写任务才知道没有人再发了
         if let Some(mut d) = direct {
             d.abort();
@@ -429,6 +520,8 @@ struct Readers {
     session_id: u64,
     control: Merge,
     bulk: Merge,
+    /// 剪贴板文件处理端。
+    files: Option<Files>,
     /// 控制数据报（Ping、确认、回声）：从哪条路来、整个数据报，和它们的解密端
     datagrams: (mpsc::Receiver<(Via, Bytes)>, Opener),
     /// 控制端麦克风的声音数据报（整个数据报，还是密文）和它们的解密端
@@ -452,6 +545,7 @@ async fn read_all(r: Readers) -> Result<()> {
         session_id,
         mut control,
         mut bulk,
+        files,
         datagrams: (mut datagrams, mut opener),
         mic: (mut mic_rx, mut mic_opener),
         express,
@@ -476,7 +570,9 @@ async fn read_all(r: Readers) -> Result<()> {
                 ControllerDatagram::Echo { t } => {
                     let _ = echoes.try_send((via, t));
                 }
-                ControllerDatagram::Ack { .. } => {}
+                ControllerDatagram::Ack { .. }
+                | ControllerDatagram::Lost { .. }
+                | ControllerDatagram::Report { .. } => {}
             }
             express.datagram(m);
         }
@@ -503,11 +599,34 @@ async fn read_all(r: Readers) -> Result<()> {
         }
         std::future::pending::<Result<()>>().await
     };
+    // 剪贴板里的文件的消息：交给 Files；控制端的公告变成请求（平台放进本机剪贴板）。文字取代对方之前的公告
+    let files_msg = |m: &ControllerMsg| -> Option<Option<Request>> {
+        match m {
+            ControllerMsg::Files(f) => Some(
+                files
+                    .as_ref()
+                    .zip(f.clone())
+                    .and_then(|(files, f)| files.handle(f))
+                    .map(Request::ClipboardFiles),
+            ),
+            ControllerMsg::Clipboard { .. } => {
+                if let Some(f) = &files {
+                    f.remote_cleared();
+                }
+                None
+            }
+            _ => None,
+        }
+    };
     // 大块通道（剪贴板）：结束了不算会话结束，控制通道结束才是
     let bulk = async {
         while let Some(m) = next_msg::<ControllerMsg>(&mut bulk, SessionLane::Bulk).await? {
             express.heard();
-            let Some(r) = request(m) else { continue };
+            let r = match files_msg(&m) {
+                Some(r) => r,
+                None => request(m),
+            };
+            let Some(r) = r else { continue };
             if bulk_tx.send(r).await.is_err() {
                 break;
             }
@@ -552,7 +671,11 @@ async fn read_all(r: Readers) -> Result<()> {
                 }
                 m => m,
             };
-            let Some(r) = request(m) else { continue };
+            let r = match files_msg(&m) {
+                Some(r) => r,
+                None => request(m),
+            };
+            let Some(r) = r else { continue };
             if control_tx.send(r).await.is_err() {
                 break;
             }
@@ -586,10 +709,10 @@ mod tests {
                 .unwrap();
         }
         assert!(bulk.try_send(Request::Clipboard("more".into())).is_err());
-        control.send(Request::SelectDisplay(7)).await.unwrap();
+        control.send(Request::Keyframe(None)).await.unwrap();
         assert!(matches!(
             incoming.recv().await,
-            Some(Request::SelectDisplay(7))
+            Some(Request::Keyframe(None))
         ));
         control
             .send(Request::Settings(QualitySettings::default()))
@@ -629,8 +752,23 @@ mod tests {
             None
         );
         assert_eq!(
-            request(ControllerMsg::RequestKeyframe { after: 7 }),
-            Some(Request::Keyframe(Some(7)))
+            request(ControllerMsg::RequestKeyframe {
+                after: 7,
+                stream: 2
+            }),
+            Some(Request::Keyframe(Some((2, 7))))
+        );
+        // 只看一个显示器是看哪几个显示器的简便说法；太长的不要
+        assert_eq!(
+            request(ControllerMsg::SelectDisplay { index: 3 }),
+            Some(Request::View(vec![StreamView::display(3)]))
+        );
+        let many: Vec<_> = (0..9).map(StreamView::display).collect();
+        assert_eq!(
+            request(ControllerMsg::View {
+                streams: many.clone()
+            }),
+            Some(Request::View(many[..MAX_STREAMS as usize].to_vec()))
         );
         assert_eq!(
             request(ControllerMsg::Mic { enabled: true }),
@@ -647,11 +785,11 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Log(Mutex<Vec<(u32, u64)>>);
+    struct Log(Mutex<Vec<(u8, u32, u64)>>);
 
     impl Acks for Log {
-        fn ack(&self, seq: u32, arrived: u64) {
-            self.0.lock().unwrap().push((seq, arrived));
+        fn ack(&self, stream: u8, seq: u32, arrived: u64) {
+            self.0.lock().unwrap().push((stream, seq, arrived));
         }
     }
 
@@ -669,12 +807,19 @@ mod tests {
             oneshot::channel().1,
             express.clone(),
         );
-        let ack = |seq| ControllerDatagram::Ack { seq, arrived: 9 };
-        express.datagram(ack(1));
+        let ack = |seq, stream| ControllerDatagram::Ack {
+            seq,
+            arrived: 9,
+            stream,
+        };
+        express.datagram(ack(1, 0));
         let log = Arc::new(Log::default());
         incoming.set_acks(log.clone());
-        express.datagram(ack(2));
-        assert_eq!(*log.0.lock().unwrap(), [(2, 9)]);
+        express.datagram(ack(2, 0));
+        // 每一路各自确认；没有的路不管
+        express.datagram(ack(7, 1));
+        express.datagram(ack(8, MAX_STREAMS));
+        assert_eq!(*log.0.lock().unwrap(), [(0, 2, 9), (1, 7, 9)]);
 
         tokio::time::advance(Duration::from_secs(10)).await;
         assert_eq!(incoming.silent_for(), Duration::from_secs(10));
@@ -685,6 +830,94 @@ mod tests {
         tokio::time::advance(Duration::from_secs(10)).await;
         express.heard();
         assert_eq!(incoming.silent_for(), Duration::ZERO);
+    }
+
+    /// 每一路的交付报告交给平台的码率控制。
+    #[tokio::test(start_paused = true)]
+    async fn reports_feed_the_rate_control() {
+        use airhand_proto::session::VideoReport;
+        #[derive(Default)]
+        struct Fb(Mutex<Vec<(u8, VideoReport)>>);
+        impl Acks for Fb {
+            fn ack(&self, _: u8, _: u32, _: u64) {}
+            fn feedback(&self, stream: u8, fb: VideoReport) {
+                self.0.lock().unwrap().push((stream, fb));
+            }
+        }
+        let express = Express::new(|_| {});
+        let incoming = ControllerReceiver::new(
+            mpsc::channel(1).1,
+            mpsc::channel(1).1,
+            oneshot::channel().1,
+            express.clone(),
+        );
+        let platform = Arc::new(Fb::default());
+        incoming.set_acks(platform.clone());
+        express.datagram(ControllerDatagram::Report {
+            report: VideoReport {
+                frames: 30,
+                stalled: 3,
+            },
+            stream: 1,
+        });
+        assert_eq!(
+            *platform.0.lock().unwrap(),
+            [(
+                1,
+                VideoReport {
+                    frames: 30,
+                    stalled: 3
+                }
+            )]
+        );
+    }
+
+    /// 控制端等不到帧了：读任务马上交给平台；平台要恢复的话，之后的帧流放弃，确认了的帧流忘掉
+    #[tokio::test]
+    async fn lost_frames_abandon_their_streams_when_the_platform_recovers() {
+        struct Recover(Mutex<Vec<(u8, u32)>>, bool);
+        impl Acks for Recover {
+            fn ack(&self, _: u8, _: u32, _: u64) {}
+            fn lost(&self, stream: u8, decoded: u32) -> bool {
+                self.0.lock().unwrap().push((stream, decoded));
+                self.1
+            }
+        }
+        let lost = |decoded, stream| ControllerDatagram::Lost { decoded, stream };
+        let (client, _server) = crate::tests::quic_pair().await;
+        for recover in [false, true] {
+            // 两路画面：第 0 路的帧流不受第 1 路的影响
+            let (other, frames) = (
+                Arc::new(FrameStreams::default()),
+                Arc::new(FrameStreams::default()),
+            );
+            for seq in 1..=4 {
+                frames.add_for_test(seq, client.open_uni().await.unwrap());
+                other.add_for_test(seq, client.open_uni().await.unwrap());
+            }
+            let express = Express::new(|_| {}).with_frames(vec![other.clone(), frames.clone()]);
+            // 平台还没接上：什么也不做
+            express.datagram(lost(1, 1));
+            assert_eq!(frames.len_for_test(), 4);
+            let platform = Arc::new(Recover(Mutex::default(), recover));
+            let incoming = ControllerReceiver::new(
+                mpsc::channel(1).1,
+                mpsc::channel(1).1,
+                oneshot::channel().1,
+                express.clone(),
+            );
+            incoming.set_acks(platform.clone());
+            express.datagram(ControllerDatagram::Ack {
+                seq: 1,
+                arrived: 0,
+                stream: 1,
+            });
+            assert_eq!(frames.len_for_test(), 3);
+            express.datagram(lost(2, 1));
+            assert_eq!(*platform.0.lock().unwrap(), [(1, 2)]);
+            assert_eq!(frames.len_for_test(), if recover { 1 } else { 3 });
+            assert_eq!(other.len_for_test(), 4);
+        }
     }
 
     /// 控制端麦克风的声音数据报：读任务解开、去掉副本，一包一包按先后交给平台；丢了的从下一个数据报里补上。
@@ -707,19 +940,9 @@ mod tests {
 
         // 控制通道一直没有流：读任务只处理数据报
         let (_control_streams, frames) = mpsc::unbounded_channel();
-        let control = Merge::new(
-            SessionLane::Control,
-            Policy::Complete,
-            test_lane(true).1,
-            frames,
-        );
+        let control = Merge::new(SessionLane::Control, test_lane(true).1, frames);
         let (_bulk_streams, frames) = mpsc::unbounded_channel();
-        let bulk = Merge::new(
-            SessionLane::Bulk,
-            Policy::Complete,
-            test_lane(true).1,
-            frames,
-        );
+        let bulk = Merge::new(SessionLane::Bulk, test_lane(true).1, frames);
         let (mic_tx, mic_rx) = mpsc::channel(16);
         let (_dgram_tx, dgram_rx) = mpsc::channel(1);
         let express = Express::new(|_| {});
@@ -727,6 +950,7 @@ mod tests {
             session_id: 1,
             control,
             bulk,
+            files: None,
             datagrams: (dgram_rx, test_lane(false).1),
             mic: (mic_rx, test_lane(false).1),
             express: express.clone(),
@@ -783,14 +1007,9 @@ mod tests {
         for genuine in [true, false] {
             let (mut sealer, opener) = test_lane(true);
             let (frames_tx, frames) = mpsc::unbounded_channel();
-            let control = Merge::new(SessionLane::Control, Policy::Complete, opener, frames);
+            let control = Merge::new(SessionLane::Control, opener, frames);
             let (_bulk_frames, bulk_frames) = mpsc::unbounded_channel();
-            let bulk = Merge::new(
-                SessionLane::Bulk,
-                Policy::Complete,
-                test_lane(true).1,
-                bulk_frames,
-            );
+            let bulk = Merge::new(SessionLane::Bulk, test_lane(true).1, bulk_frames);
             // 控制端的控制通道：一条真的单向流（Merge 只认 QUIC 的流），用进程内的两个 QUIC 端点
             let (client, server) = crate::tests::quic_pair().await;
             let mut send = client.open_uni().await.unwrap();
@@ -808,7 +1027,10 @@ mod tests {
             send.write_all(&next).await.unwrap();
             // 对方写了东西，这边才接得到这条流
             frames_tx
-                .send((server.accept_uni().await.unwrap(), Via::Relay))
+                .send(crate::lanes::LaneStream {
+                    recv: server.accept_uni().await.unwrap(),
+                    via: Via::Relay,
+                })
                 .ok();
 
             let (control_tx, mut control_rx) = mpsc::channel(4);
@@ -819,6 +1041,7 @@ mod tests {
                 session_id: 1,
                 control,
                 bulk,
+                files: None,
                 datagrams: (dgram_rx, test_lane(false).1),
                 mic: (mic_rx, test_lane(false).1),
                 express: Express::new(|_| {}),
@@ -830,7 +1053,10 @@ mod tests {
             }));
             if genuine {
                 (&mut confirmed).await.unwrap();
-                assert_eq!(control_rx.recv().await, Some(Request::SelectDisplay(3)));
+                assert_eq!(
+                    control_rx.recv().await,
+                    Some(Request::View(vec![StreamView::display(3)]))
+                );
                 reader.abort();
             } else {
                 assert!(reader.await.unwrap().is_err());

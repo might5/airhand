@@ -32,7 +32,6 @@ import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.LinkOff
 import androidx.compose.material.icons.outlined.Monitor
-import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material.icons.automirrored.outlined.VolumeOff
 import androidx.compose.material.icons.automirrored.outlined.VolumeUp
 import androidx.compose.material3.AlertDialog
@@ -72,11 +71,9 @@ import app.airhand.android.core.Code
 import app.airhand.android.core.Codec
 import app.airhand.android.core.OsKind
 import app.airhand.android.core.Preset
-import app.airhand.android.core.VideoPriority
 import app.airhand.android.data.ScaleMode
 import app.airhand.android.ui.Messages
 import app.airhand.android.ui.phone.presetName
-import app.airhand.android.ui.phone.priorityName
 import app.airhand.android.ui.theme.Brand
 import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
@@ -258,6 +255,7 @@ fun TvSession(session: RemoteSession, view: RemoteView, onExit: () -> Unit) {
 private fun InfoBar(session: RemoteSession, name: String, modifier: Modifier) {
     val stats by session.stats.collectAsState()
     val encoder by session.encoder.collectAsState()
+    val safety by session.safety.collectAsState()
     val parts = listOfNotNull(
         name.ifBlank { null },
         encoder?.let { "${it.codec.label} ${it.width}×${it.height}" },
@@ -266,6 +264,8 @@ private fun InfoBar(session: RemoteSession, name: String, modifier: Modifier) {
         stats?.let { "%.1f Mbps".format(it.kbps / 1000) },
         // 画面走的路：收到画面之后才知道
         stats?.takeIf { it.width > 0 }?.let { stringResource(if (it.direct) R.string.path_direct else R.string.path_relayed) },
+        // 安全码：对方显示的是同一个，不一样就是中间有人
+        safety?.let { stringResource(R.string.session_safety, it) },
     )
     Text(
         parts.joinToString("  ·  "),
@@ -326,14 +326,7 @@ private fun TvMenu(
         val preset = Preset.match(q) ?: Preset.DEFAULT
         TvMenuItem(Icons.Outlined.HighQuality, stringResource(R.string.menu_quality), presetName(preset)) {
             val next = Preset.entries[(Preset.entries.indexOf(preset) + 1) % Preset.entries.size]
-            session.setQuality(next.quality(q.codec, q.priority))
-        }
-        // 缩放优先（低延迟 / 文字清晰）：对方是电脑时才有区别；选择会记下来
-        if (hello?.platform != OsKind.ANDROID) {
-            TvMenuItem(Icons.Outlined.Speed, stringResource(R.string.scaling_priority), priorityName(q.priority)) {
-                val all = VideoPriority.entries
-                session.setPriority(all[(all.indexOf(q.priority) + 1) % all.size])
-            }
+            session.setQuality(next.quality(q.codec))
         }
         // 编码格式：自动 → 双方都支持的各种格式，按一下换一个；选择会记下来
         if (hello != null) {

@@ -1,9 +1,9 @@
 //! 控制端的麦克风（协议见 `airhand_proto::session` 的"麦克风"）：把控制端发来的声音放进本机的虚拟麦克风，
 //! 本机的程序（会议、语音输入）选它做录音设备，就像用着一个本地麦克风。
 //!
-//! Windows 用 Steam 的虚拟声卡 Steam Streaming Microphone（装了 Steam、用过一次远程同乐就有，见 [`wasapi`]）。
-//! Airhand 不带、也不安装这个驱动，只用已经装好的设备：没有它时控制端看到的是 `MicState::NoDevice`。
-//! 其它平台还不支持（`MicState::Unsupported`）。
+//! Windows 用 Steam 的虚拟声卡 Steam Streaming Microphone（见 [`wasapi`]）。打开转发时如果缺少设备，
+//! 从本机 Steam 安装签名驱动（见 [`steam`]）。
+//! macOS 14.2+ 和 Linux/PipeWire 在打开转发期间发布 Airhand Microphone（见 `native`）。
 //!
 //! * 同一时刻只给一个会话（[`open`]）：别的会话这时看到的是 `Busy`，空出来之后告诉它们（[`owner_changed`]）；
 //! * 控制端打开麦克风时才打开设备、开始播放线程，关掉或者会话结束时（丢掉 [`MicLease`]）停止：不一直占着设备；
@@ -11,8 +11,15 @@
 //!   丢包补偿盖过去），抖动缓冲（[`Playout`]）攒够 [`TARGET_MS`] 再开始放，换成设备的格式（[`Format`]）写进去。
 //!   没有声音的时候写静音；网络卡住、积压太多时丢掉旧的，延迟不会越积越多。
 
-#![cfg_attr(not(windows), allow(dead_code))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod native;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+pub(crate) mod unix_recorder;
+#[cfg(target_os = "macos")]
+pub(crate) use native::cleanup as cleanup_stale;
 
+#[cfg(windows)]
+mod steam;
 #[cfg(windows)]
 pub(crate) mod wasapi;
 
@@ -70,7 +77,66 @@ impl MicSink for MicInput {
 /// 现在是哪个会话在用麦克风
 static OWNER: LazyLock<watch::Sender<Option<u64>>> = LazyLock::new(|| watch::Sender::new(None));
 /// 上一个播放线程：新的播放线程等它放开设备再开始（独占模式下设备同时只能打开一次）
-static LAST: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+struct Worker {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Worker {
+    fn finish(&mut self) -> std::thread::Result<()> {
+        self.stop.store(true, Ordering::Release);
+        self.thread.take().map_or(Ok(()), |t| t.join())
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        // The closure owning the previous worker is also dropped if its successor fails to spawn.
+        if self.finish().is_err() {
+            warn!("microphone thread panicked");
+        }
+    }
+}
+
+struct Workers {
+    stopping: bool,
+    last: Option<Worker>,
+}
+static WORKERS: Mutex<Workers> = Mutex::new(Workers {
+    stopping: false,
+    last: None,
+});
+
+pub(super) fn supported() -> bool {
+    #[cfg(windows)]
+    {
+        true
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        native::supported()
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    false
+}
+
+/// Stop publication before normal exit or uninstall. Dropping HostService cancels its sessions
+/// asynchronously, so signal and join the actual output thread and disallow later opens here.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn shutdown() -> Result<()> {
+    let mut workers = WORKERS.lock().unwrap();
+    if workers.stopping {
+        return Ok(());
+    }
+    workers.stopping = true;
+    let joined = workers.last.take().map(|mut w| w.finish());
+    #[cfg(target_os = "macos")]
+    cleanup_stale()?;
+    if matches!(joined, Some(Err(_))) {
+        bail!("microphone thread panicked");
+    }
+    Ok(())
+}
 
 /// 用麦克风的会话变了（别的会话看到的 `Busy` 可能变成能用了）
 pub fn owner_changed() -> watch::Receiver<Option<u64>> {
@@ -79,26 +145,59 @@ pub fn owner_changed() -> watch::Receiver<Option<u64>> {
 
 /// 会话 `session_id` 现在能不能用麦克风（不打开设备）：会话开始时、空出来之后告诉控制端。
 /// 要列举声音设备，放在阻塞线程里
-pub async fn probe(session_id: u64) -> MicState {
+pub async fn probe(session_id: u64) -> Status {
     if OWNER.borrow().is_some_and(|o| o != session_id) {
-        return MicState::Busy;
+        return (MicState::Busy, None);
     }
     #[cfg(windows)]
     {
         tokio::task::spawn_blocking(wasapi::probe)
             .await
-            .unwrap_or(MicState::Failed)
+            .unwrap_or_else(|e| (MicState::Failed, Some(e.to_string())))
     }
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        MicState::Unsupported
+        tokio::task::spawn_blocking(native::probe)
+            .await
+            .unwrap_or_else(|e| (MicState::Failed, Some(e.to_string())))
     }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    (MicState::Unsupported, None)
 }
 
 /// 控制端打开了麦克风：占用麦克风，开始播放线程。别的会话占着时为 `Err(Busy)`，这个平台不支持时为
 /// `Err(Unsupported)`。打开设备在播放线程里做，结果从 [`MicLease::changed`] 来
-pub fn open(session_id: u64, input: &Arc<MicInput>) -> Result<MicLease, MicState> {
-    if !cfg!(windows) {
+pub fn open(session_id: u64, input: &Arc<MicInput>, initial: Status) -> Result<MicLease, MicState> {
+    let initial = if cfg!(windows) {
+        initial
+    } else {
+        (MicState::Preparing, None)
+    };
+    open_with(session_id, input, initial, |rx, stop, status| {
+        #[cfg(windows)]
+        {
+            let mut setup = steam::DriverSetup::default();
+            render(rx, stop, status, wasapi::open, |notify| {
+                setup.missing(notify)
+            });
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        render(rx, stop, status, native::open, |_| {
+            (MicState::NoDevice, None)
+        });
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+        let _ = (rx, stop, status);
+    })
+}
+
+fn open_with(
+    session_id: u64,
+    input: &Arc<MicInput>,
+    initial: Status,
+    play: fn(Receiver<Vec<u8>>, &AtomicBool, &watch::Sender<Status>),
+) -> Result<MicLease, MicState> {
+    let mut workers = WORKERS.lock().unwrap();
+    if !supported() || workers.stopping {
         return Err(MicState::Unsupported);
     }
     let mut mine = false;
@@ -108,10 +207,7 @@ pub fn open(session_id: u64, input: &Arc<MicInput>) -> Result<MicLease, MicState
             mine = true;
             true
         }
-        Some(other) => {
-            mine = other == session_id;
-            false
-        }
+        Some(_) => false,
     });
     if !mine {
         return Err(MicState::Busy);
@@ -119,24 +215,30 @@ pub fn open(session_id: u64, input: &Arc<MicInput>) -> Result<MicLease, MicState
     let (tx, rx) = sync_channel(QUEUE);
     *input.tx.lock().unwrap() = Some(tx);
     let stop = Arc::new(AtomicBool::new(false));
-    let (status_tx, status) = watch::channel((MicState::Ready, None));
-    let mut last = LAST.lock().unwrap();
-    let previous = last.take();
+    let (status_tx, status) = watch::channel(initial);
+    let previous = workers.last.take();
     let thread_stop = stop.clone();
     let spawned = std::thread::Builder::new()
         .name("airhand-mic".into())
         .spawn(move || {
-            if let Some(p) = previous {
-                let _ = p.join();
+            drop(previous);
+            if !thread_stop.load(Ordering::Acquire) {
+                play(rx, &thread_stop, &status_tx);
             }
-            #[cfg(windows)]
-            render(rx, &thread_stop, &status_tx, wasapi::open);
-            #[cfg(not(windows))]
-            drop((rx, thread_stop, status_tx));
         });
     match spawned {
-        Ok(t) => *last = Some(t),
-        Err(e) => warn!("can't start the microphone thread: {e}"),
+        Ok(t) => {
+            workers.last = Some(Worker {
+                stop: stop.clone(),
+                thread: Some(t),
+            })
+        }
+        Err(e) => {
+            warn!("can't start the microphone thread: {e}");
+            *input.tx.lock().unwrap() = None;
+            OWNER.send_replace(None);
+            return Err(MicState::Failed);
+        }
     }
     info!(session_id, "the controller's microphone is on");
     Ok(MicLease {
@@ -190,6 +292,7 @@ impl Drop for MicLease {
 // ───────────────────────────── 播放 ─────────────────────────────
 
 /// 采样的格式
+#[cfg_attr(not(any(windows, test)), allow(dead_code))] // WASAPI also accepts integer sample formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sample {
     F32,
@@ -220,13 +323,16 @@ pub(crate) struct Format {
     pub block_align: usize,
 }
 
+#[cfg(any(windows, test))]
 const WAVE_FORMAT_PCM: u16 = 1;
-const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+#[cfg(any(windows, test))]
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
 impl Format {
     /// 解析 `WAVEFORMATEX` / `WAVEFORMATEXTENSIBLE` 的字节（Windows 设备属性里的设备格式就是这个）
+    #[cfg(any(windows, test))]
     pub fn parse(b: &[u8]) -> Result<Self> {
+        const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
         let u16_at = |i: usize| b.get(i..i + 2).map(|s| u16::from_le_bytes([s[0], s[1]]));
         let u32_at = |i: usize| {
             b.get(i..i + 4)
@@ -423,6 +529,7 @@ pub(crate) fn render(
     stop: &AtomicBool,
     status: &watch::Sender<Status>,
     open: Opener,
+    mut missing: impl FnMut(&dyn Fn(Status)) -> Status,
 ) {
     let set = |s: Status| {
         status.send_if_modified(|now| {
@@ -448,6 +555,9 @@ pub(crate) fn render(
             Ok(p) => {
                 playout.push(&p);
                 while let Ok(p) = rx.try_recv() {
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
                     playout.push(&p);
                 }
             }
@@ -465,7 +575,7 @@ pub(crate) fn render(
                     out = Some((o, Resampler::new(fmt.rate)));
                 }
                 Ok(None) => {
-                    set((MicState::NoDevice, None));
+                    set(missing(&set));
                     retry = Instant::now() + REOPEN;
                 }
                 Err(e) => {
@@ -483,6 +593,7 @@ pub(crate) fn render(
         {
             // 设备没了、被拔掉了（驱动卸载）：重新找
             info!("the virtual microphone stopped, reopening: {e:#}");
+            set((MicState::Failed, Some(super::capture::wire_detail(&e))));
             out = None;
             retry = Instant::now() + Duration::from_millis(200);
         }
@@ -742,7 +853,7 @@ pub(crate) mod tests {
         let stop = AtomicBool::new(false);
         let (status_tx, status) = watch::channel((MicState::Failed, None));
         std::thread::scope(|s| {
-            let t = s.spawn(|| render(rx, &stop, &status_tx, open_fake));
+            let t = s.spawn(|| render(rx, &stop, &status_tx, open_fake, |_| unreachable!()));
             // 和网络上一样每 20 ms 来一包
             let start = Instant::now();
             for (i, p) in tone_packets(40, 1000.0).into_iter().enumerate() {
@@ -773,13 +884,92 @@ pub(crate) mod tests {
         );
     }
 
+    /// Real OS objects: force a publisher to exit without Drop, then run startup cleanup,
+    /// release a normal lease, and exercise the uninstall hook while a second lease is live.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    #[ignore = "publishes a real microphone; needs Core Audio or PipeWire with pactl"]
+    async fn native_mic_cleanup() {
+        const MODE: &str = "AIRHAND_MIC_CLEANUP_TEST";
+        let child = |mode: &str| {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args([
+                "--exact",
+                "host::mic::tests::native_mic_cleanup",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(MODE, mode);
+            if mode == "crash" {
+                cmd.env("AIRHAND_TEST_MIC_GROUP", std::process::id().to_string());
+            }
+            assert!(cmd.status().unwrap().success());
+        };
+        let objects = |expected| {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            loop {
+                let n = super::unix_recorder::published_objects();
+                if n == expected {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "expected {expected} published objects, found {n}"
+                );
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        };
+        let input = Arc::new(MicInput::default());
+        let ready = || async {
+            let mut lease = super::open(7001, &input, (MicState::Ready, None)).unwrap();
+            while lease.status().0 == MicState::Preparing {
+                tokio::time::timeout(Duration::from_secs(5), lease.changed())
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(lease.status(), (MicState::Ready, None));
+            objects(if cfg!(target_os = "macos") { 2 } else { 1 });
+            lease
+        };
+        match std::env::var(MODE).as_deref() {
+            Ok("crash") => {
+                let _live = ready().await;
+                std::process::exit(0);
+            }
+            Ok("check") => {
+                child("crash");
+                #[cfg(target_os = "macos")]
+                {
+                    objects(2);
+                    super::cleanup_stale().unwrap();
+                }
+                objects(0);
+                drop(ready().await);
+                objects(0);
+                let _live = ready().await;
+                super::shutdown().unwrap();
+                objects(0);
+                assert_eq!(
+                    super::open(7002, &input, (MicState::Ready, None)).err(),
+                    Some(MicState::Unsupported)
+                );
+                super::shutdown().unwrap();
+            }
+            // Shutdown applies to the entire process. Keep the parent test runner usable.
+            _ => child("check"),
+        }
+    }
+
     /// 同一时刻只给一个会话；放开之后别的会话能用，等着的会话收到通知
-    #[cfg(windows)]
     #[test]
     fn one_session_at_a_time() {
+        if !supported() {
+            return;
+        }
         let mut changed = owner_changed();
         changed.mark_unchanged();
         let input = Arc::new(MicInput::default());
+        let open = |id, input: &Arc<_>| open_with(id, input, (MicState::Ready, None), |_, _, _| {});
         let a = open(101, &input).unwrap();
         assert_eq!(open(102, &input).err(), Some(MicState::Busy));
         assert!(changed.has_changed().unwrap());

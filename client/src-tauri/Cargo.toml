@@ -1,7 +1,7 @@
 [package]
 name = "airhand"
 description = "Airhand remote desktop client (controller and host in one program)"
-version = "0.2.3"
+version = "0.3.1"
 edition = "2024"
 license = "MIT"
 default-run = "airhand"
@@ -15,6 +15,8 @@ crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+cc = "1"
+pkg-config = "0.3"
 
 [dependencies]
 airhand-proto = { path = "../../crates/airhand-proto" }
@@ -46,9 +48,19 @@ fast_image_resize = "6"
 opus = "0.4"
 
 [target.'cfg(windows)'.dependencies]
+# 从本机 Steam 的安装目录或自解压 ZIP 读取虚拟麦克风驱动
+winreg = "0.56"
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+tempfile = "3"
+# #[implement] 展开的代码直接引用 windows_core（剪贴板里的文件：自己实现的 IDataObject、IStream）
+windows-core = "0.62"
 windows = { version = "0.62", features = [
   "Win32_Foundation",
+  "Win32_Devices_DeviceAndDriverInstallation",
+  "Win32_Devices_Display",
+  "Win32_System_SystemInformation",
   "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D_Fxc",
   "Win32_Graphics_Direct3D11",
   "Win32_Graphics_Dxgi",
   "Win32_Graphics_Dxgi_Common",
@@ -67,6 +79,7 @@ windows = { version = "0.62", features = [
   "Win32_System_Registry",
   "Win32_System_DataExchange",
   "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
   "Win32_System_Com",
   "Win32_System_Com_StructuredStorage",
   "Win32_System_Ole",
@@ -79,6 +92,9 @@ windows = { version = "0.62", features = [
   "Win32_UI_HiDpi",
   # 声音设备的属性（控制端的麦克风：按接口名找 Steam Streaming Microphone、读它的设备格式）
   "Win32_UI_Shell_PropertiesSystem",
+  # 剪贴板里的文件：对方复制的文件以"虚拟文件"放进本机剪贴板（FILEDESCRIPTORW / FILECONTENTS，见 src/clipfiles/windows.rs）
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
   "Win32_Security",
 ] }
 
@@ -94,6 +110,9 @@ libc = "0.2"
 # 和 Tauri（gtk 0.18）用同一个版本：全屏时暂停 webview 上的信号处理函数（见 fullscreen.rs）
 glib = "0.18"
 x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "randr", "xtest", "xkb"] }
+# 剪贴板里的文件：对方复制的文件放在一个 FUSE 文件系统里，粘贴时才取（见 src/clipfiles/linux.rs）。
+# 不链接 libfuse：经 fusermount3 挂载
+fuser = { version = "0.15", default-features = false }
 libpulse-binding = "2"
 
 # macOS 被控端：ScreenCaptureKit 采集画面和系统声音，VideoToolbox 硬件编码，CGEvent 注入键鼠，
@@ -111,7 +130,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 # NSAlert 等：卸载时的确认对话框（src/uninstall.rs），NSApplication、NSButton 这些 Tauri 本来就打开了
 objc2-app-kit = { version = "0.3", default-features = false, features = [
   "std", "NSAlert", "NSApplication", "NSButton", "NSColor", "NSControl", "NSCursor", "NSGraphics", "NSGraphicsContext",
-  "NSImage", "NSImageRep", "NSPasteboard", "NSResponder", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation",
+  "NSImage", "NSImageRep", "NSOpenPanel", "NSPanel", "NSPasteboard", "NSResponder", "NSSavePanel", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation",
   "objc2-core-graphics",
 ] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = [
@@ -143,6 +162,9 @@ objc2-video-toolbox = { version = "0.3", default-features = false, features = [
   "std", "VTBase", "VTCompressionProperties", "VTCompressionSession", "VTErrors", "VTSession",
   "VTVideoEncoderList", "objc2-core-media", "objc2-core-video",
 ] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

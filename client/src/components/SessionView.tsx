@@ -1,7 +1,8 @@
 import { type ReactNode, type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { closeTab, fmtCode, toggleFullscreen } from "../lib/actions";
-import { api, type Platform } from "../lib/api";
+import { api, MOUSE_MODES, type MouseMode, type Platform } from "../lib/api";
 import { type MsgKey, t, useT } from "../lib/i18n";
+import { LocalFiles } from "../lib/files";
 import { errorText, noticeText, problemText, sessionStateText } from "../lib/messages";
 import { CODEC_LABEL } from "../lib/presets";
 import type { RemoteSession } from "../lib/session";
@@ -13,11 +14,15 @@ import {
   IconCpu,
   IconExpand,
   IconFit,
+  IconGamepad,
   IconKeyboard,
   IconMic,
   IconMicOff,
   IconMonitor,
   IconMouse,
+  IconPointer,
+  IconPopIn,
+  IconPopOut,
   IconPower,
   IconRefresh,
   IconRestoreBar,
@@ -91,7 +96,10 @@ const combosFor = (platform: Platform | null, os: string) => {
   return os === "" || /windows/i.test(os) ? WINDOWS_COMBOS : /^macos/i.test(os) ? MAC_COMBOS : LINUX_COMBOS;
 };
 
-type Menu = null | "quality" | "keys" | "display" | "clipboard" | "audio" | "mic" | "sessions";
+type Menu = null | "quality" | "mouse" | "keys" | "display" | "clipboard" | "audio" | "mic" | "sessions";
+
+/** 鼠标模式的图标（工具栏的鼠标按钮显示现在的） */
+const MOUSE_ICONS: Record<MouseMode, typeof IconMouse> = { auto: IconMouse, desktop: IconPointer, game: IconGamepad };
 
 /** 顶端热区的高度（和 .hot-edge 一致） */
 const HOT_EDGE = 6;
@@ -106,9 +114,10 @@ const KEEP_NEAR = 32;
 
 /**
  * 全屏时悬浮工具栏的显示 / 收起。不用 CSS :hover：macOS 的系统菜单栏盖住顶端时网页就不算悬停了，
- * 工具栏会马上收起。这里只在鼠标明确离开（在网页里移到了工具栏附近以外）时才收起
+ * 工具栏会马上收起。这里只在鼠标明确离开（在网页里移到了工具栏附近以外）时才收起。
+ * `win`：工具栏在哪个窗口里（弹出窗口的工具栏也用它，见 PopoutView）
  */
-function useToolbarReveal(active: boolean, toolbar: RefObject<HTMLElement | null>) {
+export function useToolbarReveal(active: boolean, toolbar: RefObject<HTMLElement | null>, win: Window = window) {
   // 全屏中切换到别的连接时会重新挂载，这时鼠标还在工具栏上：先显示
   const [revealed, setRevealed] = useState(active);
   const shown = useRef(active);
@@ -134,15 +143,16 @@ function useToolbarReveal(active: boolean, toolbar: RefObject<HTMLElement | null
       if (e.relatedTarget) return; // 还在网页里
       set(e.clientY <= LEAVE_TOP && e.buttons === 0);
     };
-    window.addEventListener("pointermove", onPointer);
-    window.addEventListener("pointerdown", onPointer);
-    document.addEventListener("mouseout", onLeave);
+    const doc = win.document;
+    win.addEventListener("pointermove", onPointer);
+    win.addEventListener("pointerdown", onPointer);
+    doc.addEventListener("mouseout", onLeave);
     return () => {
-      window.removeEventListener("pointermove", onPointer);
-      window.removeEventListener("pointerdown", onPointer);
-      document.removeEventListener("mouseout", onLeave);
+      win.removeEventListener("pointermove", onPointer);
+      win.removeEventListener("pointerdown", onPointer);
+      doc.removeEventListener("mouseout", onLeave);
     };
-  }, [active, toolbar]);
+  }, [active, toolbar, win]);
   return revealed;
 }
 
@@ -155,6 +165,8 @@ export function SessionView({ s }: { s: RemoteSession }) {
   const title = useSessionTitle(s);
   const [menu, setMenu] = useState<Menu>(null);
   const [toast, setToast] = useState<string | null>(null);
+  /** 正在往画面上拖文件 */
+  const [dropping, setDropping] = useState(false);
   // 对方要求配对码、或者对方的身份变了（要重新配对）时输入的配对码
   const [pairing, setPairing] = useState("");
   const needsPairing =
@@ -198,7 +210,7 @@ export function SessionView({ s }: { s: RemoteSession }) {
     return () => clearTimeout(t);
   }, [toast]);
 
-  // 第一次锁定鼠标时（包括被控端隐藏光标时自动锁定、按快捷键）提示怎么解除：
+  // 第一次锁定鼠标时（自动模式里被控端隐藏光标、进入游戏模式）提示怎么放开：
   // 全屏时 Esc 发给了对方，指针也碰不到顶端叫出工具栏
   const pointerLocked = s.pointerLocked;
   const lockHinted = useRef(false);
@@ -228,6 +240,9 @@ export function SessionView({ s }: { s: RemoteSession }) {
 
   const st = s.stats;
   const live = s.state === "live";
+  const MouseIcon = MOUSE_ICONS[s.mouseMode];
+  // 同时看着好几个显示器（多屏）
+  const showingAll = s.allDisplays && s.shown.length > 1;
   const rtt = st.rttMs != null ? Math.round(st.rttMs) : null;
   const rttClass = rtt == null ? "" : rtt < 60 ? "good" : rtt < 150 ? "ok" : "bad";
 
@@ -305,30 +320,85 @@ export function SessionView({ s }: { s: RemoteSession }) {
             <div className="menu-anchor">
               <button className="tb-btn" onClick={() => toggleMenu("display")} title={t("session.switchDisplay")}>
                 <IconMonitor size={17} />
-                <span>{t("session.display", { n: s.currentDisplay + 1 })}</span>
+                <span>
+                  {showingAll ? t("session.allDisplays") : t("session.display", { n: s.currentDisplay + 1 })}
+                </span>
                 <IconChevron size={14} />
               </button>
               {menu === "display" && (
-                <Dropdown onClose={closeMenu}>
-                  {s.displays.map((d) => (
-                    <button
-                      key={d.index}
-                      className={`dd-item ${d.index === s.currentDisplay ? "active" : ""}`}
-                      onClick={() => {
-                        s.selectDisplay(d.index);
-                        closeMenu();
-                        s.focus();
-                      }}
-                    >
-                      <span>
-                        {t("session.display", { n: d.index + 1 })}
-                        {d.primary ? t("session.primary") : ""}
-                      </span>
-                      <span className="muted small">
-                        {d.width}×{d.height}
-                      </span>
-                    </button>
-                  ))}
+                <Dropdown onClose={closeMenu} className="display-menu">
+                  {s.displays.map((d) => {
+                    const popped = s.isPopped(d.index);
+                    const canPop = s.canPopOut(d.index);
+                    return (
+                      <div key={d.index} className="dd-row">
+                        <button
+                          className={`dd-item ${(showingAll ? s.shown.includes(d.index) : d.index === s.currentDisplay) ? "active" : ""}`}
+                          onClick={() => {
+                            // 点一个显示器：只看它；它在单独的窗口里时切到那个窗口
+                            if (popped) {
+                              setMenu(null);
+                              s.focusPopout(d.index);
+                              return;
+                            }
+                            s.selectDisplay(d.index);
+                            closeMenu();
+                          }}
+                        >
+                          <span>
+                            {t("session.display", { n: d.index + 1 })}
+                            {d.primary ? t("session.primary") : ""}
+                            {popped && <span className="muted small block">{t("session.inWindow")}</span>}
+                          </span>
+                          <span className="muted small">
+                            {d.width}×{d.height}
+                          </span>
+                        </button>
+                        {(popped || canPop) && (
+                          // 放到单独的窗口里 / 放回来（要在点击里开窗口：浏览器只在用户操作里让开）
+                          <button
+                            className="dd-icon"
+                            title={popped ? t("session.popIn") : t("session.popOut")}
+                            onClick={() => {
+                              if (popped) {
+                                s.dockDisplay(d.index);
+                                closeMenu();
+                              } else {
+                                setMenu(null);
+                                if (!s.popOut(d.index)) setToast(t("session.popOutFailed"));
+                              }
+                            }}
+                          >
+                            {popped ? <IconPopIn size={16} /> : <IconPopOut size={16} />}
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                  {s.canShowAll && (
+                    <>
+                      <div className="dd-sep" />
+                      <label className="dd-item toggle">
+                        <span>
+                          {t("session.showAll")}
+                          <span className="muted small block">{t("session.showAllHint")}</span>
+                          {s.displays.length > s.maxStreams && (
+                            <span className="muted small block">{t("session.showAllLimit", { n: s.maxStreams })}</span>
+                          )}
+                        </span>
+                        <input
+                          type="checkbox"
+                          className="switch"
+                          checked={s.allDisplays}
+                          onChange={(e) => {
+                            s.setAllDisplays(e.target.checked);
+                            s.focus();
+                          }}
+                        />
+                      </label>
+                      <div className="dd-foot muted small">{t("session.popOutHint")}</div>
+                    </>
+                  )}
                 </Dropdown>
               )}
             </div>
@@ -376,6 +446,24 @@ export function SessionView({ s }: { s: RemoteSession }) {
                         {t(c.label)}
                       </button>
                     ))}
+                {s.hostPlatform === "mac" && (
+                  <>
+                    <div className="dd-sep" />
+                    <label className="dd-item toggle">
+                      <span>{t("session.swapCtrlCommand")}</span>
+                      <input
+                        type="checkbox"
+                        className="switch"
+                        checked={s.swapCtrlCommand}
+                        onChange={(e) => {
+                          s.setSwapCtrlCommand(e.target.checked);
+                          closeMenu();
+                          s.focus();
+                        }}
+                      />
+                    </label>
+                  </>
+                )}
               </Dropdown>
             )}
           </div>
@@ -396,6 +484,9 @@ export function SessionView({ s }: { s: RemoteSession }) {
                     {t("session.clipSync")}
                     <span className="muted small block">
                       {t(api.kind === "web" ? "session.clipSyncHintWeb" : "session.clipSyncHint")}
+                    </span>
+                    <span className="muted small block">
+                      {t(api.kind === "web" ? "session.clipFilesHintWeb" : "session.clipFilesHint")}
                     </span>
                   </span>
                   <input
@@ -465,7 +556,7 @@ export function SessionView({ s }: { s: RemoteSession }) {
             )}
           </div>
           {s.micState !== null && s.micState !== "unsupported" && (
-            // 本机的麦克风：对方能接（有虚拟麦克风）时才有
+            // 支持麦克风转发时才显示，Windows 缺驱动时也能打开开关触发安装
             <div className="menu-anchor">
               <button
                 className={`tb-btn icon ${menu === "mic" ? "on" : ""}`}
@@ -494,18 +585,17 @@ export function SessionView({ s }: { s: RemoteSession }) {
             </div>
           )}
           {s.hostPlatform !== "android" && (
-            // 游戏：鼠标锁定在画面上、发相对移动（被控端隐藏光标时会自动这样做，这里是手动的）
-            <button
-              className={`tb-btn icon ${s.mouseLocked ? "on" : ""}`}
-              title={s.mouseLocked ? t("session.mouseUnlock") : t("session.mouseLock")}
-              onClick={() => {
-                setMenu(null);
-                s.toggleMouseLock();
-                if (s.mouseLocked) setToast(t("session.mouseLocked"));
-              }}
-            >
-              <IconMouse size={17} />
-            </button>
+            // 鼠标：自动 / 桌面 / 游戏（见 input.ts），还有画面里有光标时显不显示本机光标。手机是点触屏的，没有这些
+            <div className="menu-anchor">
+              <button
+                className={`tb-btn icon ${menu === "mouse" || s.mouseMode === "game" ? "on" : ""}`}
+                title={t("session.mouse", { mode: t(`mouse.${s.mouseMode}`) })}
+                onClick={() => toggleMenu("mouse")}
+              >
+                <MouseIcon size={17} />
+              </button>
+              {menu === "mouse" && <MouseMenu s={s} onClose={closeMenu} />}
+            </div>
           )}
           <button
             className={`tb-btn icon ${s.scaleMode === "native" ? "on" : ""}`}
@@ -543,8 +633,28 @@ export function SessionView({ s }: { s: RemoteSession }) {
         </div>
       </header>
 
-      <div className="stage">
+      <div
+        className={`stage ${dropping ? "dropping" : ""}`}
+        // 拖到画面上的文件（文件夹也行）：放进对方的剪贴板，在对方那里粘贴（见 files.ts）。桌面版的窗口里拖放由 Tauri 接管
+        onDragOver={(e) => {
+          if (api.kind !== "web" || !live || !e.dataTransfer.types.includes("Files")) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "copy";
+          if (!dropping) setDropping(true);
+        }}
+        onDragLeave={(e) => {
+          if (e.currentTarget === e.target) setDropping(false);
+        }}
+        onDrop={(e) => {
+          if (api.kind !== "web" || !live) return;
+          e.preventDefault();
+          setDropping(false);
+          const files = LocalFiles.fromDataTransfer(e.dataTransfer);
+          if (files && s.offerFiles(files)) setToast(t("session.filesOffered"));
+        }}
+      >
         <CanvasHost s={s} interactive={s.state === "live"} />
+        {dropping && <div className="drop-hint">{t("session.dropFiles")}</div>}
 
         {s.state !== "live" && (
           <div className="stage-overlay">
@@ -585,22 +695,6 @@ export function SessionView({ s }: { s: RemoteSession }) {
                   </button>
                 </div>
               </div>
-            ) : s.state === "approving" ? (
-              <div className="overlay-card">
-                <span className="spinner large" />
-                <div className="overlay-title">{t("session.approving", { name: title })}</div>
-                <div className="muted small">{t("session.approvingHint")}</div>
-                {s.safety && (
-                  <div className="muted small" title={t("session.safetyHint")}>
-                    {t("session.safety", { code: s.safety })}
-                  </div>
-                )}
-                <div className="overlay-actions">
-                  <button className="ghost-btn" onClick={() => closeTab(s.id)}>
-                    {t("session.close")}
-                  </button>
-                </div>
-              </div>
             ) : s.state === "waiting" ? (
               <div className="overlay-card">
                 <span className="spinner large" />
@@ -631,6 +725,31 @@ export function SessionView({ s }: { s: RemoteSession }) {
             <span>{noticeText(s.notice)}</span>
           </div>
         )}
+        {live && s.gamePaused && <div className="lock-hint">{t("session.clickToLock")}</div>}
+        {s.remoteFiles && (
+          <div className="files-bar">
+            <span className="files-bar-text">
+              {s.download
+                ? t("session.downloading", {
+                    pct: s.download.total > 0 ? Math.floor((s.download.done * 100) / s.download.total) : 0,
+                  })
+                : t("session.remoteFiles", {
+                    n: s.remoteFiles.items.length,
+                    names: s.remoteFiles.items
+                      .slice(0, 3)
+                      .map((i) => i.path[0])
+                      .join("、")
+                      .concat(s.remoteFiles.items.length > 3 ? "…" : ""),
+                  })}
+            </span>
+            <button className="primary-btn small" disabled={s.download !== null} onClick={() => void s.downloadRemoteFiles()}>
+              {t("session.download")}
+            </button>
+            <button className="ghost-btn small" disabled={s.download !== null} onClick={() => s.dismissRemoteFiles()}>
+              ✕
+            </button>
+          </div>
+        )}
         {toast && <div className="toast">{toast}</div>}
       </div>
 
@@ -650,6 +769,53 @@ export function SessionView({ s }: { s: RemoteSession }) {
   );
 }
 
+/** 鼠标菜单：三种模式（点了马上生效，游戏模式马上锁定指针），画面里有光标时显不显示本机光标，怎么放开鼠标 */
+function MouseMenu({ s, onClose }: { s: RemoteSession; onClose: () => void }) {
+  const localCursor = useStore((st) => st.localCursor);
+  const game = s.mouseMode === "game";
+  return (
+    <Dropdown onClose={onClose} className="mouse-menu">
+      <div className="dd-title pop-title">{t("mouse.title")}</div>
+      {MOUSE_MODES.map((m) => {
+        const Icon = MOUSE_ICONS[m];
+        return (
+          <button
+            key={m}
+            className={`dd-item mode ${s.mouseMode === m ? "active" : ""}`}
+            onClick={() => {
+              // 在点击里换：游戏模式要马上锁定指针，浏览器只在用户操作里让锁定
+              s.setMouseMode(m);
+              onClose();
+            }}
+          >
+            <Icon size={18} />
+            <span>
+              {t(`mouse.${m}`)}
+              <span className="muted small block">{t(`mouse.${m}.hint`)}</span>
+            </span>
+          </button>
+        );
+      })}
+      <div className="dd-sep" />
+      <label className={`dd-item toggle ${game ? "disabled" : ""}`}>
+        <span>
+          {t("mouse.localCursor")}
+          <span className="muted small block">{t(game ? "mouse.localCursor.game" : "mouse.localCursor.hint")}</span>
+        </span>
+        <input
+          type="checkbox"
+          className="switch"
+          checked={localCursor}
+          disabled={game}
+          onChange={(e) => store.setLocalCursor(e.target.checked)}
+        />
+      </label>
+      <div className="dd-sep" />
+      <div className="dd-foot muted small">{t("mouse.footer")}</div>
+    </Dropdown>
+  );
+}
+
 function audioHint(s: RemoteSession): string {
   if (!s.audioEnabled) return t("audio.muted");
   if (s.audioError !== null) return t("notice.audioFailed", { detail: s.audioError });
@@ -664,15 +830,24 @@ function micProblem(s: RemoteSession): boolean {
 
 function micHint(s: RemoteSession): string {
   if (s.micError !== null) return t(`mic.local.${s.micError}` as const);
+  const device = s.hostPlatform === "windows" ? "Steam Streaming Microphone" : "Airhand Microphone";
   switch (s.micState) {
     case "noDevice":
       return t("mic.noDevice");
+    case "steamMissing":
+      return t("mic.steamMissing");
+    case "preparing":
+      return s.hostPlatform === "windows" ? t("mic.preparingSteam") : t("mic.preparing");
+    case "setupFailed":
+      return t("mic.setupFailed", { detail: s.micDetail ?? "—" });
     case "busy":
       return t("mic.busy");
     case "failed":
-      return t("mic.failed", { detail: s.micDetail ?? "—" });
-    default:
-      return s.micLive ? t("mic.live") : t("mic.ready");
+      return t("mic.failed", { device, detail: s.micDetail ?? "—" });
+    default: {
+      const hint = t(s.micLive ? "mic.live" : "mic.ready", { device });
+      return s.hostPlatform === "mac" ? `${hint} ${t("mic.macPermission")}` : hint;
+    }
   }
 }
 

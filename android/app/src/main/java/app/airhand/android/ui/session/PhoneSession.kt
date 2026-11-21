@@ -51,6 +51,9 @@ import androidx.compose.material.icons.outlined.LinkOff
 import androidx.compose.material.icons.outlined.Monitor
 import androidx.compose.material.icons.outlined.Mouse
 import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.SportsEsports
+import androidx.compose.material.icons.outlined.StayCurrentLandscape
+import androidx.compose.material.icons.outlined.StayCurrentPortrait
 import androidx.compose.material.icons.outlined.TouchApp
 import androidx.compose.material.icons.automirrored.outlined.VolumeOff
 import androidx.compose.material.icons.automirrored.outlined.VolumeUp
@@ -68,6 +71,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.collectAsState
@@ -104,15 +108,12 @@ import app.airhand.android.core.Codec
 import app.airhand.android.core.OsKind
 import app.airhand.android.core.Preset
 import app.airhand.android.core.SystemAction
-import app.airhand.android.core.VideoPriority
 import app.airhand.android.data.TouchMode
 import app.airhand.android.ui.ConfirmDialog
 import app.airhand.android.ui.Messages
 import app.airhand.android.ui.OsAvatar
 import app.airhand.android.ui.phone.presetDesc
 import app.airhand.android.ui.phone.presetName
-import app.airhand.android.ui.phone.priorityDesc
-import app.airhand.android.ui.phone.priorityName
 import app.airhand.android.ui.theme.Brand
 import kotlin.math.roundToInt
 
@@ -133,7 +134,7 @@ private fun initialMode(setting: TouchMode, os: OsKind) = when (setting) {
     TouchMode.AUTO -> if (os == OsKind.ANDROID) UiMode.TOUCH else UiMode.TRACKPAD
 }
 
-private enum class Page { MAIN, SHORTCUTS, DISPLAYS, QUALITY, CLIPBOARD, HELP }
+private enum class Page { MAIN, SHORTCUTS, DISPLAYS, QUALITY, CLIPBOARD, GAME, HELP }
 
 /**
  * 手机上的远程画面。
@@ -141,6 +142,8 @@ private enum class Page { MAIN, SHORTCUTS, DISPLAYS, QUALITY, CLIPBOARD, HELP }
  * 画面占满屏幕，只有一个可以拖动的小圆钮（点开是菜单），尽量不挡画面。
  * 打开键盘时上面多一排特殊键（Esc、Tab、Ctrl、方向键……），画面缩到键盘上面，始终能看到全貌。
  * 控制手机时底部有返回 / 主页 / 最近任务三个键。第一次使用某种操作方式时先说明手势。
+ * 控制电脑时可以在画面上叠一层游戏按键（菜单 → 游戏按键，见 [GameControls]），编辑方案时盖上 [GameEditOverlay]。
+ * 横屏还是竖屏跟着对方画面走，菜单里可以换（[landscape] 是现在的方向，[onRotate] 换到另一个方向）。
  */
 @OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
@@ -149,6 +152,8 @@ fun PhoneSession(
     view: RemoteView,
     kb: KeyboardController,
     keyboardOpen: MutableState<Boolean>,
+    landscape: Boolean,
+    onRotate: () -> Unit,
     onExit: () -> Unit,
 ) {
     val app = AirhandApp.instance
@@ -176,6 +181,14 @@ fun PhoneSession(
     val tipKey = gm.name.lowercase()
     val showTips = phase == RemoteSession.Phase.Live && video != null && tipKey !in settings.tipsSeen
 
+    // 游戏按键：只在控制电脑时有（手机那边是触摸，没有键盘可按）
+    val games by app.games.flow.collectAsState()
+    val gameLayout = games.layoutFor(session.code)
+    val gameOn = os != OsKind.ANDROID && games.isOn(session.code) && gameLayout != null
+    var editor by remember { mutableStateOf<LayoutEditor?>(null) }
+    LaunchedEffect(editor) { view.editor = editor }
+    DisposableEffect(Unit) { onDispose { view.editor = null } }
+
     val displays by session.displays.collectAsState()
     val currentDisplay by session.currentDisplay.collectAsState()
     val mouseLock by session.mouseLock.collectAsState()
@@ -202,7 +215,7 @@ fun PhoneSession(
         imeWasVisible = imeVisible
     }
 
-    BackHandler(enabled = !menu) { confirmExit = true }
+    BackHandler(enabled = !menu && editor == null) { confirmExit = true }
 
     val imeBottom = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
     val keysBar = if (imeVisible) 44.dp else 0.dp
@@ -219,18 +232,25 @@ fun PhoneSession(
 
         val covered = SessionStatus(session, big = false, onExit = onExit)
 
+        // 游戏按键：连上了、没盖住、没开键盘（键盘会挡住）、没在编辑时才显示；收起、换方案都先松开按着的键
+        val live = phase == RemoteSession.Phase.Live && video != null
+        val showGame = gameOn && live && !covered && !imeVisible && editor == null
+        LaunchedEffect(showGame, gameLayout) { view.setGame(if (showGame) gameLayout else null) }
+
         // 被控端的提示（采集失败、不能操作……）和本机的问题
         val messages = notices.entries.filter { it.key !in dismissed }.map { it.key to Messages.notice(ctx, it.value, os) } +
             listOfNotNull(audioError?.let { "localAudio" to ctx.getString(R.string.audio_playback_failed, it) }).filter { it.first !in dismissed }
-        Column(
-            Modifier
-                .align(Alignment.TopCenter)
-                .windowInsetsPadding(WindowInsets.safeDrawing)
-                .padding(top = 8.dp, start = 56.dp, end = 56.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            messages.forEach { (key, text) ->
-                NoticePill(text) { dismissed = dismissed + key }
+        if (editor == null) {
+            Column(
+                Modifier
+                    .align(Alignment.TopCenter)
+                    .windowInsetsPadding(WindowInsets.safeDrawing)
+                    .padding(top = 8.dp, start = 56.dp, end = 56.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                messages.forEach { (key, text) ->
+                    NoticePill(text) { dismissed = dismissed + key }
+                }
             }
         }
 
@@ -267,7 +287,7 @@ fun PhoneSession(
             )
         }
 
-        if (!covered) {
+        if (!covered && editor == null) {
             MenuHandle(
                 bottomInset = imeBottom + keysBar + navBar,
                 onClick = {
@@ -281,6 +301,22 @@ fun PhoneSession(
             GestureTips(gm, onDone = {
                 app.updateSettings { it.copy(tipsSeen = it.tipsSeen + tipKey) }
             })
+        } else if (showGame && GAME_TIPS !in settings.tipsSeen) {
+            // 第一次打开游戏按键：说明怎么按、空白处怎么转视角、在哪里改
+            GameTips(onDone = {
+                app.updateSettings { it.copy(tipsSeen = it.tipsSeen + GAME_TIPS) }
+            })
+        }
+
+        editor?.let { ed ->
+            GameEditOverlay(
+                ed,
+                onCancel = { editor = null },
+                onDone = {
+                    app.games.save(ed.layout)
+                    editor = null
+                },
+            )
         }
     }
 
@@ -299,8 +335,12 @@ fun PhoneSession(
             ) {
                 when (page) {
                     Page.MAIN -> MainMenu(
-                        session, view, name, os, mode,
+                        session, view, name, os, mode, landscape, gameOn,
                         onMode = { mode = it },
+                        onRotate = {
+                            menu = false
+                            onRotate()
+                        },
                         onKeyboard = {
                             menu = false
                             keyboardOpen.value = true
@@ -335,6 +375,18 @@ fun PhoneSession(
                     Page.CLIPBOARD -> SubPage(stringResource(R.string.menu_clipboard), { page = Page.MAIN }) {
                         ClipboardActions(session) { menu = false }
                     }
+                    Page.GAME -> SubPage(stringResource(R.string.menu_game), { page = Page.MAIN }) {
+                        GamePage(
+                            session.code,
+                            onEdit = { l ->
+                                menu = false
+                                keyboardOpen.value = false
+                                app.games.setDevice(session.code, on = true, layout = l.id)
+                                editor = view.newEditor(l)
+                            },
+                            onClose = { menu = false },
+                        )
+                    }
                     Page.HELP -> SubPage(stringResource(R.string.menu_help), { page = Page.MAIN }) {
                         GestureHelp(gm)
                     }
@@ -357,6 +409,9 @@ fun PhoneSession(
         )
     }
 }
+
+/** 看过游戏按键的说明（Settings.tipsSeen） */
+private const val GAME_TIPS = "game"
 
 // ───────────────────────────── 浮动圆钮 ─────────────────────────────
 
@@ -425,7 +480,10 @@ private fun MainMenu(
     name: String,
     os: OsKind,
     mode: UiMode,
+    landscape: Boolean,
+    gameOn: Boolean,
     onMode: (UiMode) -> Unit,
+    onRotate: () -> Unit,
     onKeyboard: () -> Unit,
     onPage: (Page) -> Unit,
     onClose: () -> Unit,
@@ -438,6 +496,7 @@ private fun MainMenu(
     val avSyncOn by session.avSyncOn.collectAsState()
     val mouseLock by session.mouseLock.collectAsState()
     val hostOs by session.hostOs.collectAsState()
+    val safety by session.safety.collectAsState()
 
     Row(Modifier.padding(horizontal = 20.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
         OsAvatar(hostOs, 40.dp)
@@ -457,6 +516,14 @@ private fun MainMenu(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            // 安全码：对方显示的是同一个（电脑在托盘里，手机在"共享本机"页），不一样就是中间有人
+            safety?.let {
+                Text(
+                    stringResource(R.string.session_safety, it),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
         IconButton(onClick = onClose) { Icon(Icons.Outlined.Close, stringResource(R.string.close)) }
     }
@@ -495,21 +562,29 @@ private fun MainMenu(
         if (displays.size > 1) {
             Action(Icons.Outlined.Monitor, stringResource(R.string.menu_displays), cell) { onPage(Page.DISPLAYS) }
         }
-        // 锁定鼠标（控制电脑时）：鼠标一直只发移动了多少，游戏里转视角用
+        // 锁定鼠标（控制电脑时）：鼠标一直只发移动了多少，游戏里转视角用；游戏按键：画面上的按钮和摇杆
         val lockable = os != OsKind.ANDROID
         if (lockable) {
             Action(Icons.Outlined.Lock, stringResource(if (mouseLock) R.string.menu_mouse_lock_on else R.string.menu_mouse_lock_off), cell, active = mouseLock) {
                 session.mouseLock.value = !mouseLock
             }
+            Action(Icons.Outlined.SportsEsports, stringResource(R.string.menu_game), cell, active = gameOn) { onPage(Page.GAME) }
         }
         Action(Icons.Outlined.Crop, stringResource(R.string.menu_fit), cell, enabled = view.zoomed) {
             view.fit()
             onClose()
         }
+        // 横屏 / 竖屏：显示现在的方向，点一下换到另一个
+        Action(
+            if (landscape) Icons.Outlined.StayCurrentLandscape else Icons.Outlined.StayCurrentPortrait,
+            stringResource(if (landscape) R.string.menu_landscape else R.string.menu_portrait),
+            cell,
+            onClick = onRotate,
+        )
         Action(Icons.AutoMirrored.Outlined.HelpOutline, stringResource(R.string.menu_help), cell) { onPage(Page.HELP) }
         Action(Icons.Outlined.LinkOff, stringResource(R.string.disconnect), cell, danger = true, onClick = onDisconnect)
         // 补齐最后一行，保持格子宽度一致
-        val items = 9 + (if (displays.size > 1) 1 else 0) + (if (lockable) 1 else 0)
+        val items = 10 + (if (displays.size > 1) 1 else 0) + (if (lockable) 2 else 0)
         repeat((4 - items % 4) % 4) { Spacer(cell) }
     }
 }
@@ -699,7 +774,7 @@ private fun Quality(session: RemoteSession) {
         Row(
             Modifier
                 .fillMaxWidth()
-                .clickable { session.setQuality(p.quality(q.codec, q.priority)) }
+                .clickable { session.setQuality(p.quality(q.codec)) }
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -710,26 +785,6 @@ private fun Quality(session: RemoteSession) {
                 Text(presetDesc(p), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
-    }
-    // 缩放优先：对方是电脑时才有区别（手机自己缩放、编码）
-    if (hello?.platform != OsKind.ANDROID) {
-        HorizontalDivider(Modifier.padding(vertical = 8.dp, horizontal = 16.dp))
-        Text(stringResource(R.string.scaling_priority), style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp))
-        FlowRow(Modifier.padding(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            VideoPriority.entries.forEach { p ->
-                FilterChip(
-                    selected = q.priority == p,
-                    onClick = { session.setPriority(p) },
-                    label = { Text(priorityName(p)) },
-                )
-            }
-        }
-        Text(
-            priorityDesc(q.priority),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
-        )
     }
     HorizontalDivider(Modifier.padding(vertical = 8.dp, horizontal = 16.dp))
     Text(stringResource(R.string.codec), style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp))

@@ -7,15 +7,16 @@
 //! * 探测和回声只发在要量的那条路上（[`DatagramSender::send_on`]）。
 //!
 //! 直连任务在直连通了、断了的时候改它（[`Paths::attach`] / [`Paths::detach`]），写任务每一帧、每个数据报看一眼。
+//!
+//! 声音发送时可短暂等发送缓冲。只关心最新值的控制数据报直接入队，满时由 QUIC 优先丢掉旧数据报。
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use airhand_proto::datagram;
-use airhand_proto::framing;
 use airhand_proto::minicbor::Encode;
 use bytes::Bytes;
-use quinn::{Connection, SendStream};
+use quinn::{Connection, SendDatagramError, SendStream};
 use tokio::sync::{mpsc, watch};
 use tracing::debug;
 
@@ -24,6 +25,25 @@ use crate::secure::Sealer;
 
 /// 直连上的控制通道最多排着这么多帧没写出去，再多就不写了（中转上还有一份）
 const MIRROR_QUEUE: usize = 64;
+
+/// 发一个数据报（见模块说明）：发送缓冲放得下就马上放进去；放不下就等空位，最多等 `wait`，等不到就算丢了（`Ok`）。
+/// 连接断了是错误
+pub(crate) async fn send_datagram(
+    conn: &Connection,
+    d: Bytes,
+    wait: Duration,
+) -> Result<(), SendDatagramError> {
+    if conn.datagram_send_buffer_space() >= d.len() {
+        return conn.send_datagram(d);
+    }
+    match tokio::time::timeout(wait, conn.send_datagram_wait(d)).await {
+        Ok(r) => r,
+        Err(_) => {
+            debug!("the datagram send buffer stayed full, dropped a datagram");
+            Ok(())
+        }
+    }
+}
 
 /// 一个会话的两条路（见模块说明）。复制出来的是同一个
 #[derive(Clone)]
@@ -179,22 +199,22 @@ impl DatagramSender {
 
     /// 只发在 `via` 这条路上（探测、回声：量的就是这条路）。直连没通时什么也不发
     pub fn send_on<T: Encode<()>>(&self, via: Via, msg: &T) {
-        let conn = match via {
-            Via::Relay => Some(self.0.paths.relay().clone()),
-            Via::Direct => self.0.paths.direct(),
+        let paths = &self.0.paths;
+        let direct = match via {
+            Via::Relay => None,
+            Via::Direct => match paths.direct() {
+                Some(conn) => Some(conn),
+                None => return,
+            },
         };
-        if let (Some(conn), Some(d)) = (conn, self.seal(msg)) {
-            let _ = conn.send_datagram(d);
+        if let Some(d) = self.seal(msg) {
+            let _ = direct.as_ref().unwrap_or(paths.relay()).send_datagram(d);
         }
     }
 
     fn seal<T: Encode<()>>(&self, msg: &T) -> Option<Bytes> {
         let d = &self.0;
-        let sealed = d.sealer.lock().unwrap().seal_datagram(
-            d.session_id,
-            datagram::CONTROL,
-            &framing::to_vec(msg),
-        );
+        let sealed = d.sealer.lock().unwrap().seal_control(d.session_id, msg);
         sealed
             .inspect_err(|e| debug!("can't seal a control datagram: {e:#}"))
             .ok()

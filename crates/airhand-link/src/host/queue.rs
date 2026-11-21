@@ -59,23 +59,23 @@ impl Place {
     fn of(msg: &HostMsg) -> Self {
         let lane = match msg.lane() {
             SessionLane::Bulk => BULK,
-            // 画面不是消息，不走这里
-            SessionLane::Control | SessionLane::Video => CONTROL,
+            // 画面、文件的内容不是消息，不走这里
+            SessionLane::Control | SessionLane::Video(_) | SessionLane::File => CONTROL,
         };
         let queued = |before| Place::Queued { lane, before };
         match msg {
             HostMsg::Displays { .. } => Place::Latest(DISPLAYS),
             HostMsg::Hello(_) => queued(Some(DISPLAYS)),
             HostMsg::Cursor { .. } => Place::Latest(CURSOR),
-            HostMsg::AwaitingApproval
-            | HostMsg::Notice(_)
+            HostMsg::Notice(_)
             | HostMsg::Encoder(_)
             | HostMsg::CursorImage { .. }
             | HostMsg::Clipboard { .. }
             | HostMsg::Bye(_)
             | HostMsg::Direct(_)
             // 麦克风的状态很少变，跟在 Hello 后面按顺序发
-            | HostMsg::Mic { .. } => queued(None),
+            | HostMsg::Mic { .. }
+            | HostMsg::Files(_) => queued(None),
         }
     }
 
@@ -274,6 +274,7 @@ mod tests {
         HostMsg::Displays {
             displays: vec![display(name)],
             current: 0,
+            shown: vec![0],
         }
     }
 
@@ -288,6 +289,8 @@ mod tests {
             platform: Platform::Linux,
             touch: false,
             actions: vec![],
+            shown: vec![0],
+            streams: 1,
         })
     }
 
@@ -347,7 +350,6 @@ mod tests {
             (displays("a"), SessionLane::Control),
             (hello("a"), SessionLane::Control),
             (notice(), SessionLane::Control),
-            (HostMsg::AwaitingApproval, SessionLane::Control),
             (HostMsg::Bye(ByeReason::Kicked), SessionLane::Control),
             (
                 HostMsg::Mic {

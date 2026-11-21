@@ -18,7 +18,7 @@ import java.io.File
  * 应用的全部数据：都是 JSON 文件，放在应用自己的数据目录（`filesDir`）里。
  * 没有别的地方存东西：卸载时系统把这个目录整个删掉；清单里也关掉了备份和设备迁移。
  */
-private object JsonFile {
+internal object JsonFile {
     fun read(file: File): String? = try {
         if (file.exists()) String(AtomicFile(file).readFully(), Charsets.UTF_8) else null
     } catch (e: Exception) {
@@ -76,8 +76,6 @@ data class Settings(
     val avSync: Boolean = false,
     /** 视频编码格式：空字符串表示自动（双方都支持的压缩率最高的格式），否则是 `Codec.wire` */
     val codec: String = "",
-    /** 对方缩小画面时优先低延迟还是文字清晰（`VideoPriority.wire`）；会话里改了也记在这里，以后的连接也用 */
-    val priority: String = "latency",
     /** 电视上画面的缩放方式 */
     val tvScale: ScaleMode = ScaleMode.FIT,
     /** 控制手机时显示返回 / 主页 / 最近任务按钮 */
@@ -87,8 +85,6 @@ data class Settings(
      * 关掉时只看画面里的（见 [app.airhand.android.ui.session.RemoteView]）
      */
     val localCursor: Boolean = true,
-    /** 别人连接本机时先请我同意 */
-    val requireApproval: Boolean = true,
     /** 已经看过的手势说明（trackpad / touch / tv） */
     val tipsSeen: Set<String> = emptySet(),
     /**
@@ -115,11 +111,9 @@ data class Settings(
         .put("audio", audio)
         .put("avSync", avSync)
         .put("codec", codec)
-        .put("priority", priority)
         .put("tvScale", tvScale.id)
         .put("navKeys", navKeys)
         .put("localCursor", localCursor)
-        .put("requireApproval", requireApproval)
         .put("tipsSeen", JSONArray(tipsSeen.toList()))
         .put("identity", identity)
 
@@ -138,11 +132,9 @@ data class Settings(
                 audio = o.optBoolean("audio", d.audio),
                 avSync = o.optBoolean("avSync", d.avSync),
                 codec = o.optString("codec", d.codec),
-                priority = o.optString("priority", d.priority),
                 tvScale = ScaleMode.of(o.optStringOrNull("tvScale")),
                 navKeys = o.optBoolean("navKeys", d.navKeys),
                 localCursor = o.optBoolean("localCursor", d.localCursor),
-                requireApproval = o.optBoolean("requireApproval", d.requireApproval),
                 tipsSeen = if (tips == null) emptySet() else (0 until tips.length()).map { tips.getString(it) }.toSet(),
                 identity = o.optString("identity", ""),
             )
@@ -324,5 +316,58 @@ class HostCodeStore(context: Context) {
         } else {
             JsonFile.write(file, JSONObject().put("code", c.code).put("secret", c.secret).toString())
         }
+    }
+}
+
+/** 配对过的一个控制端（`key`：它在端到端握手里的公钥；`since`：配对的时间，Unix 毫秒） */
+data class PairedDevice(val key: String, val name: String, val since: Long)
+
+/**
+ * 本机作为被控端的配对状态：配对码、有人多次输错之后暂停了没有、配对过的控制端。
+ * JSON 的格式和 Rust 的 `airhand_link::host::PairingState` 一样：规则都在 Rust 那边，这里只保存和显示
+ */
+data class Pairing(val code: String, val locked: Boolean, val paired: List<PairedDevice>) {
+    fun toJson(): JSONObject = JSONObject()
+        .put("code", code)
+        .put("locked", locked)
+        .put("paired", JSONArray(paired.map { JSONObject().put("key", it.key).put("name", it.name).put("since", it.since) }))
+
+    companion object {
+        fun parse(o: JSONObject): Pairing {
+            val list = o.optJSONArray("paired") ?: JSONArray()
+            return Pairing(
+                code = o.optString("code"),
+                locked = o.optBoolean("locked"),
+                paired = (0 until list.length()).mapNotNull { i ->
+                    list.optJSONObject(i)?.let { PairedDevice(it.optString("key"), it.optString("name"), it.optLong("since")) }
+                },
+            )
+        }
+    }
+}
+
+/**
+ * 配对状态（`pairing.json`）。共享的时候由 Rust 维护：每次变化发 `pairing` 事件，这里保存下来，下次开始共享时传回去。
+ * 没在共享时才直接改它（忘掉配对过的、更换控制码时一起重来）
+ */
+class PairingStore(context: Context) {
+    private val file = File(context.filesDir, "pairing.json")
+    private val _flow = MutableStateFlow(load())
+    val flow: StateFlow<Pairing?> = _flow.asStateFlow()
+    val value: Pairing? get() = _flow.value
+
+    private fun load(): Pairing? = JsonFile.read(file)?.let { runCatching { Pairing.parse(JSONObject(it)) }.getOrNull() }
+
+    /** `null`：全部重来（下次开始共享时生成新的配对码，配对过的都忘掉） */
+    @Synchronized
+    fun save(p: Pairing?) {
+        if (p == null) AtomicFile(file).delete() else JsonFile.write(file, p.toJson().toString())
+        _flow.value = p
+    }
+
+    /** 忘掉配对过的控制端（配对码不变） */
+    @Synchronized
+    fun forget() {
+        value?.let { save(it.copy(paired = emptyList())) }
     }
 }

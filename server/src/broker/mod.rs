@@ -6,21 +6,19 @@
 //! 3. 把一端开过来的通道（单向流）转给另一端，以 `Bytes` 块为单位零拷贝透传；会话的数据报（声音、探测，见
 //!    `airhand_proto::datagram`）按开头的会话 ID 在两端之间原样转发（见 [`relay`]）。
 //!
-//! 服务器从不解析会话内容：会话是端到端加密的（见 `airhand_proto::handshake`），服务器只看会话头里的会话 ID、
-//! 通道编号和优先级，发起会话时控制端带来的握手消息也原样交给被控端。会话有几条通道、每条是什么，服务器都不管
-//! （只限制数量，`airhand_proto::MAX_LANES`）；任何一端的控制通道（0 号）结束了，整个会话结束。所以会话层加通道、
-//! 改格式都不用升级服务器。
+//! 中转只读会话 ID 和通道编号，据此设置优先级、限制并发；不解析端到端密文或握手。任一端的控制通道结束时关闭会话。
+//! 文件流另外受 [`Config::file_limit`] 约束，服务器在 Hello 中告知客户端。
 //!
-//! 版本握手见 `airhand_proto::signal` 的"版本握手"：服务器接受一个区间的信令版本，不要求相等。
+//! 信令版本必须一致，见 `airhand_proto::signal`。
 //!
 //! 防暴力猜码：控制码不存在算一次猜错（[`FAIL_LIMIT`]），并且晚 400 ms 回答。控制码存在、但被控端还没准备好
 //! （正在注册、正在断开）时回答得一模一样（也算猜错、也晚回答），不能靠回答的快慢看出控制码存在。
 //! 之前连上过的控制端带着重连凭证重连（见 `airhand_proto::signal` 模块说明的"重连凭证"）：凭证证明它本来就知道这个
 //! 控制码，这些请求不算猜错、不受猜码限速的影响，被控端不在线时服务器记下它们（[`Waiter`]），被控端重新上线时通知它们重连。
 //!
-//! 控制码对了的请求也限速：每批准一个，被控端就要开一个会话（先请本机用户同意的被控端还要问一次），并且占着它的
-//! 一个会话槽位——控制端一直不开控制通道的话，占到超时（[`relay`]）为止。不限速的话，知道控制码的人反复发起连接，
-//! 就能一直占满它的会话槽位、让它不停地弹出请求。所以同一个来源（[`limiter_key`]）一分钟内向同一台被控端发起的会话
+//! 控制码对了的请求也限速：每批准一个，被控端就要开一个会话（做一次端到端握手，带着配对码的还要占一次配对名额），
+//! 并且占着它的一个会话槽位——控制端一直不开控制通道的话，占到超时（[`relay`]）为止。不限速的话，知道控制码的人
+//! 反复发起连接，就能一直占满它的会话槽位。所以同一个来源（[`limiter_key`]）一分钟内向同一台被控端发起的会话
 //! 最多 [`Config::connects_per_minute`] 个，再多回答 `RateLimited`。带凭证的请求也算：凭证只说明它不是在猜码。
 //! 只数批准了的请求，被限速的来源本来就连上过这个控制码，这个回答不透露控制码存不存在。
 //!
@@ -60,10 +58,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use airhand_link::wire::{read_frame, write_frame, write_msg};
+use airhand_link::wire::{read_frame, write_msg};
 use airhand_proto::framing;
-use airhand_proto::signal::{ClientHello, ServerHello, ServerMsg, Versions};
-use airhand_proto::{MAX_SIGNAL_MSG, Role, features};
+use airhand_proto::signal::{ClientHello, ServerHello, ServerMsg};
+use airhand_proto::{MAX_SIGNAL_MSG, Role, SIGNAL_VERSION};
 use anyhow::{Context, Result, bail};
 use quinn::{SendStream, VarInt};
 use tokio::sync::mpsc;
@@ -111,6 +109,9 @@ pub struct Config {
     /// 同一个来源（[`limiter_key`]）一分钟内最多向同一台被控端发起这么多个会话（见模块说明）。
     /// 不应该比 `max_sessions_per_host` 小：不然同一个出口 IP 后面的人坐不满一台被控端
     pub connects_per_minute: usize,
+    /// 一次粘贴（剪贴板里的一个文件公告）经中转最多传这么多字节的内容（`None`：不限；`Some(0)`：中转不传文件，
+    /// 只能走直连）。在版本握手里告诉客户端（`ServerHello::file_limit`）；服务器按单条文件流兜底（见 [`relay`]）
+    pub file_limit: Option<u64>,
 }
 
 impl Config {
@@ -119,6 +120,8 @@ impl Config {
     /// 发起之后不开流的会话占着槽位到配对超时（20 多秒）：一分钟 6 个，平均占着 2 个多，
     /// 一个来源靠它占不满默认的 4 个槽位。正常使用（输错配对码再试、断线重连）到不了这个数
     pub const DEFAULT_CONNECTS_PER_MINUTE: usize = 6;
+    /// 剪贴板里的文件经中转的上限：50 MiB（大的走直连，见 `airhand_proto::files` 的"走哪条路"）
+    pub const DEFAULT_FILE_LIMIT: u64 = 50 << 20;
 }
 
 /// Bounded signaling output. A non-reading peer is disconnected on overflow,
@@ -162,6 +165,8 @@ pub struct Broker {
     /// 每个来源（[`limiter_key`]）现在有几条连接
     conns: Ranked<HashMap<std::net::IpAddr, usize>>,
     next_conn: AtomicU64,
+    /// 启动以来文件流一共转发了多少字节（见 [`relay`]）
+    file_bytes: Arc<AtomicU64>,
 }
 
 async fn writer_loop(mut send: SendStream, mut rx: mpsc::Receiver<ServerMsg>) {
@@ -188,6 +193,7 @@ impl Broker {
             new_codes: Limiter::new(Rank::NewCodes, limits::NEW_CODE_WINDOW),
             conns: Ranked::default_with(Rank::Conns),
             next_conn: AtomicU64::new(1),
+            file_bytes: Arc::default(),
         }))
     }
 
@@ -232,6 +238,11 @@ impl Broker {
         let sessions = self.sessions.lock().len();
         let fixed = self.bindings.lock().len();
         (hosts, sessions, fixed)
+    }
+
+    /// 启动以来文件流（剪贴板里的文件）一共经中转转发了多少字节
+    pub fn relayed_file_bytes(&self) -> u64 {
+        self.file_bytes.load(Ordering::Relaxed)
     }
 
     pub async fn handle_incoming(self: Arc<Self>, incoming: quinn::Incoming) {
@@ -281,22 +292,26 @@ impl Broker {
         if !got {
             bail!("peer closed the stream");
         }
-        // 版本握手（见 airhand_proto::signal 的"版本握手"）：先只读版本区间，任何版本的客户端都能听懂回答
-        let versions: Versions =
-            framing::decode_known(&buf).context("the first message must be Hello")?;
-        let answer = ServerHello::answer(versions, features::signal::SUPPORTED);
-        write_frame(&mut send, &framing::to_vec(&answer)).await?;
-        let Some(version) = answer.version else {
-            info!(%peer, min = versions.min, max = versions.max, "rejected client: no common signal version");
-            let _ = send.finish();
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        let ClientHello {
+            version,
+            role,
+            mut name,
+            mut os,
+        } = framing::decode_known(&buf).context("the first message must be Hello")?;
+        write_msg(&mut send, &ServerHello::new(self.cfg.file_limit)).await?;
+        if version != SIGNAL_VERSION {
+            info!(%peer, version, "rejected client: signal version mismatch");
+            send.finish()?;
+            // 等 Hello 被确认送达再关闭，不靠固定延时。
+            let _ = timeout(HANDSHAKE_TIMEOUT, send.stopped()).await;
             return Ok(());
-        };
-        let hello: ClientHello = framing::decode_known(&buf).context("bad Hello")?;
-        let role = hello.role;
+        }
         anyhow::ensure!(role.is_known(), "unknown role {role:?}");
-        let name: String = hello.name.chars().take(64).collect();
-        let os: String = hello.os.chars().take(64).collect();
+        for field in [&mut name, &mut os] {
+            if let Some((end, _)) = field.char_indices().nth(64) {
+                field.truncate(end);
+            }
+        }
         info!(%peer, conn_id, ?role, %name, %os, version, "client connected");
 
         let (tx, rx) = mpsc::channel::<ServerMsg>(64);

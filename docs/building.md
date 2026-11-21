@@ -12,14 +12,14 @@ The clients have the **relay server's address and certificate fingerprint** comp
 |---|---|
 | All | A recent stable Rust (edition 2024), Node.js 20+, CMake (to build libopus) |
 | Windows | Windows 10/11. WebView2 usually ships with the OS; if it's missing the installer downloads and installs it |
-| macOS | macOS 13 or later and the Xcode Command Line Tools (`xcode-select --install`); CMake can come from `brew install cmake` |
-| Linux | Tauri's dependencies, the PulseAudio development files and the GStreamer plugins the console uses to decode video (see below) |
+| macOS | macOS 13 or later and the Xcode Command Line Tools with a macOS 14.2+ SDK for microphone forwarding (`xcode-select --install`); CMake can come from `brew install cmake` |
+| Linux | Tauri's dependencies, the PulseAudio and PipeWire development files and the GStreamer plugins the console uses to decode video (see below) |
 
 Debian / Ubuntu:
 
 ```bash
 sudo apt install build-essential cmake pkg-config libssl-dev libwebkit2gtk-4.1-dev \
-  libayatana-appindicator3-dev librsvg2-dev libxdo-dev libpulse-dev \
+  libayatana-appindicator3-dev librsvg2-dev libxdo-dev libpulse-dev libpipewire-0.3-dev \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
 ```
 
@@ -76,6 +76,7 @@ The output is under `client/src-tauri/target/release/`:
 - For just the .app use `npm run tauri build -- --bundles app`; it is built for the machine's own architecture (arm64 on Apple silicon)
 - The app is only ad-hoc signed, not notarized: the first time you open a copy on another Mac, right-click it in Finder → Open (or run `xattr -dr com.apple.quarantine Airhand.app`)
 - macOS remembers granted permissions by code signature, and an ad-hoc signature changes with every build: after rebuilding, remove Airhand in System Settings → Privacy & Security and grant the permissions again. For long-term use, put your own Developer ID in `signingIdentity` in `client/src-tauri/tauri.macos.conf.json`
+- Bundles are signed with the Hardened Runtime, using the entitlements in `client/src-tauri/Entitlements.plist`. Without `com.apple.security.device.audio-input`, macOS denies the microphone silently, without asking
 
 ## Android (APK)
 

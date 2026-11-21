@@ -14,15 +14,10 @@ import { isTauri } from "@tauri-apps/api/core";
 import { tauriBackend } from "./backend/tauri";
 import { webBackend } from "./backend/web";
 import type { MediaView, ViewOutput } from "./console";
+import type { LocalFiles } from "./files";
 import type { Lang } from "./i18n";
 
 export type Codec = "h264" | "h265" | "av1";
-
-/**
- * 被控端缩放画面时优先什么（airhand_proto::session::VideoPriority）：
- * latency：在显卡上缩放，画面不经过 CPU；clarity：在 CPU 上用更锐利的算法缩放。不需要缩放时一样
- */
-export type VideoPriority = "latency" | "clarity";
 
 /** 与 airhand_proto::session::QualitySettings 对应 */
 export interface QualitySettings {
@@ -32,9 +27,21 @@ export interface QualitySettings {
   maxShort: number;
   adaptive: boolean;
   codec: Codec;
-  /** 不带（之前保存的画质、Android）就是 latency */
-  priority?: VideoPriority;
+  /**
+   * 让对方把光标画进画面里（游戏模式，见 input.ts）。不是画质的一部分：由会话按鼠标模式在发出去的时候加上
+   * （session.ts 的 effectiveSettings），保存的画质里没有它
+   */
+  drawCursor?: boolean;
 }
+
+/**
+ * 鼠标模式（见 input.ts 和 airhand_proto::session 的"鼠标"）：
+ * auto：平时跟着本机指针，对方隐藏光标时（游戏里转视角）自动锁定、发相对移动（默认）；
+ * desktop：一直跟着本机指针，从不锁定；
+ * game：锁定本机指针、一直发相对移动，对方把光标画进画面里
+ */
+export type MouseMode = "auto" | "desktop" | "game";
+export const MOUSE_MODES: MouseMode[] = ["auto", "desktop", "game"];
 
 export interface DisplayInfo {
   index: number;
@@ -44,6 +51,15 @@ export interface DisplayInfo {
   width: number;
   height: number;
   primary: boolean;
+}
+
+/**
+ * 一路画面看哪个显示器（airhand_proto::session::StreamView，见那里的"多屏"）：`display` 是 DisplayInfo.index，
+ * `maxShort` 是按这一路显示的大小要的短边上限（0 = 不限，和画质设置里的取较严的）
+ */
+export interface StreamView {
+  display: number;
+  maxShort: number;
 }
 
 export type ServerState =
@@ -88,10 +104,6 @@ export type Problem =
   | { kind: "hostUnresponsive" }
   | { kind: "kicked" }
   | { kind: "codeChanged" }
-  /** 被控端的用户拒绝了连接 */
-  | { kind: "declined" }
-  /** 被控端的用户一直没有回应连接请求 */
-  | { kind: "unanswered" }
   | { kind: "sessionEnded" }
   // 其它
   | { kind: "noSession" }
@@ -144,6 +156,10 @@ export interface SavedDevice {
   lastUsed: number;
   /** 上次用的画质 */
   quality: QualitySettings | null;
+  /** 上次用的鼠标模式；没有（自动、之前的版本、网页版刚记下的）就是自动 */
+  mouse?: MouseMode | null;
+  /** 操作这台 Mac 时互换物理 Ctrl 和 Command 键，默认关闭 */
+  swapCtrlCommand?: boolean;
   /** 对方的端到端加密公钥（64 位十六进制，第一次连上时记下）：之后只认它 */
   hostKey: string | null;
 }
@@ -181,16 +197,44 @@ export interface ConnectOptions {
   settings: QualitySettings;
   /** 开始时要不要声音（同上） */
   audio: boolean;
+  /** 开始时看哪几个显示器（第 i 项是第 i 路画面）；不带、空的是只看主显示器（第一次连时还不知道对方有哪些显示器） */
+  view?: StreamView[];
 }
+
+/**
+ * 剪贴板里的文件的一项（airhand_proto::files::FileEntry）：公告里 path 只有一段（名称），列表里是相对被列的目录的几段。
+ * 链接带着它指向的路径（分隔符是 /）
+ */
+export interface FileEntry {
+  path: string[];
+  kind: "file" | "dir" | "link";
+  size: number;
+  /** 修改时间（Unix 毫秒） */
+  mtime: number | null;
+  target?: string;
+}
+
+/** 剪贴板里的文件为什么传不了（airhand_proto::files::FileError） */
+export type FileError =
+  | "notFound"
+  | "denied"
+  | "changed"
+  | "io"
+  | "tooLarge"
+  | "expired"
+  | "invalid"
+  | "busy"
+  | "tooMany"
+  | "closed";
 
 /** 被控端的平台，与 airhand_proto::session::Platform 对应（对方的版本更新、报了这边不认识的平台时是 linux） */
 export type Platform = "windows" | "mac" | "linux" | "android";
 
 /**
  * 被控端能不能接本机的麦克风（airhand_proto::session::MicState）：unsupported = 那个平台还不支持；
- * noDevice = 没有虚拟麦克风（Windows：Steam Streaming Microphone）；busy = 别的控制端在用；failed = 打不开、在重试
+ * noDevice = 打开转发时可安装驱动，steamMissing = 需要先安装 Steam，preparing = 正在准备设备，setupFailed = 驱动未就绪。
  */
-export type MicState = "unsupported" | "noDevice" | "ready" | "busy" | "failed";
+export type MicState = "unsupported" | "noDevice" | "ready" | "busy" | "failed" | "steamMissing" | "preparing" | "setupFailed";
 
 /** 系统操作（手机的导航键等），与 airhand_proto::session::SystemAction 对应 */
 export type SystemAction =
@@ -212,7 +256,12 @@ export type SessionEvent =
       os: string;
       version: string;
       displays: DisplayInfo[];
+      /** 第 0 路画面是哪个显示器 */
       current: number;
+      /** 每一路画面是哪个显示器（第 i 项是第 i 路） */
+      shown: number[];
+      /** 对方最多能同时发几路画面（同时看几个显示器） */
+      maxStreams: number;
       codecs: Codec[];
       platform: Platform;
       /** 能接收多点触摸（控制台用鼠标，不发触摸） */
@@ -220,9 +269,7 @@ export type SessionEvent =
       /** 支持的系统操作 */
       actions: SystemAction[];
     }
-  /** 被控端在等它的用户同意这次连接，同意之后才会收到 hello */
-  | { type: "awaitingApproval" }
-  | { type: "displays"; displays: DisplayInfo[]; current: number }
+  | { type: "displays"; displays: DisplayInfo[]; current: number; shown: number[] }
   | {
       type: "stats";
       fps: number;
@@ -234,12 +281,17 @@ export type SessionEvent =
       /** 画面是从直连来的（两台设备之间打通的路，不经过服务器） */
       direct: boolean;
     }
-  | { type: "encoder"; codec: Codec; name: string; hardware: boolean; width: number; height: number }
+  /** 第 stream 路画面的编码器 */
+  | { type: "encoder"; stream: number; codec: Codec; name: string; hardware: boolean; width: number; height: number }
   | { type: "notice"; notice: RemoteNotice }
   /** 被控端复制的文本（只有网页版会收到，由 backend/web.ts 处理） */
   | { type: "clipboard"; text: string }
   /** 被控端能不能接本机的麦克风：会话开始时一次，之后有变化再来；对方的版本旧时没有。detail：出错时的技术信息 */
   | { type: "mic"; state: MicState; detail: string | null }
+  /** 被控端复制了文件（只有网页版会收到；桌面版直接放进本机剪贴板）：要内容时用 remoteList / remoteRead 取 */
+  | { type: "clipboardFiles"; clip: number; items: FileEntry[] }
+  /** 剪贴板里的文件传不了（被控端那边的、这边的）：哪个文件、为什么 */
+  | { type: "fileError"; name: string; error: FileError }
   | { type: "closed"; reason: Problem; retry: boolean };
 
 export type MouseButton = "left" | "right" | "middle" | "back" | "forward";
@@ -248,8 +300,8 @@ export type TouchPhase = "down" | "move" | "up" | "cancel";
 
 /** 与 airhand_proto::session::InputEvent 对应（以 type 区分） */
 export type InputEvent =
-  /** 移到这个位置（0..1，相对当前显示器的画面） */
-  | { type: "mouseMove"; x: number; y: number }
+  /** 移到这个位置（0..1，相对第 stream 路画面；第 0 路不写） */
+  | { type: "mouseMove"; x: number; y: number; stream?: number }
   /** 相对移动（被控端光标隐藏时，例如游戏里转视角）：鼠标的原始计数，约等于被控端的像素 */
   | { type: "mouseDelta"; dx: number; dy: number }
   | { type: "mouseButton"; button: MouseButton; down: boolean }
@@ -265,10 +317,12 @@ export type InputEvent =
 export type Command =
   | { cmd: "input"; sid: number; events: InputEvent[] }
   | { cmd: "settings"; sid: number; settings: QualitySettings }
-  /** 请被控端马上编一个关键帧 */
-  | { cmd: "keyframe"; sid: number }
-  /** 切换到被控端的另一个显示器 */
+  /** 请被控端马上给第 stream 路画面编一个关键帧（不写是第 0 路） */
+  | { cmd: "keyframe"; sid: number; stream?: number }
+  /** 只看被控端的第 index 个显示器 */
   | { cmd: "display"; sid: number; index: number }
+  /** 看被控端的哪几个显示器：第 i 项是第 i 路画面（多屏同时显示） */
+  | { cmd: "view"; sid: number; streams: StreamView[] }
   /** 开启 / 关闭被控端的声音 */
   | { cmd: "audio"; sid: number; enabled: boolean }
   /** 打开 / 关闭本机的麦克风（打开之后 Worker 把编好的声音包发给控制端服务，见 media.ts 的 micMessage） */
@@ -277,9 +331,20 @@ export type Command =
   | { cmd: "clipboard"; sid: number; text: string }
   /** 打开 / 关闭剪贴板同步 */
   | { cmd: "clipboardSync"; sid: number; enabled: boolean }
+  /** 这里的剪贴板换成了文件以外的东西：之前公告的文件不再是最新的（网页版） */
+  | { cmd: "clipboardCleared"; sid: number }
   /** 收到了第 seq 帧画面（累积确认；控制台的 Worker 收到画面时自己发，走二进制，见 ack.ts） */
-  | { cmd: "ack"; sid: number; seq: number }
+  | { cmd: "ack"; sid: number; seq: number; stream?: number }
   | { cmd: "disconnect"; sid: number };
+
+/** 桌面版的弹出窗口（Tauri 窗口，按 label 找到它，见 src-tauri/src/popout.rs） */
+export interface PopoutFrames {
+  setFullscreen(label: string, on: boolean): Promise<void>;
+  isFullscreen(label: string): Promise<boolean>;
+  /** 把窗口拿到前面（最小化了的先还原） */
+  focus(label: string): Promise<void>;
+  close(label: string): Promise<void>;
+}
 
 /** 控制台与控制端服务之间的通道。会话的部分两种运行方式共用（console.ts 的 ConsoleLink） */
 export interface Backend {
@@ -318,10 +383,34 @@ export interface Backend {
   setWindowFullscreen(on: boolean): Promise<void>;
   /** 窗口退出了全屏（例如按了系统快捷键） */
   onWindowFullscreenExit(cb: () => void): () => void;
+  /**
+   * 弹出窗口（把对方的一个显示器放到单独的窗口里，见 popout.ts）的全屏、关闭：桌面版按窗口的 label 由 Rust 处理
+   * （网页全屏不会让 WebView2 的窗口变大，window.close 在 macOS、Linux 上关不掉窗口）；网页版没有，用浏览器自己的
+   */
+  readonly popouts?: PopoutFrames;
   /** 我的设备（桌面版：config.toml 里的）。返回 null 表示不能保存（网页版：只在本页面的内存里） */
   loadDevices(): Promise<SavedDevice[] | null>;
   /** 保存整个列表 */
   saveDevices(devices: SavedDevice[]): Promise<void>;
+  /**
+   * 剪贴板里的文件（见 files.ts）。这里复制的文件（粘贴到画面上、拖到画面上的）公告给被控端，它粘贴时才来取
+   * （由 `files` 读）；桌面版的本机剪贴板由 Rust 端自己同步，只有拖放走这里
+   */
+  offerFiles(sid: number, files: LocalFiles): Promise<void>;
+  /** 被控端复制的文件（clipboardFiles 事件）：列出目录 */
+  remoteList(sid: number, clip: number, path: string[], recursive: boolean): Promise<FileEntry[]>;
+  /** 被控端复制的文件：从 offset 开始最多读 len 字节（`file` 是这边选的编号，一个文件一个；读完了 remoteClose） */
+  remoteRead(
+    sid: number,
+    clip: number,
+    file: number,
+    path: string[],
+    size: number,
+    mtime: number | null,
+    offset: number,
+    len: number,
+  ): Promise<Uint8Array>;
+  remoteClose(sid: number, file: number): void;
   /** 桌面版的无边框窗口（标题栏和窗口按钮由界面自己画）；网页版在浏览器里，为 null */
   readonly frame: WindowFrame | null;
 }

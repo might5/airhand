@@ -4,15 +4,15 @@
 use std::sync::Arc;
 
 use airhand_proto::SessionLane;
-use airhand_proto::handshake::{Negotiated, PublicKey};
+use airhand_proto::handshake::PublicKey;
 use anyhow::Result;
 use quinn::{Connection, SendStream};
 
 use super::receiver::HostReceiver;
-use crate::lanes::{Feed, Registration, Router, Via, first_stream, open_lane};
-use crate::merge::{Merge, Policy};
+use crate::lanes::{Feed, LaneStreams, Registration, Router, Via, first_stream, open_lane};
+use crate::merge::Merge;
 use crate::paths::{DatagramSender, Paths};
-use crate::secure::{Initiator, STEP_TIMEOUT, Sealer};
+use crate::secure::{FileKeys, Initiator, STEP_TIMEOUT, Sealer};
 
 /// 握手做完了、本端的通道开好了的会话（见模块说明）
 pub struct Established {
@@ -20,8 +20,6 @@ pub struct Established {
     /// 被控端的公钥、安全码（见 `airhand_proto::handshake`）
     pub peer: PublicKey,
     pub safety: String,
-    /// 选定的会话版本和双方都支持的能力位
-    pub negotiated: Negotiated,
     /// 本端的控制通道（写的一半）和它的加密端（已经发出了确认，计数接着往下数）
     pub control: (SendStream, Sealer),
     /// 本端的大块通道
@@ -30,13 +28,14 @@ pub struct Established {
     pub paths: Paths,
     /// 发控制数据报（Ping、画面确认）
     pub datagrams: DatagramSender,
-    /// 麦克风的声音数据报的加密端（双方都支持 `airhand_proto::features::session::MIC` 时才用，
-    /// 见 `airhand_proto::session` 的"麦克风"）
+    /// 麦克风声音数据报的加密端，见 `airhand_proto::session` 的“麦克风”。
     pub mic: Sealer,
     /// 被控端发来的东西（被控端的探测在里面就弹回去了）
     pub receiver: HostReceiver,
     /// 直连上来的流、数据报交给这个会话
     pub feed: Feed,
+    /// 剪贴板里的文件：每次取用的密钥，被控端开过来的文件流（见 [`crate::files`]）
+    pub files: (FileKeys, LaneStreams),
     /// 在中转连接上的登记：丢掉之后不再收这个会话的东西
     pub registration: Registration,
 }
@@ -54,30 +53,24 @@ pub async fn establish(
     let mut control = open_lane(conn, session_id, SessionLane::Control).await?;
     let done = initiator.finish(&mut control_in, &mut control).await?;
     let bulk = open_lane(conn, session_id, SessionLane::Bulk).await?;
-    let secured = done.secured;
+    let mut secured = done.secured;
     let paths = Paths::new(conn.clone());
     let datagrams = DatagramSender::new(session_id, paths.clone(), secured.datagrams.sealer);
-    let mut control_merge = Merge::new(
-        SessionLane::Control,
-        Policy::Complete,
-        done.opener,
-        inbox.control,
-    );
+    let mut control_merge = Merge::new(SessionLane::Control, done.opener, inbox.control);
     control_merge.add(control_in, Via::Relay)?;
+    // 画面的每一路（见 airhand_proto::session 的"多屏"）：各自的帧流和密钥
+    let video = std::mem::take(&mut secured.video)
+        .into_iter()
+        .zip(inbox.video.drain(..))
+        .enumerate()
+        .map(|(stream, (keys, streams))| {
+            Merge::new(SessionLane::Video(stream as u8), keys.opener, streams)
+        })
+        .collect();
     let receiver = HostReceiver::new(
         control_merge,
-        Merge::new(
-            SessionLane::Bulk,
-            Policy::Complete,
-            secured.bulk.opener,
-            inbox.bulk,
-        ),
-        Merge::new(
-            SessionLane::Video,
-            Policy::Video,
-            secured.video.opener,
-            inbox.video,
-        ),
+        Merge::new(SessionLane::Bulk, secured.bulk.opener, inbox.bulk),
+        video,
         (inbox.audio, secured.audio.opener),
         (inbox.datagrams, secured.datagrams.opener),
         datagrams.clone(),
@@ -86,7 +79,6 @@ pub async fn establish(
         session_id,
         peer: secured.peer,
         safety: secured.safety,
-        negotiated: done.negotiated,
         control: (control, done.sealer),
         bulk: (bulk, secured.bulk.sealer),
         paths,
@@ -94,6 +86,7 @@ pub async fn establish(
         mic: secured.audio.sealer,
         receiver,
         feed: inbox.feed,
+        files: (secured.files, inbox.files),
         registration,
     })
 }

@@ -1,5 +1,8 @@
 //! 控制端的单个会话：把画面、声音原样转交给界面（界面自己解码），转发输入与设置，
-//! 把界面打好的麦克风声音包发成声音数据报。
+//! 把界面打好的麦克风声音包发成声音数据报，定时告诉被控端画面收得怎么样（[`Feedback::report`]）。
+//!
+//! 画面可能有好几路（多屏同时显示，见 `airhand_proto::session` 的"多屏"）：确认、等不到帧、报告、要关键帧都按路分开，
+//! 画面包头里写着是第几路，界面据此交给那一路的解码器。
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -8,15 +11,16 @@ use std::time::{Duration, Instant};
 
 use super::receiver::{FromHost, HostReceiver};
 use crate::audio::Bundler;
+use crate::merge::Video;
 use crate::paths::{DatagramSender, Paths};
-use crate::secure::{Negotiated, Sealer};
+use crate::secure::Sealer;
 use crate::transport::write_lane;
-use airhand_proto::datagram;
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{
     ByeReason, Codec, ControllerDatagram, ControllerMsg, DirectOffer, DisplayInfo, HostMsg,
-    MicState, Notice, Platform, SystemAction,
+    MicState, Notice, Platform, REPORT_EVERY, SystemAction, VideoReport,
 };
+use airhand_proto::{MAX_STREAMS, datagram};
 use anyhow::Result;
 use bytes::Bytes;
 use quinn::SendStream;
@@ -24,9 +28,12 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::{CLIPBOARD_POLL, ClipboardSync, send_clipboard};
+use super::{CLIPBOARD_POLL, Clip, ClipboardSync, send_clipboard};
 use crate::Problem;
 use crate::clock::now_us;
+use crate::files::{Files, LocalFs, RemoteOffer};
+use crate::tasks::OwnedTask;
+use airhand_proto::files::{FileEntry, FileError};
 
 /// 这么久没有收到被控端的任何消息（它每秒回 Pong），或者控制流这么久写不进去，才算失联。
 /// 网络卡一下不断开：卡住期间排着的输入由命令队列丢掉（见 [`super::queue`]）
@@ -35,41 +42,95 @@ const HOST_TIMEOUT: Duration = Duration::from_secs(20);
 const ACK_REPEAT: Duration = Duration::from_millis(30);
 const ACK_REPEATS: u8 = 3;
 
-/// 发给被控端的控制数据报：每秒的 Ping、画面确认（`ControllerDatagram`）。丢了的确认怎么补见 [`AckState`]
+/// 发给被控端的控制数据报：每秒的 Ping、画面确认（`ControllerDatagram`）。丢了的确认怎么补见 [`AckState`]，
+/// 画面的每一路各补各的
 pub(super) struct Feedback {
     out: DatagramSender,
-    acks: std::sync::Mutex<AckState>,
+    /// 第 `i` 项是第 `i` 路
+    acks: std::sync::Mutex<Vec<AckState>>,
+    /// 发了新的确认：补发的定时器闲着的话叫醒它（见 [`Feedback::run_repeats`]）
+    acked: tokio::sync::Notify,
 }
 
 impl Feedback {
     pub fn new(out: DatagramSender) -> Self {
         Self {
             out,
-            acks: Default::default(),
+            acks: std::sync::Mutex::new(
+                (0..MAX_STREAMS)
+                    .map(|stream| AckState { stream, last: None })
+                    .collect(),
+            ),
+            acked: tokio::sync::Notify::new(),
         }
     }
 
-    /// 第 `seq` 帧到了（界面收到了，或者界面反正解不了、这里替它确认），它开始到达的时刻是 `arrived`
-    pub fn ack(&self, seq: u32, arrived: u64) {
-        let m = self.acks.lock().unwrap().ack(seq, arrived, Instant::now());
+    /// 第 `stream` 路的第 `seq` 帧到了（界面收到了，或者界面反正解不了、这里替它确认），它的到达时刻是 `arrived`
+    /// （见 `crate::merge` 的"到达时刻"）
+    pub fn ack(&self, stream: u8, seq: u32, arrived: u64) {
+        let m = self
+            .acks
+            .lock()
+            .unwrap()
+            .get_mut(stream as usize)
+            .and_then(|a| a.ack(seq, arrived, Instant::now()));
         if let Some(m) = m {
             self.out.send(&m);
+            self.acked.notify_one();
         }
     }
 
-    /// 定时调用：好一阵没有新的确认了，最近的一个再发一次
+    /// 补发丢了的确认（见 [`AckState`]），一直跑到会话结束。每一路都补完了（画面停了、补够了次数）就不再定时醒来，
+    /// 等到下一个确认：画面静止的会话不用每 [`ACK_REPEAT`] 醒一次
+    async fn run_repeats(&self) {
+        loop {
+            let idle = !self.acks.lock().unwrap().iter().any(AckState::repeating);
+            if idle {
+                // 闲下来之前发的确认留下的通知只会让这里多转一圈
+                self.acked.notified().await;
+            }
+            tokio::time::sleep(ACK_REPEAT).await;
+            self.repeat();
+        }
+    }
+
+    /// 好一阵没有新的确认了，最近的一个再发一次（每一路）
     fn repeat(&self) {
-        let m = self.acks.lock().unwrap().repeat(Instant::now());
-        if let Some(m) = m {
+        let now = Instant::now();
+        let repeats: Vec<_> = self
+            .acks
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .filter_map(|a| a.repeat(now))
+            .collect();
+        for m in repeats {
             self.out.send(&m);
         }
     }
 
-    /// 每秒一次：Ping（也是保活），再带一次最近的确认
+    /// 第 `stream` 路等不到一帧了（见 `crate::merge`）：请被控端从 `decoded` 恢复
+    fn lost(&self, stream: u8, decoded: u32) {
+        self.out.send(&ControllerDatagram::Lost { decoded, stream });
+    }
+
+    /// 告诉被控端该路视频收完和等待重传的帧数。
+    fn report(&self, stream: u8, report: VideoReport) {
+        self.out
+            .send(&ControllerDatagram::Report { report, stream });
+    }
+
+    /// 每秒一次：Ping（也是保活），再带一次每一路最近的确认
     fn ping(&self) {
         self.out.send(&ControllerDatagram::Ping { t: now_us() });
-        let last = self.acks.lock().unwrap().last();
-        if let Some(m) = last {
+        let last: Vec<_> = self
+            .acks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(AckState::last)
+            .collect();
+        for m in last {
             self.out.send(&m);
         }
     }
@@ -79,14 +140,18 @@ impl Feedback {
 ///
 /// 确认走数据报，会丢。丢的要是最后一个（画面停了，或者被控端的在途帧满了、正等着它），被控端就一直等：
 /// 所以 [`ACK_REPEAT`] 里没有新的确认时，最近的一个再发一次、最多 [`ACK_REPEATS`] 次，之后随每秒的 Ping 再发一次。
-/// 画面一直在来时每帧都有新的确认，不补发。确认是累积的：比发过的还旧的（界面晚到的确认）不用发
+/// 画面一直在来时每帧都有新的确认，不补发。确认是累积的：比发过的还旧的（界面晚到的确认）不用发。
+/// 一路画面一个
 #[derive(Default)]
 struct AckState {
+    /// 第几路
+    stream: u8,
     last: Option<LastAck>,
 }
 
 #[derive(Clone, Copy)]
 struct LastAck {
+    stream: u8,
     seq: u32,
     arrived: u64,
     /// 上次发出的时刻
@@ -100,6 +165,7 @@ impl LastAck {
         ControllerDatagram::Ack {
             seq: self.seq,
             arrived: self.arrived,
+            stream: self.stream,
         }
     }
 }
@@ -114,6 +180,7 @@ impl AckState {
             return None;
         }
         let l = LastAck {
+            stream: self.stream,
             seq,
             arrived,
             at: now,
@@ -138,20 +205,10 @@ impl AckState {
     fn last(&self) -> Option<ControllerDatagram> {
         self.last.map(|l| l.msg())
     }
-}
 
-/// 画面断过（前面有帧断在直连上等不到了，[`FromHost::Video`] 的 `gap`）：之后的增量帧缺了参考帧，硬件解码器多半
-/// 不报错、而是解出花屏。所以从断的地方到下一个关键帧之间的帧不交给界面（三种界面都不用知道有过缺口）
-#[derive(Default)]
-struct Keyframes {
-    waiting: bool,
-}
-
-impl Keyframes {
-    /// 这一帧交不交给界面
-    fn admit(&mut self, gap: bool, key: bool) -> bool {
-        self.waiting = (self.waiting || gap) && !key;
-        !self.waiting
+    /// 还要补发（发了确认之后还没补够 [`ACK_REPEATS`] 次）
+    fn repeating(&self) -> bool {
+        self.last.is_some_and(|l| l.left > 0)
     }
 }
 
@@ -178,31 +235,40 @@ pub struct UiClosed;
     rename_all_fields = "camelCase"
 )]
 pub enum SessionEvent {
-    /// 会话开始了。`codecs` / `actions` 里只有本机认识的；本机不认识的平台（对方的版本更新）报成 `linux`
+    /// 会话开始了。`codecs` / `actions` 里只有本机认识的；本机不认识的平台（对方的版本更新）报成 `linux`。
+    /// `current`：第 0 路画面是哪个显示器；`shown`：每一路画面是哪个显示器（见 [`SessionEvent::Displays`]）；
+    /// `max_streams`：对方最多能同时发几路画面（同时看几个显示器，至少 1）
     Hello {
         hostname: String,
         os: String,
         version: String,
         displays: Vec<DisplayInfo>,
         current: u8,
+        shown: Vec<u8>,
+        max_streams: u8,
         codecs: Vec<Codec>,
         platform: Platform,
         touch: bool,
         actions: Vec<SystemAction>,
     },
-    /// 被控端在等它的用户同意这次连接（同意之后才会收到 `Hello` 和画面）
-    AwaitingApproval,
+    /// 第 `stream` 路画面的编码器（重新）建好了
     Encoder {
+        stream: u8,
         codec: Codec,
         name: String,
         hardware: bool,
         width: u32,
         height: u32,
     },
+    /// 显示器列表、看着哪几个显示器变了。`current`：第 0 路画面是哪个显示器（只看一个显示器的界面只管它）；
+    /// `shown`：第 `i` 项是第 `i` 路画面的显示器（见 `airhand_proto::session` 的"多屏"）
     Displays {
         displays: Vec<DisplayInfo>,
         current: u8,
+        shown: Vec<u8>,
     },
+    /// 每秒一次。`fps`：最快的那一路的帧率；`kbps`：所有的画面和声音；`width` / `height`：第 0 路画面的大小；
+    /// `frames`：一共收到了几帧（所有的路）
     Stats {
         fps: f32,
         kbps: f32,
@@ -217,6 +283,12 @@ pub enum SessionEvent {
     Notice { notice: NoticeView },
     /// 被控端复制了文本（只发给浏览器，见 [`super::Frontend::Browser`]；桌面版直接写入本机剪贴板）
     Clipboard { text: String },
+    /// 被控端复制了文件（只发给浏览器、Android，见 [`super::Frontend::Browser`]；桌面版直接放进本机剪贴板）：
+    /// 用户选中的那几项。界面要内容时从 [`super::ControllerService::remote_files`] 取（编号是 `clip`）
+    ClipboardFiles { clip: u32, items: Vec<FileEntry> },
+    /// 剪贴板里的文件传不了（被控端那边的、本机这边的）：`name` 是哪个文件，`error` 是为什么
+    /// （例如只能走中转、又超过了服务器允许的大小），界面按自己的语言显示
+    FileError { name: String, error: FileError },
     /// 被控端现在能不能接本机的麦克风（见 [`super`] 的"麦克风"）：会话开始时一次，之后有变化再来。
     /// 被控端不支持（版本旧）时不会有。`detail`：出错时给排查问题用的技术信息（英文）
     Mic {
@@ -272,9 +344,11 @@ impl From<Notice> for NoticeView {
 }
 
 struct Stats {
-    frames: u32,
+    /// 这一秒每一路收到的帧
+    frames: [u32; MAX_STREAMS as usize],
     bytes: usize,
     total: u64,
+    /// 第 0 路画面的大小
     w: u16,
     h: u16,
     rtt: Option<f32>,
@@ -286,7 +360,7 @@ struct Stats {
 impl Default for Stats {
     fn default() -> Self {
         Self {
-            frames: 0,
+            frames: [0; MAX_STREAMS as usize],
             bytes: 0,
             total: 0,
             w: 0,
@@ -298,7 +372,12 @@ impl Default for Stats {
     }
 }
 
-/// 交给了界面、还没确认的画面帧是什么时候开始从网络上到达的（控制端的时钟，见 [`now_us`]）：界面确认时带给被控端
+/// 每一路画面的 [`Arrivals`]（第 `i` 项是第 `i` 路）
+pub(super) fn arrivals() -> Vec<Arrivals> {
+    (0..MAX_STREAMS).map(|_| Arrivals::default()).collect()
+}
+
+/// 一路画面交给了界面、还没确认的帧是什么时候开始从网络上到达的（控制端的时钟，见 [`now_us`]）：界面确认时带给被控端
 /// （`ControllerDatagram::Ack::arrived`）。确认是累积的：确认了一帧，它和它前面的都不用记了。
 /// 在途的帧不超过 `flow::MAX_WINDOW` 个，最多记 [`Arrivals::MAX`] 个就够了
 #[derive(Default)]
@@ -319,7 +398,7 @@ impl Arrivals {
         self.last = seq;
     }
 
-    /// 界面确认了第 `seq` 帧：它开始到达的时刻（不是交给过界面的帧、已经确认过的为 `None`）
+    /// 界面确认了第 `seq` 帧：它的到达时刻（不是交给过界面的帧、已经确认过的为 `None`）
     pub(super) fn take(&mut self, seq: u32) -> Option<u64> {
         let at = self.pending.iter().find(|(s, _)| *s == seq)?.1;
         self.pending.retain(|(s, _)| s.wrapping_sub(seq) as i32 > 0);
@@ -342,9 +421,8 @@ pub(super) struct SessionIo {
     pub recv: HostReceiver,
     pub ui: Arc<dyn SessionUi>,
     pub mode: Mode,
-    /// 端到端握手协商出来的会话版本和能力位（和被控端算出来的一样）：以后的可选功能按它决定发不发
-    pub negotiated: Negotiated,
-    pub arrivals: Arc<std::sync::Mutex<Arrivals>>,
+    /// 每一路画面的（第 `i` 项是第 `i` 路）
+    pub arrivals: Arc<std::sync::Mutex<Vec<Arrivals>>>,
     /// Ping、画面确认（控制数据报）
     pub feedback: Arc<Feedback>,
     /// 会话的两条路：控制通道在直连通着时也从直连发一份
@@ -353,6 +431,10 @@ pub(super) struct SessionIo {
     pub direct: Direct,
     /// 麦克风：会话 ID、界面交过来的声音包、声音数据报的加密端
     pub mic: (u64, mpsc::Receiver<Bytes>, Sealer),
+    /// 剪贴板文件会话和收文件流的任务。
+    pub files: (Files, OwnedTask<()>),
+    /// 被控端剪贴板里最新的文件（网页版、Android 从这里取）
+    pub remote: Arc<std::sync::Mutex<Option<RemoteOffer>>>,
 }
 
 /// 会话的直连任务（[`crate::direct::controller`]）：被控端发来的候选地址交给它
@@ -385,7 +467,6 @@ pub(super) async fn run(
         mut recv,
         ui,
         mode,
-        negotiated,
         arrivals,
         feedback,
         paths,
@@ -394,11 +475,26 @@ pub(super) async fn run(
             task: direct_task,
         },
         mic: (session_id, mut mic_rx, mut mic_sealer),
+        files: (files, _files_task),
+        remote,
     } = io;
+    let mut file_notices = files.notices();
+    let notices_ui = ui.clone();
+    let notices = async move {
+        while let Some(n) = file_notices.recv().await {
+            let _ = notices_ui.event(SessionEvent::FileError {
+                name: n.name,
+                error: n.error,
+            });
+        }
+        std::future::pending::<()>().await
+    };
+    let files_in = files.clone();
+    let files_out = files.clone();
     let mic_paths = paths.clone();
     // 画面最近是从直连来的：麦克风的声音也走直连（被控端按两条路的时延选的，见 crate::direct）
     let video_direct = Arc::new(AtomicBool::new(false));
-    info!(sid, ?negotiated, "session started");
+    info!(sid, "session started");
     let local_clip = match mode {
         Mode::Desktop { clip, enabled } => Some((clip, enabled)),
         Mode::Browser => None,
@@ -428,43 +524,61 @@ pub(super) async fn run(
     let keyframe_tx = tx.clone();
     let acker = feedback.clone();
     let on_direct = video_direct.clone();
+    let video_stats = recv.video_stats();
+    let reporter_feedback = feedback.clone();
     let reader = async move {
         let mut cursor = super::cursor::CursorReceiver::default();
-        let mut keyframes = Keyframes::default();
         loop {
             let msg = match recv.recv().await? {
-                // 画面、声音：只看一眼头做统计，原样交给界面
+                // 画面、声音：只看一眼头做统计，原样交给界面。交出来的画面都解得了（缺了参考帧的在
+                // crate::merge 里就挑出来了：硬件解码器多半不报错、而是解出花屏，三种界面都不用知道有过缺口）
                 FromHost::Video {
+                    stream,
                     packet: p,
                     arrived,
                     direct,
-                    gap,
                 } => {
                     // 未知编码仍交给界面确认并丢弃，不能把合法的新格式当成损坏而断开。
                     let h = VideoHeader::decode_any(&p)
                         .ok_or_else(|| anyhow::anyhow!("bad video packet header"))?;
-                    // 前面有帧断在了直连上：解码器要从关键帧重新开始（被控端在这一帧之后发过关键帧就不用了）
-                    if gap {
-                        keyframe_tx.send(ControllerMsg::RequestKeyframe { after: h.seq })?;
-                    }
+                    // 界面按头里写的路交给解码器：和来的通道对不上的不能交出去
+                    anyhow::ensure!(
+                        h.stream == stream,
+                        "a video packet of stream {} came on stream {stream}",
+                        h.stream
+                    );
                     {
                         let mut s = st.lock().unwrap();
                         s.last_msg = Instant::now();
-                        s.frames += 1;
+                        s.frames[stream as usize] += 1;
                         s.total += 1;
                         s.bytes += p.len();
-                        s.w = h.width;
-                        s.h = h.height;
+                        if stream == 0 {
+                            s.w = h.width;
+                            s.h = h.height;
+                        }
                         s.direct = direct;
                     }
                     on_direct.store(direct, Ordering::Relaxed);
-                    if !keyframes.admit(gap, h.key) {
-                        // 解不了的增量帧不交给界面，这里替它确认：不然被控端的在途窗口停住，关键帧也发不过来
-                        acker.ack(h.seq, arrived);
-                        continue;
-                    }
-                    arrivals.lock().unwrap().record(h.seq, arrived);
+                    arrivals.lock().unwrap()[stream as usize].record(h.seq, arrived);
                     out.packet(p).map_err(|_| ui_closed())?;
+                    continue;
+                }
+                FromHost::VideoEvent(stream, v) => {
+                    match v {
+                        // 解不了的增量帧不交给界面，这里替它确认：不然被控端的在途窗口停住，恢复的帧也发不过来
+                        Video::Skipped { seq, arrived } => {
+                            st.lock().unwrap().last_msg = Instant::now();
+                            acker.ack(stream, seq, arrived);
+                        }
+                        // 等不到一帧了：请被控端恢复这一路
+                        Video::Lost { decoded } => acker.lost(stream, decoded),
+                        // 被控端在这一帧之后发过关键帧就不用再编了
+                        Video::Keyframe { after } => {
+                            keyframe_tx.send(ControllerMsg::RequestKeyframe { after, stream })?;
+                        }
+                        Video::Frame(_) => unreachable!("delivered as FromHost::Video"),
+                    }
                     continue;
                 }
                 FromHost::Audio(p) => {
@@ -478,12 +592,18 @@ pub(super) async fn run(
                 }
                 FromHost::Pong(t) => {
                     let sample = now_us().saturating_sub(t) as f32 / 1000.0;
-                    let mut s = st.lock().unwrap();
-                    s.last_msg = Instant::now();
-                    s.rtt = Some(match s.rtt {
-                        Some(r) => r * 0.7 + sample * 0.3,
-                        None => sample,
-                    });
+                    let rtt = {
+                        let mut s = st.lock().unwrap();
+                        s.last_msg = Instant::now();
+                        let rtt = match s.rtt {
+                            Some(r) => r * 0.7 + sample * 0.3,
+                            None => sample,
+                        };
+                        s.rtt = Some(rtt);
+                        rtt
+                    };
+                    // 缺着的画面等多久按它算（见 crate::merge）
+                    recv.set_rtt(rtt as f64);
                     continue;
                 }
                 FromHost::Control(m) => m,
@@ -491,6 +611,8 @@ pub(super) async fn run(
             st.lock().unwrap().last_msg = Instant::now();
             match msg {
                 HostMsg::Hello(h) => {
+                    let max_streams = h.max_streams();
+                    let shown = shown_or_current(h.shown, h.current_display);
                     // 对方版本新增的编码格式、系统操作这里用不了；新的平台当作一台普通的电脑
                     let _ = out.event(SessionEvent::Hello {
                         hostname: h.hostname,
@@ -498,33 +620,69 @@ pub(super) async fn run(
                         version: h.version,
                         displays: h.displays,
                         current: h.current_display,
+                        shown,
+                        max_streams,
                         codecs: h.codecs.into_iter().filter(|c| c.is_known()).collect(),
                         platform: h.platform.or_linux(),
                         touch: h.touch,
                         actions: h.actions.into_iter().filter(|a| a.is_known()).collect(),
                     });
                 }
-                HostMsg::AwaitingApproval => {
-                    let _ = out.event(SessionEvent::AwaitingApproval);
-                }
-                HostMsg::Displays { displays, current } => {
-                    let _ = out.event(SessionEvent::Displays { displays, current });
+                HostMsg::Displays {
+                    displays,
+                    current,
+                    shown,
+                } => {
+                    let shown = shown_or_current(shown, current);
+                    let _ = out.event(SessionEvent::Displays {
+                        displays,
+                        current,
+                        shown,
+                    });
                 }
                 HostMsg::Notice(Some(n)) => {
                     let _ = out.event(SessionEvent::Notice { notice: n.into() });
                 }
                 // 对方版本新增的提示：不显示
                 HostMsg::Notice(None) => debug!(sid, "skipping a notice from a newer host"),
-                HostMsg::Clipboard { text } => match &clip_in {
-                    Some((clip, enabled)) => {
-                        if enabled.load(Ordering::Relaxed) {
-                            clip.lock().unwrap().apply(text);
+                HostMsg::Clipboard { text } => {
+                    // 文字取代被控端之前公告的文件
+                    files_in.remote_cleared();
+                    match &clip_in {
+                        Some((clip, enabled)) => {
+                            if enabled.load(Ordering::Relaxed) {
+                                clip.lock().unwrap().apply(text);
+                            }
+                        }
+                        None => {
+                            let _ = out.event(SessionEvent::Clipboard { text });
                         }
                     }
-                    None => {
-                        let _ = out.event(SessionEvent::Clipboard { text });
+                }
+                HostMsg::Files(Some(m)) => {
+                    if let Some(offer) = files_in.handle(m) {
+                        *remote.lock().unwrap() = Some(offer.clone());
+                        match &clip_in {
+                            Some((clip, enabled)) => {
+                                if enabled.load(Ordering::Relaxed) {
+                                    clip.lock().unwrap().apply_files(offer);
+                                } else {
+                                    // 不同步剪贴板：不放进本机剪贴板，但别让被控端一直等
+                                    offer.ready();
+                                }
+                            }
+                            None => {
+                                let _ = out.event(SessionEvent::ClipboardFiles {
+                                    clip: offer.clip(),
+                                    items: offer.items().to_vec(),
+                                });
+                                offer.ready();
+                            }
+                        }
                     }
-                },
+                }
+                // 对方版本新增的文件消息：跳过
+                HostMsg::Files(None) => {}
                 HostMsg::Bye(reason) => {
                     if let ByeReason::Unknown(n) = reason {
                         info!(
@@ -548,6 +706,7 @@ pub(super) async fn run(
                 }
                 HostMsg::Encoder(e) => {
                     let _ = out.event(SessionEvent::Encoder {
+                        stream: e.stream,
                         codec: e.codec,
                         name: e.name,
                         hardware: e.hardware,
@@ -590,7 +749,7 @@ pub(super) async fn run(
                     return Err(Problem::HostUnresponsive.into());
                 }
                 let e = SessionEvent::Stats {
-                    fps: s.frames as f32 / dt,
+                    fps: s.frames.iter().copied().max().unwrap_or(0) as f32 / dt,
                     kbps: s.bytes as f32 * 8.0 / 1000.0 / dt,
                     rtt_ms: s.rtt,
                     width: s.w,
@@ -598,7 +757,7 @@ pub(super) async fn run(
                     frames: s.total,
                     direct: s.direct,
                 };
-                s.frames = 0;
+                s.frames = [0; MAX_STREAMS as usize];
                 s.bytes = 0;
                 e
             };
@@ -609,15 +768,22 @@ pub(super) async fn run(
         #[allow(unreachable_code)]
         anyhow::Ok(())
     };
-    // 丢了的确认（见 Feedback）
-    let repeater = async move {
-        let mut tick = tokio::time::interval(ACK_REPEAT);
+    // 画面收得怎么样（见 crate::merge 的"报告"）：每 REPORT_EVERY 告诉被控端一次，这段时间什么画面都没收到就不报
+    let reporter = async move {
+        let mut tick = tokio::time::interval(REPORT_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            feedback.repeat();
+            for (stream, stats) in video_stats.iter().enumerate() {
+                let r = stats.take();
+                if !r.is_empty() {
+                    reporter_feedback.report(stream as u8, r);
+                }
+            }
         }
     };
+    // 丢了的确认（见 Feedback）
+    let repeater = async move { feedback.run_repeats().await };
 
     let clipper = async move {
         let Some((clip, enabled)) = local_clip else {
@@ -629,11 +795,26 @@ pub(super) async fn run(
         loop {
             tick.tick().await;
             // poll 只取后台读任务已完成的结果，锁内不执行或等待剪贴板 IO。
-            let text = clip.lock().unwrap().poll();
+            let got = clip.lock().unwrap().poll();
             // 关闭同步时也要消费变化，否则重新打开时会把旧内容发过去
-            let Some(text) = text else { continue };
-            if enabled.load(Ordering::Relaxed) {
-                send_clipboard(&bulk_tx, text);
+            let Some(got) = got else { continue };
+            if !enabled.load(Ordering::Relaxed) {
+                continue;
+            }
+            match got {
+                Clip::Text(text) => {
+                    files_out.withdraw();
+                    send_clipboard(&bulk_tx, text);
+                }
+                // 复制时只发清单，读取文件元数据可能阻塞。
+                Clip::Files(paths) => {
+                    let local = tokio::task::spawn_blocking(move || LocalFs::new(&paths)).await;
+                    if let Ok(local) = local
+                        && !local.is_empty()
+                    {
+                        files_out.offer(Arc::new(local));
+                    }
+                }
             }
         }
     };
@@ -673,12 +854,16 @@ pub(super) async fn run(
         r = reader => r,
         r = ticker => r,
         _ = repeater => Ok(()),
+        () = reporter => Ok(()),
         () = clipper => Ok(()),
         () = direct => Ok(()),
         () = mic => Ok(()),
+        () = notices => Ok(()),
         r = writer => r.and(Err(Problem::SessionEnded.into())),
         r = bulk_writer => r.and(Err(Problem::SessionEnded.into())),
     };
+    // 停下给到一半的、取到一半的（本机剪贴板里留着的公告之后再读也只是失败）
+    files.close();
     let reason = match result {
         Ok(()) => Problem::SessionEnded,
         Err(e) => Problem::from_error(e, Problem::failed),
@@ -696,12 +881,25 @@ fn ui_closed() -> anyhow::Error {
     anyhow::anyhow!("the console was closed")
 }
 
+/// 每一路画面是哪个显示器；被控端没说（版本旧）时只有第 0 路，就是 `current`
+fn shown_or_current(shown: Vec<u8>, current: u8) -> Vec<u8> {
+    if shown.is_empty() {
+        vec![current]
+    } else {
+        shown
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ack(seq: u32) -> Option<ControllerDatagram> {
-        Some(ControllerDatagram::Ack { seq, arrived: 0 })
+        Some(ControllerDatagram::Ack {
+            seq,
+            arrived: 0,
+            stream: 0,
+        })
     }
 
     /// 画面一直在来时不补发；停了之后每隔 ACK_REPEAT 补一次、最多 ACK_REPEATS 次；旧的、重复的确认不发
@@ -710,6 +908,8 @@ mod tests {
         let mut a = AckState::default();
         let t0 = Instant::now();
         assert_eq!(a.repeat(t0), None);
+        // 还没发过确认：补发的定时器闲着
+        assert!(!a.repeating());
         // 60 fps：每帧都有新的确认，定时器不补
         let frame = Duration::from_micros(16_667);
         for i in 1..=10u32 {
@@ -733,25 +933,41 @@ mod tests {
         }
         assert_eq!(repeats, ACK_REPEATS);
         assert_eq!(a.last(), ack(10));
+        // 补够了：定时器闲下来，直到下一个确认
+        assert!(!a.repeating());
+        assert_eq!(a.ack(11, 0, now), ack(11));
+        assert!(a.repeating());
         // 序号绕回
         let mut a = AckState::default();
         assert_eq!(a.ack(u32::MAX, 0, t0), ack(u32::MAX));
         assert_eq!(a.ack(0, 0, t0), ack(0));
     }
 
-    /// 断过之后等关键帧：中间的增量帧不交给界面
-    #[test]
-    fn frames_after_a_gap_wait_for_a_keyframe() {
-        let mut k = Keyframes::default();
-        assert!(k.admit(false, true));
-        assert!(k.admit(false, false));
-        assert!(!k.admit(true, false));
-        assert!(!k.admit(false, false));
-        assert!(k.admit(false, true));
-        assert!(k.admit(false, false));
-        // 断在关键帧前面：关键帧不用等前面的帧
-        assert!(k.admit(true, true));
-        assert!(k.admit(false, false));
+    /// 补完了就闲下来（不再定时醒）；闲下来之后再来确认，照样补发 ACK_REPEATS 次
+    #[tokio::test]
+    async fn repeats_resume_after_going_idle() {
+        let (client, server) = crate::tests::quic_pair().await;
+        let (sealer, _opener) = crate::secure::test_lane(false);
+        let feedback = Arc::new(Feedback::new(DatagramSender::new(
+            1,
+            Paths::new(client),
+            sealer,
+        )));
+        let _repeater = {
+            let f = feedback.clone();
+            OwnedTask(tokio::spawn(async move { f.run_repeats().await }))
+        };
+        for seq in 1..=2u32 {
+            feedback.ack(0, seq, 0);
+            let until = tokio::time::Instant::now() + Duration::from_millis(400);
+            let mut sent = 0;
+            while let Ok(Ok(_)) = tokio::time::timeout_at(until, server.read_datagram()).await {
+                sent += 1;
+            }
+            // 确认本身 + 补发
+            assert_eq!(sent, 1 + ACK_REPEATS as usize, "frame {seq}");
+            assert!(!feedback.acks.lock().unwrap()[0].repeating());
+        }
     }
 
     /// 控制台（client/src/lib/api.ts 的 SessionEvent / Notice 类型）依赖这个 JSON 形状
@@ -807,10 +1023,6 @@ mod tests {
             json!({ "type": "clipboard", "text": "hi" })
         );
         assert_eq!(
-            serde_json::to_value(SessionEvent::AwaitingApproval).unwrap(),
-            json!({ "type": "awaitingApproval" })
-        );
-        assert_eq!(
             serde_json::to_value(SessionEvent::Mic {
                 state: MicState::NoDevice,
                 detail: None
@@ -832,6 +1044,8 @@ mod tests {
             version: "0.1.0".into(),
             displays: vec![],
             current: 0,
+            shown: vec![0],
+            max_streams: 1,
             codecs: vec![Codec::H265],
             platform: Platform::Android,
             touch: true,
@@ -842,7 +1056,18 @@ mod tests {
         assert_eq!(v["touch"], json!(true));
         assert_eq!(v["actions"], json!(["back", "quickSettings"]));
         assert_eq!(v["codecs"], json!(["h265"]));
+        assert_eq!((&v["shown"], &v["maxStreams"]), (&json!([0]), &json!(1)));
+        let d = SessionEvent::Displays {
+            displays: vec![],
+            current: 1,
+            shown: vec![1, 0],
+        };
+        assert_eq!(
+            serde_json::to_value(&d).unwrap(),
+            json!({ "type": "displays", "displays": [], "current": 1, "shown": [1, 0] })
+        );
         let e = SessionEvent::Encoder {
+            stream: 1,
             codec: Codec::AV1,
             name: "NVENC".into(),
             hardware: true,
@@ -851,7 +1076,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_value(&e).unwrap(),
-            json!({ "type": "encoder", "codec": "av1", "name": "NVENC", "hardware": true, "width": 1920, "height": 1080 })
+            json!({ "type": "encoder", "stream": 1, "codec": "av1", "name": "NVENC", "hardware": true, "width": 1920, "height": 1080 })
         );
         let s = SessionEvent::Stats {
             fps: 30.0,
@@ -865,12 +1090,12 @@ mod tests {
         assert_eq!(serde_json::to_value(&s).unwrap()["rttMs"], json!(null));
         assert_eq!(serde_json::to_value(&s).unwrap()["direct"], json!(true));
         let c = SessionEvent::Closed {
-            reason: Problem::from(airhand_proto::session::ByeReason::Declined),
+            reason: Problem::from(airhand_proto::session::ByeReason::CodeChanged),
             retry: false,
         };
         assert_eq!(
             serde_json::to_value(&c).unwrap(),
-            json!({ "type": "closed", "reason": { "kind": "declined" }, "retry": false })
+            json!({ "type": "closed", "reason": { "kind": "codeChanged" }, "retry": false })
         );
     }
 }

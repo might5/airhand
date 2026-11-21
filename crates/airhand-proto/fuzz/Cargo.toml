@@ -1,4 +1,5 @@
-# 服务器在认证之前就要解析的东西：版本握手、信令消息、会话头。协议库只吃字节、不碰 IO，所以直接拿来当入口。
+# Fuzz the signaling handshake, messages and session stream headers.
+# 协议库只吃字节、不碰 IO，所以直接拿来当入口。
 #
 #   cargo install cargo-fuzz
 #   cd crates/airhand-proto/fuzz && cargo +nightly fuzz run signal

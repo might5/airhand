@@ -48,13 +48,15 @@ dependencies = [
 
 [[package]]
 name = "airhand-link"
-version = "0.2.3"
+version = "0.3.1"
 dependencies = [
  "airhand-proto",
  "anyhow",
  "bytes",
  "curve25519-dalek",
  "futures-util",
+ "if-addrs",
+ "libc",
  "quinn",
  "rand 0.9.5",
  "rcgen",
@@ -73,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "airhand-proto"
-version = "0.2.3"
+version = "0.3.1"
 dependencies = [
  "minicbor",
  "serde",
@@ -83,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "airhand-web"
-version = "0.2.3"
+version = "0.3.1"
 dependencies = [
  "airhand-link",
  "airhand-proto",
@@ -662,6 +664,16 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tower-service",
+]
+
+[[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

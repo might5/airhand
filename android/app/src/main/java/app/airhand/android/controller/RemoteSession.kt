@@ -6,6 +6,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import app.airhand.android.AirhandApp
+import app.airhand.android.core.ClipFiles
 import app.airhand.android.core.Codec
 import app.airhand.android.core.DisplayInfo
 import app.airhand.android.core.EncoderInfo
@@ -19,7 +20,6 @@ import app.airhand.android.core.Quality
 import app.airhand.android.core.ServerState
 import app.airhand.android.core.Stats
 import app.airhand.android.core.SystemAction
-import app.airhand.android.core.VideoPriority
 import app.airhand.android.core.optStringOrNull
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -54,12 +54,11 @@ data class CursorState(
 /**
  * 一个远程会话（看 / 操作一台设备）。连接、断线重连、等对方上线都在这里，界面只观察 [phase] 等状态。
  *
- * * 对方要先问它的用户（手机默认这样）：[Phase.Approving]，同意之后才是 [Phase.Live]；
- * * 第一次连接失败（控制码不对、对方不在线、对方拒绝……）：[Phase.Failed]，回到首页显示原因；
+ * * 第一次连接失败（控制码不对、对方不在线、要配对码……）：[Phase.Failed]，回到首页显示原因；
  * * 连上之后断了：带着重连凭证自动重连（[Phase.Reconnecting]）；对方离线了就等它上线（[Phase.WaitingHost]）；
  * * 对方断开了我们 / 换了控制码：[Phase.Ended]，不再重连。
  *
- * 对方同意、开始会话时把设备（和重连凭证）记进"我的设备"，下次点一下就能连；对方不在线时也能等它上线。
+ * 开始会话时把设备（和重连凭证）记进"我的设备"，下次点一下就能连；对方不在线时也能等它上线。
  */
 class RemoteSession(
     private val app: AirhandApp,
@@ -74,9 +73,6 @@ class RemoteSession(
 ) {
     sealed interface Phase {
         data object Connecting : Phase
-
-        /** 连上了，在等对方的用户同意 */
-        data object Approving : Phase
         data object Live : Phase
         data class Reconnecting(val reason: Problem) : Phase
         data class WaitingHost(val reason: Problem?) : Phase
@@ -115,7 +111,6 @@ class RemoteSession(
     val quality = MutableStateFlow(
         Preset.of(app.settings.value.preset).quality(
             VideoDecoder.decodable.firstOrNull { it in Codec.PRIORITY } ?: Codec.H264,
-            VideoPriority.fromWire(app.settings.value.priority),
         ),
     )
 
@@ -453,7 +448,6 @@ class RemoteSession(
                 val best = pickCodec(codecs)
                 if (quality.value.codec != best) setQuality(quality.value.copy(codec = best)) else refreshSettings()
             }
-            "awaitingApproval" -> _phase.value = Phase.Approving
             "encoder" -> encoder.value = EncoderInfo(
                 Codec.fromWire(e.optString("codec")) ?: Codec.H264,
                 e.optString("name"),
@@ -499,7 +493,38 @@ class RemoteSession(
                     }
                 }
             }
+            // 对方复制了文件：换一个 key，放进手机的剪贴板（别的应用读的时候才取），通知里可以保存到下载
+            "clipboardFiles" -> {
+                val h = handle
+                val s = sid
+                val items = e.optJSONArray("items") ?: return
+                if (h == 0L || s < 0) return
+                scope.launch(Dispatchers.IO) {
+                    val cmd = JSONObject().put("cmd", "remoteFiles").put("sid", s).put("clip", e.optInt("clip"))
+                    val r = runCatching { JSONObject(Native.ctlCall(h, cmd.toString())) }.getOrNull() ?: return@launch
+                    if (r.has("ok")) ClipFiles.apply(app, r.getLong("ok"), items)
+                }
+            }
+            "fileError" -> Log.w(TAG, "a clipboard file couldn't be transferred: ${e.optString("name")} (${e.optString("error")})")
         }
+    }
+
+    /** 现在能不能把手机上的文件放进对方的剪贴板（连着） */
+    fun canOfferFiles() = handle != 0L && sid >= 0 && !closed && _phase.value == Phase.Live
+
+    /**
+     * 手机上分享给 Airhand 的文件（[ClipFiles.offer]）：放进对方的剪贴板。文件描述符不管成不成都归这里：
+     * 交给 Rust 就由 Rust 关（出错时也是），没连着时在这里关。没放成返回 false
+     */
+    fun offerFiles(files: JSONArray): Boolean {
+        val h = handle
+        val s = sid
+        if (h == 0L || s < 0 || closed) {
+            ClipFiles.closeFds(files)
+            return false
+        }
+        val cmd = JSONObject().put("cmd", "offerFiles").put("sid", s).put("files", files)
+        return !Native.ctlCall(h, cmd.toString()).contains("\"err\"")
     }
 
     private fun currentSettings(): Quality {
@@ -602,12 +627,6 @@ class RemoteSession(
         val host = hello.value?.codecs ?: return
         val next = pickCodec(host)
         if (quality.value.codec != next) setQuality(quality.value.copy(codec = next))
-    }
-
-    /** 对方缩小画面时优先低延迟还是文字清晰：记进设置，以后的会话也用它 */
-    fun setPriority(p: VideoPriority) {
-        app.updateSettings { it.copy(priority = p.wire) }
-        if (quality.value.priority != p) setQuality(quality.value.copy(priority = p))
     }
 
     fun selectDisplay(index: Int) {

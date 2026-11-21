@@ -54,6 +54,7 @@ export async function openSession(code: string, settings: QualitySettings, opts:
     if (s.sid !== null) rememberSession(s);
     s.onConnected = rememberSession;
     s.onSettingsChange = rememberQuality;
+    s.onInputSettingsChange = rememberInputSettings;
   } catch (e) {
     s.dispose();
     if (pending === s) store.patchDraft({ busy: false, error: toProblem(e) });
@@ -126,7 +127,7 @@ function setDevices(list: SavedDevice[]) {
   saveDevices();
 }
 
-/** 连上了：记下这台电脑（名字、系统、重连凭证、画质、时间） */
+/** 连上了：记下这台电脑（名字、系统、重连凭证、画质、鼠标模式、时间） */
 export function rememberSession(s: RemoteSession) {
   const seen = {
     code: s.code,
@@ -135,6 +136,8 @@ export function rememberSession(s: RemoteSession) {
     resume: s.resumeToken,
     quality: s.settings,
     hostKey: s.hostKey,
+    mouse: s.mouseMode,
+    swapCtrlCommand: s.swapCtrlCommand,
   };
   setDevices(devices.remember(store.get().devices, seen, Date.now()));
 }
@@ -142,6 +145,11 @@ export function rememberSession(s: RemoteSession) {
 /** 画质改了：下次用同样的画质连（只更新已经记下的） */
 function rememberQuality(s: RemoteSession) {
   setDevices(devices.patchDevice(store.get().devices, s.code, { quality: s.settings }));
+}
+
+/** 输入偏好按设备记住（只更新已经记下的） */
+function rememberInputSettings(s: RemoteSession) {
+  setDevices(devices.patchDevice(store.get().devices, s.code, { mouse: s.mouseMode, swapCtrlCommand: s.swapCtrlCommand }));
 }
 
 export const renameDevice = (code: string, name: string) =>

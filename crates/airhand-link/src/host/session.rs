@@ -1,19 +1,14 @@
-//! 被控端的一个会话：协议层的事都在这里（[`serve`]），各平台只实现 [`Platform`]（采集、编码、注入输入、请本机用户同意）。
+//! 被控端的一个会话：协议层的事都在这里（[`serve`]），各平台只实现 [`Platform`]（采集、编码、注入输入）。
 //!
-//! 桌面版和 Android 以前各写一份会话循环，Pong、失联检测、踢人时发 Bye、画质设置、同意流程各有一份，
+//! 桌面版和 Android 以前各写一份会话循环，Pong、失联检测、踢人时发 Bye、画质设置各有一份，
 //! 慢慢就会不一样。现在它们只在这里：
 //!
 //! ```text
-//! 端到端握手 ─┬─ 不用同意（配对过的、同意过的、谁都能连）→ start：Hello、画面…… ─ 控制端确认了 → confirmed：显示它
-//!            └─ NeedsApproval ─ 控制端确认了 → AwaitingApproval，问本机用户（最多 60 秒）─┬─ 同意 → start
-//!                                                                                   └─ 拒绝 / 没人理 → Bye
+//! 端到端握手（配对过的、输对了配对码的）→ start：Hello、画面…… ─ 控制端确认了 → confirmed：显示它
 //! ```
 //!
-//! * 不用同意的会话不等控制端的确认就开始（省一个往返，编码器的初始化也和它重叠），确认了才显示它
+//! * 会话不等控制端的确认就开始（省一个往返，编码器的初始化也和它重叠），确认了才显示它
 //!   （[`Platform::confirmed`]）；[`CONFIRM_TIMEOUT`] 等不到确认就结束（见 `airhand_proto::handshake` 的"确认"）；
-//! * 要同意的会话确认了才问本机用户：重放的握手消息不能弹出请求。同时最多有 [`MAX_PENDING_APPROVALS`] 个请求
-//!   在等本机用户回答，再来的不问、直接回绝（[`ApprovalSlots`]）；
-//! * 同意之前只回应 Ping、记下画质和声音设置（同意之后随 [`Start`] 一起生效），不发画面、不执行任何输入；
 //! * 一直回应 Ping，[`PEER_TIMEOUT`] 收不到控制端的任何消息算失联。Ping 和画面确认（控制数据报）在读任务里
 //!   就处理了（确认交给 [`Platform::acks`]），不等这里：这里可能正等着平台重建编码管线（见 [`super::HostStreams`]）；
 //! * 本机用户断开所有控制端（[`Incoming::kick`]）时发 [`HostMsg::Bye`]，然后结束；
@@ -29,26 +24,91 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use airhand_proto::session::{ByeReason, HostMsg, InputEvent, QualitySettings};
+use airhand_proto::session::{ByeReason, HostMsg, InputEvent, QualitySettings, StreamView};
 use anyhow::{Result, bail};
 use bytes::Bytes;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
 use super::queue::Outbox;
 use super::streams::{Admitted, ControllerReceiver, HostStreams, Writer};
 
-/// 画面确认交给谁（[`Platform::acks`]）：桌面版是会话的 [`crate::flow::Flow`]，Android 是画面分发。
-/// 在读任务里调用：要快，不能等什么
+/// 画面确认交给谁（[`Platform::acks`]）：桌面版是每一路画面的 [`crate::flow::Flow`]（[`Flows`]），Android 是画面分发。
+/// 在读任务里调用：要快，不能等什么。`stream` 是第几路画面（见 `airhand_proto::session` 的"多屏"），
+/// 控制端给的，没检查过（不小于 `airhand_proto::MAX_STREAMS` 的已经去掉了）
 pub trait Acks: Send + Sync + 'static {
-    /// 控制端收到了第 `seq` 帧（累积确认）；`arrived` 见 `ControllerDatagram::Ack`
-    fn ack(&self, seq: u32, arrived: u64);
+    /// 控制端收到了第 `stream` 路的第 `seq` 帧（累积确认）；`arrived` 见 `ControllerDatagram::Ack`
+    fn ack(&self, stream: u8, seq: u32, arrived: u64);
 
-    /// 画面换了一条路（中转 ⇄ 直连，见 [`crate::direct`]）：时延的基准要从头量。
-    /// `lost`：旧路（直连）断了，在途的帧不会确认了，不要再等它们（会话随即要一个关键帧）
+    /// 画面换了一条路（中转 ⇄ 直连，见 [`crate::direct`]）：时延的基准要从头量（每一路都是）。
+    /// `lost`：旧路（直连）断了，在途的帧不会确认了，不要再等它们（会话随即要关键帧）
     fn path_changed(&self, lost: bool) {
         let _ = lost;
+    }
+
+    /// 控制端等不到第 `stream` 路的帧了（`ControllerDatagram::Lost`，见 `airhand_proto::session` 的"帧流"）：
+    /// 它交给解码器的最后一帧是 `decoded`。返回 `true`：这一路这之后在途的帧作废了（下一帧从控制端有的帧恢复），
+    /// 它们的帧流放弃掉；`false`：什么也不做（恢复帧已经在路上了；恢复只能编关键帧、等不到的帧还会重传、
+    /// 这是同一处的第一次报告，见 `crate::refs` 的"只能编关键帧时"；默认：这个平台不恢复，控制端等久了会要关键帧）。
+    fn lost(&self, stream: u8, decoded: u32) -> bool {
+        let _ = (stream, decoded);
+        false
+    }
+
+    /// 控制端定时上报每路收完和停顿的帧数。
+    fn feedback(&self, stream: u8, fb: airhand_proto::session::VideoReport) {
+        let _ = (stream, fb);
+    }
+}
+
+/// 每一路画面一个在途控制和码率（[`crate::flow::Flow`]，桌面版的 [`Acks`]）：一共 `airhand_proto::MAX_STREAMS` 个，
+/// 会话一开始就建好（确认在读任务里就交给它们）。一路换了显示器（重建编码管线）时接着用它的码率估计
+pub struct Flows(Vec<Arc<crate::flow::Flow>>);
+
+impl Default for Flows {
+    fn default() -> Self {
+        Self(
+            (0..airhand_proto::MAX_STREAMS)
+                .map(|_| Arc::default())
+                .collect(),
+        )
+    }
+}
+
+impl Flows {
+    /// 第 `stream` 路的（不小于 `MAX_STREAMS` 的没有）
+    pub fn get(&self, stream: u8) -> Option<&Arc<crate::flow::Flow>> {
+        self.0.get(stream as usize)
+    }
+
+    /// 每一路的
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<crate::flow::Flow>> {
+        self.0.iter()
+    }
+}
+
+impl Acks for Flows {
+    fn ack(&self, stream: u8, seq: u32, arrived: u64) {
+        if let Some(f) = self.get(stream) {
+            f.ack(seq, Some(arrived));
+        }
+    }
+
+    fn path_changed(&self, lost: bool) {
+        for f in self.iter() {
+            f.path_changed(lost);
+        }
+    }
+
+    fn lost(&self, stream: u8, decoded: u32) -> bool {
+        self.get(stream).is_some_and(|f| f.lost(decoded))
+    }
+
+    fn feedback(&self, stream: u8, fb: airhand_proto::session::VideoReport) {
+        if let Some(f) = self.get(stream) {
+            f.feedback(fb);
+        }
     }
 }
 
@@ -59,49 +119,14 @@ pub trait MicSink: Send + Sync + 'static {
     fn packet(&self, packet: Vec<u8>);
 }
 
-impl Acks for crate::flow::Flow {
-    fn ack(&self, seq: u32, arrived: u64) {
-        crate::flow::Flow::ack(self, seq, Some(arrived));
-    }
-
-    fn path_changed(&self, lost: bool) {
-        crate::flow::Flow::path_changed(self, lost);
-    }
-}
 use super::{Admission, Gate, Incoming};
 
 /// 控制端每秒都会发 Ping，这么久没有任何消息说明对方已失联
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 /// 这么久等不到控制端的确认（见 `airhand_proto::handshake` 的"确认"）就结束会话
 pub const CONFIRM_TIMEOUT: Duration = crate::secure::STEP_TIMEOUT;
-/// 本机用户这么久没有回应连接请求就当作没人理会（[`ByeReason::Unanswered`]）
-pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 /// 多久检查一次是不是失联了
 const WATCHDOG: Duration = Duration::from_secs(5);
-/// 同时最多有这么多个连接请求在等本机用户回答，再来的不问、直接回绝（[`ByeReason::TooManyRequests`]）。
-///
-/// 知道控制码的人可以反复发起连接：没有这个上限的话，每个请求都弹出一次"是否允许"、各占着服务器上这台被控端的
-/// 一个会话槽位直到 [`APPROVAL_TIMEOUT`]。回绝的会话马上结束，槽位随之归还。
-/// 配对过的、同意过的控制端不用问，不受影响
-pub const MAX_PENDING_APPROVALS: usize = 2;
-
-/// 在等本机用户回答的连接请求的名额（[`MAX_PENDING_APPROVALS`]）：一个被控端服务的所有会话共用
-/// （[`Incoming::approvals`]）
-#[derive(Clone)]
-pub struct ApprovalSlots(Arc<Semaphore>);
-
-impl Default for ApprovalSlots {
-    fn default() -> Self {
-        Self(Arc::new(Semaphore::new(MAX_PENDING_APPROVALS)))
-    }
-}
-
-impl ApprovalSlots {
-    /// 占一个名额（丢掉时归还）；满了为 `None`
-    fn take(&self) -> Option<OwnedSemaphorePermit> {
-        self.0.clone().try_acquire_owned().ok()
-    }
-}
 
 /// 控制端要被控端做的事（会话开始之后才有，见模块说明）
 #[derive(Debug, Clone, PartialEq)]
@@ -110,35 +135,63 @@ pub enum Request {
     Input(Vec<InputEvent>),
     /// 画质设置变了（做过范围校验）
     Settings(QualitySettings),
-    /// 要一个关键帧：控制端要的（例如解码器重置了）带着它收到的最后一帧的序号，在那之后发过关键帧就不用再编了
-    /// （见 `airhand_proto::session` 的"关键帧"）；`None`：被控端自己要的（直连断了，断在上面的帧接收端等不到了），一定要编
-    Keyframe(Option<u32>),
-    /// 改看另一个显示器（序号没检查过）
-    SelectDisplay(u8),
+    /// 要关键帧。控制端要的（例如解码器重置了）是 `Some((第几路, 它收到的这一路的最后一帧的序号))`：在那之后
+    /// 发过关键帧就不用再编了（见 `airhand_proto::session` 的"关键帧"；第几路没检查过）；`None`：被控端自己要的
+    /// （直连断了，断在上面的帧接收端等不到了），每一路都要编
+    Keyframe(Option<(u8, u32)>),
+    /// 看哪几个显示器：第 `i` 项是第 `i` 路画面（见 `airhand_proto::session` 的"多屏"）。显示器的序号、有几项都没检查过
+    /// （[`resolve_view`]）。只看一个显示器（`ControllerMsg::SelectDisplay`）也是它
+    View(Vec<StreamView>),
     /// 控制端复制了文本（不会超过 [`airhand_proto::session::MAX_CLIPBOARD_TEXT`]）
     Clipboard(String),
+    /// 控制端复制了文件（见 [`crate::files`]）：放进本机剪贴板，本机有程序粘贴时才去取内容。
+    /// 放好了（放不了也要）调用 [`crate::files::RemoteOffer::ready`]
+    ClipboardFiles(crate::files::RemoteOffer),
     /// 打开 / 关闭声音
     Audio(bool),
     /// 打开 / 关闭控制端的麦克风（见 [`MicSink`]）
     Mic(bool),
 }
 
-/// 会话怎么开始：握手里的画质和要不要声音，同意之前又收到的设置也算进来
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// 控制端要看的显示器（[`Request::View`]）落到这台被控端上（`displays` 个显示器，最多同时发 `max` 路）：
+/// 去掉不存在的、重复的，多出来的不要；一个都不剩时看主显示器（第 0 个）。没有显示器时是空的
+pub fn resolve_view(view: &[StreamView], displays: usize, max: u8) -> Vec<StreamView> {
+    let mut out: Vec<StreamView> = Vec::with_capacity(view.len());
+    let max = max.clamp(1, airhand_proto::MAX_STREAMS) as usize;
+    for v in view {
+        if out.len() == max {
+            break;
+        }
+        if (v.display as usize) < displays && !out.iter().any(|o| o.display == v.display) {
+            out.push(*v);
+        }
+    }
+    if out.is_empty() && displays > 0 {
+        out.push(StreamView::display(0));
+    }
+    out
+}
+
+/// 会话怎么开始：控制端在握手里给的画质、要不要声音、看哪几个显示器
+#[derive(Debug, Clone, PartialEq)]
 pub struct Start {
     /// 做过范围校验
     pub settings: QualitySettings,
     pub audio: bool,
+    /// 看哪几个显示器（和 [`Request::View`] 一样没检查过；空的是只看主显示器）
+    pub view: Vec<StreamView>,
 }
 
 /// 交给平台的发送端（[`serve`] 的 `platform` 拿到它们）
 pub struct Senders {
     /// 控制消息：Hello、提示、显示器列表、光标、剪贴板……（按消息挑通道，见 [`super::queue`]）
     pub out: Outbox,
-    /// 画面包
-    pub video: mpsc::Sender<Bytes>,
+    /// 画面包：第 `i` 项是第 `i` 路（一共 `airhand_proto::MAX_STREAMS` 路，见 `airhand_proto::session` 的"多屏"）
+    pub video: Vec<mpsc::Sender<Bytes>>,
     /// 声音包
     pub audio: mpsc::Sender<Bytes>,
+    /// 剪贴板文件处理端（见 [`crate::files`]）。
+    pub files: Option<crate::files::Files>,
 }
 
 /// 一个会话里各平台不同的事。方法都在会话的任务里依次调用，不会同时进来两个。
@@ -149,24 +202,9 @@ pub trait Platform: Send {
     /// 平台自己的事（定时检查、别处来的广播……），见 [`Platform::next_event`]
     type Event: Send;
 
-    /// 请本机用户同意这次连接（握手时 [`Gate`] 要求的，[`Admission::NeedsApproval`]）。
-    /// 回答从返回的通道来，通道关了算拒绝；最多等 [`APPROVAL_TIMEOUT`]。同时在等回答的请求最多
-    /// [`MAX_PENDING_APPROVALS`] 个，再来的不会问到这里。
-    /// 默认直接拒绝：给不会要求同意的 [`Gate`] 用
-    fn ask(&mut self, admitted: &Admitted) -> oneshot::Receiver<bool> {
-        let _ = admitted;
-        warn!("this host can't ask its user to allow a connection, declining");
-        oneshot::channel().1
-    }
-
-    /// 本机用户回答了连接请求（没人理会、会话先结束了的不调用）。同意了的话接着就是 [`Platform::start`]
-    fn answered(&mut self, allowed: bool) {
-        let _ = allowed;
-    }
-
-    /// 控制端确认了握手（见 `airhand_proto::handshake` 的"确认"）：是真的在连，这时才在托盘、列表里显示它。
-    /// 不用同意的会话这时已经开始了（[`Platform::start`] 在确认之前：重放的握手消息看不到画面，只是让本机白编码一会儿）；
-    /// 要同意的会话接着就是 [`Platform::ask`]
+    /// 控制端确认了握手（见 `airhand_proto::handshake` 的"确认"）：是真的在连，这时才在托盘、列表里显示它、
+    /// 提醒本机用户。会话这时已经开始了（[`Platform::start`] 在确认之前：重放的握手消息看不到画面，
+    /// 只是让本机白编码一会儿）
     fn confirmed(&mut self) {}
 
     /// 画面确认交给谁。会话一开始取一次；确认在读任务里就交给它，不经过 [`Platform::request`]
@@ -178,7 +216,7 @@ pub trait Platform: Send {
         None
     }
 
-    /// 会话开始（不用同意，或者本机用户同意了）：发 [`HostMsg::Hello`] 和开始时的提示，开始采集
+    /// 会话开始：发 [`HostMsg::Hello`] 和开始时的提示，开始采集
     fn start(&mut self, start: Start) -> impl Future<Output = Result<()>> + Send;
 
     /// 执行控制端的请求。返回错误时会话结束
@@ -238,6 +276,7 @@ where
             out: io.out.clone(),
             video: io.video.clone(),
             audio: io.audio.clone(),
+            files: io.files.clone(),
         },
     );
     let result = drive(
@@ -248,7 +287,6 @@ where
         &mut io.incoming,
         &mut kick,
         &mut io.writer,
-        &inc.approvals,
         &|| started.notify_one(),
     )
     .await;
@@ -258,44 +296,8 @@ where
     io.close(session_id, result).await
 }
 
-/// 会话处在哪一步
-enum Phase {
-    /// 要请本机用户同意，在等控制端的确认（确认之前不问）
-    Confirming,
-    /// 在等本机用户回答
-    Asking {
-        answer: oneshot::Receiver<bool>,
-        deadline: Instant,
-        /// 占着的名额（[`ApprovalSlots`]）：不再等了就归还
-        _slot: OwnedSemaphorePermit,
-    },
-    /// 开始了
-    Open,
-}
-
-enum Answer {
-    Allowed,
-    Declined,
-    Unanswered,
-}
-
-/// 等本机用户回答（会话开始之后一直等下去）
-async fn answer(phase: &mut Phase) -> Answer {
-    match phase {
-        Phase::Asking {
-            answer, deadline, ..
-        } => match tokio::time::timeout_at(*deadline, answer).await {
-            Ok(Ok(true)) => Answer::Allowed,
-            Ok(_) => Answer::Declined,
-            Err(_) => Answer::Unanswered,
-        },
-        Phase::Confirming | Phase::Open => std::future::pending().await,
-    }
-}
-
 /// 会话的主循环（见模块说明）。正常结束（控制端断开、发了 Bye）时为 `Ok`。
-/// `started`：会话开始了（发了 Hello）之后调用：这时才开始建直连（见 [`crate::direct`]），
-/// 不把本机的地址告诉还没被同意的控制端
+/// `started`：会话开始了（发了 Hello）之后调用：这时才开始建直连（见 [`crate::direct`]）
 #[allow(clippy::too_many_arguments)]
 async fn drive<P: Platform>(
     session_id: u64,
@@ -305,7 +307,6 @@ async fn drive<P: Platform>(
     incoming: &mut ControllerReceiver,
     kick: &mut watch::Receiver<ByeReason>,
     writer: &mut Writer,
-    approvals: &ApprovalSlots,
     started: &(dyn Fn() + Sync),
 ) -> Result<()> {
     // 本机用户可能在端到端握手期间已经点了断开，不能先开始采集再处理这个通知。
@@ -317,19 +318,16 @@ async fn drive<P: Platform>(
     if let Some(mic) = platform.mic() {
         incoming.set_mic(mic);
     }
-    let mut start = Start {
-        settings: admitted.settings,
-        audio: admitted.audio,
-    };
-    // 不用同意的：不等确认就开始（见模块说明）
-    let mut phase = if admitted.admission == Admission::NeedsApproval {
-        Phase::Confirming
-    } else {
-        platform.start(start).await?;
-        info!(session_id, "session started");
-        started();
-        Phase::Open
-    };
+    // 不等确认就开始（见模块说明）
+    platform
+        .start(Start {
+            settings: admitted.settings,
+            audio: admitted.audio,
+            view: admitted.view.clone(),
+        })
+        .await?;
+    info!(session_id, "session started");
+    started();
     let mut confirm = incoming.confirmation();
     let mut confirmed = false;
     let confirm_by = Instant::now() + CONFIRM_TIMEOUT;
@@ -343,7 +341,6 @@ async fn drive<P: Platform>(
             out.send(&HostMsg::Bye(*kick.borrow_and_update()))?;
             return Ok(());
         }
-        let open = matches!(phase, Phase::Open);
         tokio::select! {
             c = &mut confirm, if !confirmed => {
                 // 读任务没等到确认就结束了：会话的结果是读任务的错误（见 HostStreams::close）
@@ -353,64 +350,13 @@ async fn drive<P: Platform>(
                 confirmed = true;
                 info!(session_id, "the controller confirmed the handshake");
                 platform.confirmed();
-                if !matches!(phase, Phase::Confirming) {
-                    continue;
-                }
-                // 在等本机用户回答的请求已经够多了：这一个不问（见 MAX_PENDING_APPROVALS）
-                let Some(slot) = approvals.take() else {
-                    info!(
-                        session_id,
-                        "too many connection requests are waiting for the local user, turning this one away"
-                    );
-                    out.send(&HostMsg::Bye(ByeReason::TooManyRequests))?;
-                    return Ok(());
-                };
-                let answer = platform.ask(admitted);
-                info!(session_id, safety = %admitted.safety, "asking the local user to allow the connection");
-                out.send(&HostMsg::AwaitingApproval)?;
-                phase = Phase::Asking {
-                    answer,
-                    deadline: Instant::now() + APPROVAL_TIMEOUT,
-                    _slot: slot,
-                };
             }
             () = tokio::time::sleep_until(confirm_by), if !confirmed => {
                 bail!("the controller didn't confirm the handshake");
             }
             req = incoming.recv() => {
                 let Some(req) = req else { return Ok(()) };
-                match req {
-                    req if open => platform.request(req).await?,
-                    // 同意之前：记下画质和声音设置，同意之后一起生效；别的（输入、剪贴板……）都不执行
-                    Request::Settings(s) => start.settings = s,
-                    Request::Audio(a) => start.audio = a,
-                    _ => {}
-                }
-            }
-            a = answer(&mut phase) => {
-                if let Answer::Allowed | Answer::Declined = a {
-                    platform.answered(matches!(a, Answer::Allowed));
-                }
-                let reason = match a {
-                    Answer::Allowed => {
-                        info!(session_id, "the local user allowed the connection");
-                        phase = Phase::Open;
-                        platform.start(start).await?;
-                        info!(session_id, "session started");
-                        started();
-                        continue;
-                    }
-                    Answer::Declined => {
-                        info!(session_id, "the local user declined the connection");
-                        ByeReason::Declined
-                    }
-                    Answer::Unanswered => {
-                        info!(session_id, "nobody answered the connection request");
-                        ByeReason::Unanswered
-                    }
-                };
-                out.send(&HostMsg::Bye(reason))?;
-                return Ok(());
+                platform.request(req).await?;
             }
             changed = kick.changed(), if kickable => {
                 // 发送端不在了：被控端服务正在结束，会话随之被取消
@@ -423,10 +369,10 @@ async fn drive<P: Platform>(
                 out.send(&HostMsg::Bye(reason))?;
                 return Ok(());
             }
-            event = platform.next_event(), if open => platform.event(event).await?,
+            event = platform.next_event() => platform.event(event).await?,
             e = writer.failed() => return Err(e),
             _ = watchdog.tick() => {
-                if open && platform.video_stalled() {
+                if platform.video_stalled() {
                     bail!("the controller stopped acknowledging video");
                 }
                 if incoming.silent_for() > PEER_TIMEOUT {
@@ -444,18 +390,16 @@ mod tests {
     use crate::host::streams::{Express, request};
     use crate::tasks::OwnedTask;
     use airhand_proto::framing;
-    use airhand_proto::handshake::Negotiated;
     use airhand_proto::session::{
         Codec, ControllerDatagram, ControllerMsg, MAX_CLIPBOARD_TEXT, MouseButton,
     };
     use std::sync::{Arc, Mutex};
+    use tokio::sync::oneshot;
 
     /// 平台那边发生了什么
     #[derive(Debug, Clone, PartialEq)]
     enum Call {
         Confirmed,
-        Ask,
-        Answered(bool),
         Start(Start),
         Request(Request),
         Event(u32),
@@ -476,12 +420,12 @@ mod tests {
 
     struct Fake {
         log: Log,
-        answer: Option<oneshot::Receiver<bool>>,
         events: mpsc::Receiver<u32>,
     }
 
     impl Acks for Log {
-        fn ack(&self, seq: u32, arrived: u64) {
+        fn ack(&self, stream: u8, seq: u32, arrived: u64) {
+            assert_eq!(stream, 0);
             self.push(Call::Ack(seq, arrived));
         }
     }
@@ -490,13 +434,6 @@ mod tests {
         type Event = Option<u32>;
         fn acks(&self) -> Arc<dyn Acks> {
             Arc::new(self.log.clone())
-        }
-        fn ask(&mut self, _: &Admitted) -> oneshot::Receiver<bool> {
-            self.log.push(Call::Ask);
-            self.answer.take().unwrap()
-        }
-        fn answered(&mut self, allowed: bool) {
-            self.log.push(Call::Answered(allowed));
         }
         fn confirmed(&mut self) {
             self.log.push(Call::Confirmed);
@@ -534,7 +471,6 @@ mod tests {
         confirm: Option<oneshot::Sender<()>>,
         events: mpsc::Sender<u32>,
         kick: watch::Sender<ByeReason>,
-        answer: Option<oneshot::Sender<bool>>,
         control: LaneReceiver,
         task: tokio::task::JoinHandle<Result<()>>,
     }
@@ -546,34 +482,25 @@ mod tests {
             os: "test".into(),
             safety: "000-000".into(),
             admission,
-            negotiated: Negotiated {
-                version: 1,
-                features: Default::default(),
-            },
             settings: QualitySettings::default(),
             audio: true,
+            view: Vec::new(),
         }
     }
 
     /// 控制端一开始就确认了的会话（真的控制端收到决定马上确认）
     fn session(admission: Admission) -> Harness {
-        session_with(admission, ApprovalSlots::default())
-    }
-
-    /// `approvals`：和别的会话共用的名额（同一个被控端服务的会话）
-    fn session_with(admission: Admission, approvals: ApprovalSlots) -> Harness {
-        let mut h = unconfirmed(admission, approvals);
+        let mut h = unconfirmed(admission);
         h.confirm();
         h
     }
 
     /// 还没确认的会话（[`Harness::confirm`]）
-    fn unconfirmed(admission: Admission, approvals: ApprovalSlots) -> Harness {
+    fn unconfirmed(admission: Admission) -> Harness {
         let log = Log::default();
         let (to_host, control_in) = mpsc::channel(16);
         let (events_tx, events) = mpsc::channel(16);
         let (kick, mut kick_rx) = watch::channel(ByeReason::Kicked);
-        let (answer_tx, answer) = oneshot::channel();
         let (confirm_tx, confirm_rx) = oneshot::channel();
         let (out, control, _bulk) = queue::channel();
         let pongs = Arc::new(Mutex::new(Vec::new()));
@@ -583,7 +510,6 @@ mod tests {
             ControllerReceiver::new(control_in, mpsc::channel(1).1, confirm_rx, express.clone());
         let mut platform = Fake {
             log: log.clone(),
-            answer: Some(answer),
             events,
         };
         let task = tokio::spawn(async move {
@@ -597,7 +523,6 @@ mod tests {
                 &mut incoming,
                 &mut kick_rx,
                 &mut writer,
-                &approvals,
                 &|| {},
             )
             .await
@@ -610,7 +535,6 @@ mod tests {
             confirm: Some(confirm_tx),
             events: events_tx,
             kick,
-            answer: Some(answer_tx),
             control,
             task,
         }
@@ -676,9 +600,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_kick_during_the_handshake_prevents_start_and_approval() {
+    async fn a_kick_during_the_handshake_prevents_start() {
         // current-thread runtime: send before yielding, so drive first sees the pending kick.
-        for admission in [Admission::Known, Admission::NeedsApproval] {
+        for admission in [Admission::Known, Admission::Paired] {
             let mut h = session(admission);
             h.kick.send_replace(ByeReason::Kicked);
             assert!(matches!(
@@ -708,7 +632,11 @@ mod tests {
         })
         .await;
         h.send(ControllerMsg::Settings(fast())).await;
-        h.datagram(ControllerDatagram::Ack { seq: 3, arrived: 9 });
+        h.datagram(ControllerDatagram::Ack {
+            seq: 3,
+            arrived: 9,
+            stream: 0,
+        });
         h.send(ControllerMsg::Clipboard {
             text: "x".repeat(MAX_CLIPBOARD_TEXT + 1),
         })
@@ -727,7 +655,8 @@ mod tests {
             [
                 Call::Start(Start {
                     settings: QualitySettings::default(),
-                    audio: true
+                    audio: true,
+                    view: Vec::new(),
                 }),
                 Call::Request(Request::Input(click())),
                 Call::Request(Request::Settings(fast().sanitized())),
@@ -739,180 +668,35 @@ mod tests {
         assert!((&mut h.task).await.unwrap().is_ok());
     }
 
-    /// 不用同意的会话不等确认就开始，确认了才显示控制端；要同意的确认了才问本机用户
+    /// 会话不等确认就开始，确认了才告诉平台（显示控制端、提醒本机用户）
     #[tokio::test]
-    async fn the_session_starts_before_the_confirmation_but_asks_after_it() {
-        let mut h = unconfirmed(Admission::Known, ApprovalSlots::default());
+    async fn the_session_starts_before_the_confirmation() {
+        let mut h = unconfirmed(Admission::Known);
         h.settle().await;
         assert!(matches!(h.log.take()[..], [Call::Start(_)]));
         h.confirm();
         h.settle().await;
         assert_eq!(h.log.take(), [Call::Confirmed]);
-
-        let mut h = unconfirmed(Admission::NeedsApproval, ApprovalSlots::default());
-        h.datagram(ControllerDatagram::Ping { t: 1 });
-        assert!(h.received().await.is_empty());
-        assert!(h.log.take().is_empty());
-        assert_eq!(*h.pongs.lock().unwrap(), [1]);
-        h.confirm();
-        assert!(matches!(
-            h.received().await[..],
-            [HostMsg::AwaitingApproval]
-        ));
-        assert_eq!(h.log.take(), [Call::Confirmed, Call::Ask]);
     }
 
-    /// 等不到确认（重放的握手消息）：会话结束，不显示、不问；读任务没等到确认就结束了也一样
+    /// 等不到确认（重放的握手消息）：会话结束，不显示；读任务没等到确认就结束了也一样
     #[tokio::test(start_paused = true)]
     async fn no_confirmation_ends_the_session() {
-        for admission in [Admission::Known, Admission::NeedsApproval] {
-            let h = unconfirmed(admission, ApprovalSlots::default());
-            let err = h.task.await.unwrap().unwrap_err();
-            assert!(err.to_string().contains("confirm"), "{err}");
-            assert!(!h.log.take().contains(&Call::Confirmed));
-        }
-        let mut h = unconfirmed(Admission::NeedsApproval, ApprovalSlots::default());
+        let h = unconfirmed(Admission::Known);
+        let err = h.task.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("confirm"), "{err}");
+        assert!(!h.log.take().contains(&Call::Confirmed));
+
+        let mut h = unconfirmed(Admission::Known);
+        h.settle().await;
         drop(h.confirm.take());
         assert!((&mut h.task).await.unwrap().is_ok());
-        assert!(h.log.take().is_empty());
-    }
-
-    /// 同意之前只回应 Ping、记下设置；同意之后带着记下的设置开始
-    #[tokio::test]
-    async fn nothing_happens_before_the_local_user_allows_it() {
-        let mut h = session(Admission::NeedsApproval);
-        h.send(ControllerMsg::Input {
-            t: 0,
-            events: click(),
-        })
-        .await;
-        h.send(ControllerMsg::Settings(fast())).await;
-        h.send(ControllerMsg::Audio { enabled: false }).await;
-        h.send(ControllerMsg::Clipboard { text: "hi".into() }).await;
-        h.datagram(ControllerDatagram::Ping { t: 1 });
-        h.events.send(1).await.unwrap();
-        let got = h.received().await;
-        assert!(matches!(got[..], [HostMsg::AwaitingApproval]), "{got:?}");
-        assert_eq!(*h.pongs.lock().unwrap(), [1]);
-        assert_eq!(h.log.take(), [Call::Confirmed, Call::Ask]);
-
-        h.answer.take().unwrap().send(true).unwrap();
-        // 和回答同时到的消息算同意之前的（控制端收到 Hello 之前发的本来就是）：等会话开始了再发
-        h.settle().await;
-        h.send(ControllerMsg::Input {
-            t: 0,
-            events: click(),
-        })
-        .await;
-        h.settle().await;
-        let log = h.log.take();
-        assert_eq!(
-            log[..2],
-            [
-                Call::Answered(true),
-                Call::Start(Start {
-                    settings: fast().sanitized(),
-                    audio: false
-                }),
-            ]
-        );
-        // 开始之后才处理平台自己的事（之前排着的那一件也是）
-        assert!(log.contains(&Call::Event(1)), "{log:?}");
-        assert!(log.contains(&Call::Request(Request::Input(click()))));
-    }
-
-    #[tokio::test]
-    async fn declined() {
-        let mut h = session(Admission::NeedsApproval);
-        h.answer.take().unwrap().send(false).unwrap();
-        assert!((&mut h.task).await.unwrap().is_ok());
-        let got = h.received().await;
-        assert!(matches!(
-            got[..],
-            [HostMsg::AwaitingApproval, HostMsg::Bye(ByeReason::Declined)]
-        ));
-        assert_eq!(
-            h.log.take(),
-            [Call::Confirmed, Call::Ask, Call::Answered(false)]
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn unanswered() {
-        let mut h = session(Admission::NeedsApproval);
-        // 控制端一直在发 Ping：不算失联，但没人理会
-        let express = h.express.clone();
-        let _pinger = OwnedTask(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                express.datagram(ControllerDatagram::Ping { t: 0 });
-            }
-        }));
-        assert!((&mut h.task).await.unwrap().is_ok());
-        let got = h.received().await;
-        assert!(
-            matches!(
-                got[..],
-                [
-                    HostMsg::AwaitingApproval,
-                    HostMsg::Bye(ByeReason::Unanswered)
-                ]
-            ),
-            "{got:?}"
-        );
-        assert_eq!(h.log.take(), [Call::Confirmed, Call::Ask]);
-    }
-
-    /// 同时在等本机用户回答的请求有上限：再来的不问、直接回绝；有一个不再等了（回答了、走了）才问下一个
-    #[tokio::test]
-    async fn only_a_few_requests_wait_for_the_local_user_at_once() {
-        let slots = ApprovalSlots::default();
-        let mut waiting = Vec::new();
-        for _ in 0..MAX_PENDING_APPROVALS {
-            let mut h = session_with(Admission::NeedsApproval, slots.clone());
-            assert!(matches!(
-                h.received().await[..],
-                [HostMsg::AwaitingApproval]
-            ));
-            assert_eq!(h.log.take(), [Call::Confirmed, Call::Ask]);
-            waiting.push(h);
-        }
-        // 再来一个：本机用户看不到它，会话马上结束
-        let mut extra = session_with(Admission::NeedsApproval, slots.clone());
-        assert!((&mut extra.task).await.unwrap().is_ok());
-        let got = extra.received().await;
-        assert!(
-            matches!(got[..], [HostMsg::Bye(ByeReason::TooManyRequests)]),
-            "{got:?}"
-        );
-        assert_eq!(extra.log.take(), [Call::Confirmed]);
-        // 不用问的（同意过的、配对过的）不受影响
-        let known = session_with(Admission::Known, slots.clone());
-        known.settle().await;
-        assert!(matches!(
-            known.log.take()[..],
-            [Call::Start(_), Call::Confirmed]
-        ));
-
-        // 本机用户同意了一个：它不再占着名额，下一个请求又会问
-        let mut allowed = waiting.pop().unwrap();
-        allowed.answer.take().unwrap().send(true).unwrap();
-        allowed.settle().await;
-        let next = session_with(Admission::NeedsApproval, slots.clone());
-        next.settle().await;
-        assert_eq!(next.log.take(), [Call::Confirmed, Call::Ask]);
-        // 控制端自己走了的也一样
-        let gone = waiting.pop().unwrap();
-        drop(gone.to_host);
-        assert!(gone.task.await.unwrap().is_ok());
-        let another = session_with(Admission::NeedsApproval, slots);
-        another.settle().await;
-        assert_eq!(another.log.take(), [Call::Confirmed, Call::Ask]);
+        assert!(!h.log.take().contains(&Call::Confirmed));
     }
 
     #[tokio::test]
     async fn kicked() {
-        for admission in [Admission::Open, Admission::NeedsApproval] {
+        for admission in [Admission::Known, Admission::Paired] {
             let mut h = session(admission);
             h.settle().await;
             h.kick.send_replace(ByeReason::CodeChanged);
@@ -927,8 +711,48 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_silent_controller_times_out() {
-        let h = session(Admission::Open);
+        let h = session(Admission::Known);
         let err = h.task.await.unwrap().unwrap_err();
         assert!(err.to_string().contains("stopped responding"), "{err}");
+    }
+
+    /// 控制端要看的显示器：不存在的、重复的去掉，最多能发几路就几路；一个都不剩（或者没说）就看主显示器
+    #[test]
+    fn views_resolve_against_the_displays() {
+        let v = |ds: &[u8]| {
+            ds.iter()
+                .copied()
+                .map(StreamView::display)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(resolve_view(&v(&[2, 0]), 3, 4), v(&[2, 0]));
+        assert_eq!(resolve_view(&v(&[2, 7, 2, 1]), 3, 4), v(&[2, 1]));
+        assert_eq!(resolve_view(&v(&[0, 1, 2]), 3, 2), v(&[0, 1]));
+        // 只能发一路（0 也当作 1）
+        assert_eq!(resolve_view(&v(&[1, 0]), 3, 0), v(&[1]));
+        assert_eq!(resolve_view(&[], 3, 4), v(&[0]));
+        assert_eq!(resolve_view(&v(&[9]), 3, 4), v(&[0]));
+        assert_eq!(resolve_view(&v(&[0]), 0, 4), v(&[]));
+        // 每一路的大小跟着它走
+        let sized = [StreamView {
+            display: 1,
+            max_short: 720,
+        }];
+        assert_eq!(resolve_view(&sized, 2, 4), sized);
+    }
+
+    /// 桌面版的确认按路交给那一路的码率控制；没有的路不管
+    #[test]
+    fn flows_route_acks_by_stream() {
+        let flows = Flows::default();
+        let seq = flows.get(1).unwrap().sent(1000);
+        assert_eq!(flows.get(1).unwrap().inflight_for_test(), 1);
+        flows.ack(0, seq, 5);
+        assert_eq!(flows.get(1).unwrap().inflight_for_test(), 1);
+        flows.ack(1, seq, 5);
+        assert_eq!(flows.get(1).unwrap().inflight_for_test(), 0);
+        flows.ack(airhand_proto::MAX_STREAMS, seq, 5);
+        assert!(flows.get(airhand_proto::MAX_STREAMS).is_none());
+        assert!(!flows.lost(airhand_proto::MAX_STREAMS, 0));
     }
 }

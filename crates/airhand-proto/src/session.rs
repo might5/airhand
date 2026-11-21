@@ -11,8 +11,8 @@
 //!   控制端测的往返时延都靠它们）。丢了的确认由控制端重发（见 [`ControllerDatagram::Ack`]）。直连通着时 Ping、Pong、
 //!   确认两条路各发一份（同一个计数，后到的那份被接收端的重放窗口挡掉）；探测和回声只发在要量的那条路上；
 //! * **控制**：输入、设置、提示……都很小，要快，不能丢、不能乱序；
-//! * **大块**：剪贴板（[`HostMsg::Clipboard`] / [`ControllerMsg::Clipboard`]，最多 1 MiB）和光标图像
-//!   （[`HostMsg::CursorImage`]，几十 KB）。它们要是和控制消息挤在一条有序的流里，上行 5 Mbps 时一个 1 MiB 的剪贴板
+//! * **大块**：剪贴板（[`HostMsg::Clipboard`] / [`ControllerMsg::Clipboard`]，最多 1 MiB）、光标图像
+//!   （[`HostMsg::CursorImage`]，几十 KB）、剪贴板里的文件的公告和列表（[`crate::files::FileMsg::lane`]）。它们要是和控制消息挤在一条有序的流里，上行 5 Mbps 时一个 1 MiB 的剪贴板
 //!   会把后面的消息挡住大约 1.7 秒：确认迟到，被控端的在途帧窗口停住、测到的往返时延变大，自适应码率误判为拥塞；
 //!   输入晚到超过 [`INPUT_MAX_AGE`] 还会被当成过时的丢掉。
 //!
@@ -23,24 +23,30 @@
 //!
 //! # 会话开始
 //!
-//! 控制通道上先做端到端握手（见 [`crate::handshake`]）：双方确认对方的身份、协商会话版本和能力位，
-//! 被控端决定让不让这个控制端连（配对过的、输对了配对码的、或者被控端允许任何人连）。
+//! 控制通道上先做端到端握手（见 [`crate::handshake`]）：双方确认对方的身份，校验会话版本一致，
+//! 被控端决定让不让这个控制端连（配对过的、输对了配对码的；只凭控制码进不来）。
 //! 画质设置和要不要声音在控制端的介绍里（[`crate::handshake::ControllerIntro`]），被控端一开始就按它建编码器，
 //! 不用先按默认设置建一个、等设置到了再重建（硬件编码器初始化就要上百毫秒，还要多发一个关键帧）。
-//! 握手之后被控端通常马上发 [`HostMsg::Hello`]，之后开始发画面。
-//!
-//! 被控端也可以先请坐在它面前的人同意（[`HostMsg::AwaitingApproval`]，例如手机默认这样做）：
-//! 同意之后才发 `Hello` 和画面，拒绝或者超时没人理会就发 [`HostMsg::Bye`]（[`ByeReason::Declined`] /
-//! [`ByeReason::Unanswered`]）。等待期间照常回应 Ping，控制端不会把它当成失联。
-//! 同时在等回答的请求有上限：再来的被控端不问，直接发 `Bye`（[`ByeReason::TooManyRequests`]）。
-//! 被控端认得出同意过的控制端（端到端握手里控制端的公钥），断线重连时可以不再询问。
+//! 握手之后被控端马上发 [`HostMsg::Hello`]，之后开始发画面。
 //!
 //! # 鼠标
 //!
-//! 平时鼠标用绝对坐标（[`InputEvent::MouseMove`]）：控制端的指针在哪里，被控端的光标就在哪里。
-//! 被控端的光标隐藏了（[`CursorVisibility::Hidden`]，例如游戏里按住右键转视角、第一人称游戏）时，
-//! 控制端改发相对移动（[`InputEvent::MouseDelta`]）：游戏这时自己把光标拉回原位、只看移动了多少，
-//! 绝对坐标会和它打架（视角乱跳、拖到画面边上就转不动了）。
+//! 鼠标有两种发法，光标也有两种显示法，原则是**谁决定光标的位置，就由谁画光标**：
+//!
+//! * **绝对坐标**（[`InputEvent::MouseMove`]）：控制端的指针在哪里，被控端的光标就在哪里。位置由控制端决定，
+//!   光标也就用控制端的本地光标显示（形状是被控端的，见 [`HostMsg::Cursor`]），移动零延迟；
+//! * **相对移动**（[`InputEvent::MouseDelta`]）：只说移动了多少，被控端像真鼠标一样注入。光标落在哪里由被控端决定
+//!   （指针速度和加速、屏幕边缘、游戏自己把光标拉回原位），控制端不知道，本地光标表示不了它：要看光标，
+//!   就让被控端把它画进画面里（[`QualitySettings::draw_cursor`]）。
+//!
+//! 控制端（控制台）据此有三种鼠标模式：
+//!
+//! * 自动（默认）：平时发绝对坐标；被控端的光标隐藏了（[`CursorVisibility::Hidden`]，例如游戏里按住右键转视角、
+//!   第一人称游戏）时改发相对移动：游戏这时自己把光标拉回原位、只看移动了多少，绝对坐标会和它打架
+//!   （视角乱跳、拖到画面边上就转不动了）。光标隐藏着，画面里也就不用有光标；
+//! * 桌面：一直发绝对坐标，不管被控端的光标隐藏没有；
+//! * 游戏：一直发相对移动，被控端把光标画进画面里（`draw_cursor`），控制端不显示本地光标。
+//!   游戏里转视角、点界面都是对方真实的光标，不用看对方的光标隐藏没有，也就不会反复切换。
 //!
 //! 光标显示着、但已经画在画面里了（[`CursorVisibility::InFrame`]，被控端改用了软件光标，例如 Windows 拖动、
 //! 缩放窗口时）：不算隐藏，控制端照常发绝对坐标。本地光标还显示不显示由控制端的用户决定：显示着跟手，
@@ -67,17 +73,61 @@
 //! 关键帧（正在路上）就不再编一个。控制端的几个地方（解码出错、换路时缺了帧、界面刚切回来）各自要、在一个往返里
 //! 连着要，被控端也只编一个：关键帧是最大的帧，偏偏又是在网络最差的时候要。
 //!
+//! # 帧流
+//!
+//! v10 每帧使用一条 QUIC 单向流，直连和中转使用相同的格式。
+//!
+//! * 一帧丢了包只卡住它自己那一条流，后面的帧照样到；
+//! * 增量帧带着参考帧（[`crate::media`] 的"参考帧"），控制端据此判断哪些帧交得给解码器：缺了参考帧的先留着，
+//!   等它补到；
+//! * 后面的帧到了、前面的一帧却一直等不到（重传也丢了、路上堵着），控制端发 [`ControllerDatagram::Lost`]，带着它交给
+//!   解码器的最后一帧（`decoded`）。被控端放弃在途的、`decoded` 之后的帧（整条流 reset，不再重传过时的数据），
+//!   下一帧只参考 `decoded` 和它之前控制端已经有的帧：编码器支持长期参考帧时就参考其中一个长期参考帧（参考帧失效，
+//!   比关键帧小得多），不支持就编关键帧。控制端在恢复之前定时重发 `Lost`；被控端收到恢复点已经在路上时的重复请求不再编；
+//! * 一直恢复不了（等了一秒多，见 `airhand_link::merge`）就照旧要关键帧（[`ControllerMsg::RequestKeyframe`]，
+//!   走控制通道，不会丢）。
+//!
+//! 控制端每 [`REPORT_EVERY`] 按显示器报告收完的帧数和等重传停顿的帧数，供被控端调整码率。
+//!
 //! # 麦克风
 //!
 //! 控制端可以把本机麦克风的声音交给被控端，被控端把它放进一个虚拟麦克风，那台电脑上的程序（会议、语音输入）
-//! 就像用着一个本地麦克风。双方都支持（会话能力位 [`crate::features::session::MIC`]）才有：
+//! 就像用着一个本地麦克风。能不能用由被控端的平台和设备决定：
 //!
 //! * 被控端在 [`HostMsg::Hello`] 之后发 [`HostMsg::Mic`]，说明它现在能不能接（[`MicState`]：平台不支持、
-//!   没有虚拟麦克风、能接、被别的控制端占着、出错了），之后有变化再发；
+//!   没有虚拟麦克风、需要安装 Steam、准备设备、能接、被别的控制端占着、出错了），之后有变化再发；
 //! * 控制端在能接时发 [`ControllerMsg::Mic`] 打开，之后的声音和被控端的声音一样走声音数据报（方向相反，
 //!   同样带着之前几包的副本，见 [`crate::media`] 的"声音数据报"）；关掉时也发 [`ControllerMsg::Mic`]。
 //!   被控端只在打开着的时候接（同一时刻只给一个控制端，后来的是 [`MicState::Busy`]）；
 //! * 被控端没有声音放进去的时候虚拟麦克风里是静音。
+//!
+//! # 多屏
+//!
+//! 被控端有好几个显示器时，控制端可以同时看、同时操作其中几个（默认只看一个）。每个显示器是一**路**画面：
+//!
+//! * 第 `i` 路走画面通道的第 `i` 路（[`crate::SessionLane::Video`]，每一路一条通道、一把密钥、一串计数），
+//!   画面包头也带有路号。每一路独立编码、确认和恢复。
+//! * 控制端用 [`ControllerMsg::View`] 说看哪几个显示器（第 `i` 项是第 `i` 路），以及每一路按显示的大小要多大的画面
+//!   （[`StreamView::max_short`]，和画质设置里的短边上限取较严的）。开始时看哪几个在握手里
+//!   （[`crate::handshake::ControllerIntro::view`]，空的是只看主显示器）。被控端最多同时发 [`HostHello::streams`] 路
+//!   （不超过 [`crate::MAX_STREAMS`]），多出来的、重复的、不存在的显示器不要。[`ControllerMsg::SelectDisplay`] 是只看一个
+//!   显示器的简便说法（这一路的大小只看画质设置）；
+//! * 被控端在 [`HostMsg::Displays`] 里告诉控制端现在每一路是哪个显示器（[`HostMsg::Displays::shown`]，显示器插拔时
+//!   跟着它走，拔掉了就不要那一路）；
+//! * 和画面有关的反馈都带着是第几路：确认（[`ControllerDatagram::Ack::stream`]）、等不到帧了
+//!   （[`ControllerDatagram::Lost::stream`]）、收得怎么样（[`ControllerDatagram::Report`]）、要关键帧
+//!   （[`ControllerMsg::RequestKeyframe::stream`]）、编码器（[`EncoderInfo::stream`]）；
+//! * 绝对坐标的鼠标移动说的是第几路画面上的位置（[`InputEvent::MouseMove::stream`]）。键盘、相对移动和画面无关；
+//! * 画质设置（帧率、码率、编码格式……）对每一路分别生效；光标、声音、剪贴板是整个会话一份。
+//!
+//! 第 0 路编号为 0，省略末尾的路号也表示第 0 路。
+//!
+//! # 剪贴板里的文件
+//!
+//! 剪贴板里除了文字还可以是文件：复制时只发清单
+//! （[`crate::files::FileMsg::Offer`]），粘贴时才传内容（文件通道 [`crate::SessionLane::File`]），两个方向一样，
+//! 见 [`crate::files`]。消息包在 [`HostMsg::Files`] / [`ControllerMsg::Files`] 里，走哪条通道看里面的消息。
+//! 文字和文件互相取代：剪贴板里只有最近的一样。
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -87,23 +137,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::SessionLane;
 use crate::cbor::open_enum;
+use crate::files::FileMsg;
 
 /// 被控端 → 控制端。变体的编号是线上的类型，不能改、不能复用。走哪条通道见模块说明
 #[derive(Encode, Decode, Debug, Clone)]
 pub enum HostMsg {
-    /// 会话开始（需要本机用户同意时，同意之后才发）
+    /// 会话开始
     #[n(1)]
     Hello(#[n(0)] HostHello),
-    /// 正在等被控端的用户同意这次连接（见模块说明）
-    #[n(2)]
-    AwaitingApproval,
-    /// 显示器列表或当前显示器变化。
+    // 2：以前的"等被控端的用户同意"，已经去掉了，编号不再用
+    /// 显示器列表或者正在看的显示器变了。
     #[n(4)]
     Displays {
         #[n(0)]
         displays: Vec<DisplayInfo>,
+        /// 第 0 路画面是哪个显示器（`displays` 里的序号）
         #[n(1)]
         current: u8,
+        /// 每一路画面是哪个显示器：第 `i` 项是第 `i` 路（见模块说明的"多屏"），第 0 项就是 `current`
+        #[cbor(n(2), default)]
+        shown: Vec<u8>,
     },
     /// 给控制端的提示（例如采集失败）。不认识的提示（对方版本新增的）是 `None`：不显示。发的时候总是 `Some`
     #[n(5)]
@@ -142,8 +195,7 @@ pub enum HostMsg {
     /// 被控端的直连候选地址：开始（第 `round` 轮）打洞（见模块说明的"直连"）
     #[n(11)]
     Direct(#[n(0)] DirectOffer),
-    /// 被控端现在能不能接控制端的麦克风（见模块说明的"麦克风"）。只发给协商了
-    /// [`crate::features::session::MIC`] 的控制端：Hello 之后发一次，之后有变化再发。
+    /// 被控端现在能不能接控制端的麦克风。Hello 之后发一次，之后有变化再发。
     /// `detail`：出错时给排查问题用的技术信息（英文，同 [`Notice::CaptureFailed`]）
     #[n(12)]
     Mic {
@@ -152,6 +204,10 @@ pub enum HostMsg {
         #[n(1)]
         detail: Option<String>,
     },
+    /// 剪贴板里的文件（见模块说明的"剪贴板里的文件"）。
+    /// 不认识的（对方版本新增的）是 `None`：跳过
+    #[n(13)]
+    Files(#[cbor(n(0), with = "crate::cbor::opt", has_nil)] Option<FileMsg>),
 }
 
 open_enum! {
@@ -159,7 +215,7 @@ open_enum! {
     pub enum MicState {
         /// 这台被控端的平台还不支持
         Unsupported = 0 => "unsupported",
-        /// 支持，但没有可用的虚拟麦克风（Windows：Steam Streaming Microphone，装了 Steam、用过一次远程同乐就有）
+        /// 支持，但没有可用的虚拟麦克风。Windows 被控端可以在打开转发时从 Steam 安装驱动
         NoDevice = 1 => "noDevice",
         /// 能接：控制端打开麦克风之后，声音放进虚拟麦克风
         Ready = 2 => "ready",
@@ -167,6 +223,12 @@ open_enum! {
         Busy = 3 => "busy",
         /// 打不开（例如被别的程序独占了），被控端在重试
         Failed = 4 => "failed",
+        /// Windows 上既没有可用的设备，也没找到 Steam
+        SteamMissing = 5 => "steamMissing",
+        /// 正在打开设备、安装驱动或等 Windows 发布声音端点
+        Preparing = 6 => "preparing",
+        /// Steam 在，但驱动包不可用、安装失败或设备没有出现。detail 给出原因
+        SetupFailed = 7 => "setupFailed",
     }
 }
 
@@ -191,9 +253,10 @@ impl HostMsg {
     /// 这条消息走哪条通道（见模块说明的"走哪条通道"）
     pub fn lane(&self) -> SessionLane {
         match self {
+            HostMsg::Files(Some(m)) => m.lane(),
             HostMsg::CursorImage { .. } | HostMsg::Clipboard { .. } => SessionLane::Bulk,
+            HostMsg::Files(None) => SessionLane::Control,
             HostMsg::Hello(_)
-            | HostMsg::AwaitingApproval
             | HostMsg::Displays { .. }
             | HostMsg::Notice(_)
             | HostMsg::Encoder(_)
@@ -203,6 +266,11 @@ impl HostMsg {
             | HostMsg::Mic { .. } => SessionLane::Control,
         }
     }
+}
+
+/// 第 0 路（只看一个显示器时）的这一项不写进线上的数组（见模块说明的"多屏"）
+pub(crate) fn is_zero(v: &u8) -> bool {
+    *v == 0
 }
 
 /// 被控端给控制端的提示。
@@ -261,12 +329,7 @@ open_enum! {
         Kicked = 0 => "kicked",
         /// 被控端的用户更换了控制码（所有控制端随之断开）
         CodeChanged = 1 => "codeChanged",
-        /// 被控端的用户拒绝了这次连接
-        Declined = 2 => "declined",
-        /// 被控端的用户一直没有回应连接请求
-        Unanswered = 3 => "unanswered",
-        /// 被控端上已经有好几个连接请求在等它的用户回答，这一个没有问（过一会儿再试）
-        TooManyRequests = 4 => "tooManyRequests",
+        // 2–4：以前请本机用户同意时的拒绝 / 没人回答 / 请求太多，已经去掉了，编号不再用
     }
 }
 
@@ -328,6 +391,10 @@ pub struct EncoderInfo {
     pub width: u32,
     #[n(4)]
     pub height: u32,
+    /// 第几路画面的编码器（见模块说明的"多屏"）
+    #[cbor(n(5), skip_if = "is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stream: u8,
 }
 
 #[derive(Encode, Decode, Debug, Clone)]
@@ -341,6 +408,7 @@ pub struct HostHello {
     pub version: String,
     #[n(3)]
     pub displays: Vec<DisplayInfo>,
+    /// 第 0 路画面是哪个显示器（`displays` 里的序号）
     #[n(4)]
     pub current_display: u8,
     /// 被控端可用的编码格式（硬件或软件）。控制端不认识的（`Unknown`）不用管
@@ -355,6 +423,52 @@ pub struct HostHello {
     /// 支持的系统操作（[`InputEvent::System`]），控制端只显示这些。控制端不认识的（`Unknown`）不显示
     #[n(8)]
     pub actions: Vec<SystemAction>,
+    /// 每一路画面是哪个显示器（见 [`HostMsg::Displays::shown`]）
+    #[cbor(n(9), default)]
+    pub shown: Vec<u8>,
+    /// 最多能同时发几路画面（同时看几个显示器，见模块说明的"多屏"）。不超过 [`crate::MAX_STREAMS`]；0 和 1 一样：
+    /// 只能看一个
+    #[cbor(n(10), default)]
+    pub streams: u8,
+}
+
+impl HostHello {
+    /// 最多能同时看几个显示器（至少 1 个，不超过 [`crate::MAX_STREAMS`]）
+    pub fn max_streams(&self) -> u8 {
+        self.streams.clamp(1, crate::MAX_STREAMS)
+    }
+}
+
+/// 一路画面看哪个显示器（[`ControllerMsg::View`]，见模块说明的"多屏"）。JSON（界面传来的）是 camelCase
+#[derive(Encode, Decode, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamView {
+    /// 显示器的序号（[`DisplayInfo::index`]）
+    #[n(0)]
+    pub display: u8,
+    /// 这一路画面的短边上限：控制端按它显示的大小算的（0 = 不限）。被控端和画质设置里的
+    /// [`QualitySettings::max_short`] 取较严的
+    #[cbor(n(1), default)]
+    #[serde(default)]
+    pub max_short: u16,
+}
+
+impl StreamView {
+    /// 第 `display` 个显示器，大小只看画质设置
+    pub fn display(display: u8) -> Self {
+        Self {
+            display,
+            max_short: 0,
+        }
+    }
+}
+
+/// 两个短边上限取较严的（0 = 不限）
+pub fn stricter_short(a: u16, b: u16) -> u16 {
+    match (a, b) {
+        (0, x) | (x, 0) => x,
+        (a, b) => a.min(b),
+    }
 }
 
 open_enum! {
@@ -433,35 +547,6 @@ impl Codec {
     }
 }
 
-open_enum! {
-    /// 被控端缩放画面时优先什么（[`QualitySettings::priority`]）。只在需要缩放时有区别：
-    /// 不缩放时两种都在 GPU 上转换颜色（画质一样）
-    #[derive(Default)]
-    pub enum VideoPriority {
-        /// 延迟低、被控端 CPU 占用低：显卡能缩放就在显卡上缩放、转换颜色，画面不离开显卡，直接交给硬件编码器。
-        /// 显卡的缩放滤镜由驱动决定，缩小很多时（4K、Retina 屏缩到 1080p）文字不一定有 CPU 缩放清楚
-        #[default]
-        Latency = 0 => "latency",
-        /// 文字清楚：画面读回内存，在 CPU 上用 Catmull-Rom 卷积缩放（4K 缩到 1080p 每帧多十几毫秒，CPU 占用也高）
-        Clarity = 1 => "clarity",
-    }
-}
-
-impl VideoPriority {
-    fn is_latency(&self) -> bool {
-        *self == VideoPriority::Latency
-    }
-
-    /// 不认识的值（对方版本新增的）按低延迟处理
-    pub fn or_latency(self) -> Self {
-        if self.is_known() {
-            self
-        } else {
-            VideoPriority::Latency
-        }
-    }
-}
-
 /// 控制端 → 被控端。变体的编号是线上的类型，不能改、不能复用。走哪条通道见模块说明
 #[derive(Encode, Decode, Debug, Clone)]
 pub enum ControllerMsg {
@@ -479,13 +564,17 @@ pub enum ControllerMsg {
     /// 画质设置变了（开始时的设置在握手里，见 [`crate::handshake::ControllerIntro`]）
     #[n(3)]
     Settings(#[n(0)] QualitySettings),
-    /// 要一个关键帧。`after`：控制端收到的最后一帧的序号（还没收到过时为 0），被控端在这之后发过关键帧就不再编
+    /// 要一个关键帧。`after`：控制端收到的这一路的最后一帧的序号（还没收到过时为 0），被控端在这之后发过关键帧就不再编
     /// （见模块说明的"关键帧"）
     #[n(4)]
     RequestKeyframe {
         #[n(0)]
         after: u32,
+        /// 第几路画面（见模块说明的"多屏"）
+        #[cbor(n(1), skip_if = "is_zero")]
+        stream: u8,
     },
+    /// 只看第 `index` 个显示器（[`ControllerMsg::View`] 的简便说法，这一路的大小只看画质设置）
     #[n(5)]
     SelectDisplay {
         #[n(0)]
@@ -506,23 +595,35 @@ pub enum ControllerMsg {
     /// 控制端的直连候选地址，回答 [`HostMsg::Direct`]（见模块说明的"直连"）
     #[n(9)]
     Direct(#[n(0)] DirectOffer),
-    /// 打开 / 关闭控制端的麦克风（见模块说明的"麦克风"）。只发给协商了 [`crate::features::session::MIC`]
-    /// 的被控端；打开之后的声音走声音数据报
+    /// 打开 / 关闭控制端的麦克风；打开之后的声音走声音数据报。
     #[n(10)]
     Mic {
         #[n(0)]
         enabled: bool,
     },
+    /// 看哪几个显示器：第 `i` 项是第 `i` 路画面（见模块说明的"多屏"）。空的是只看主显示器
+    #[n(11)]
+    View {
+        #[n(0)]
+        streams: Vec<StreamView>,
+    },
+    /// 剪贴板里的文件（见模块说明的"剪贴板里的文件"）。
+    /// 不认识的（对方版本新增的）是 `None`：跳过
+    #[n(12)]
+    Files(#[cbor(n(0), with = "crate::cbor::opt", has_nil)] Option<FileMsg>),
 }
 
 impl ControllerMsg {
     pub fn lane(&self) -> SessionLane {
         match self {
+            Self::Files(Some(m)) => m.lane(),
+            Self::Files(None) => SessionLane::Control,
             Self::Clipboard { .. } => SessionLane::Bulk,
             Self::Input { .. }
             | Self::Settings(_)
             | Self::RequestKeyframe { .. }
             | Self::SelectDisplay { .. }
+            | Self::View { .. }
             | Self::Audio { .. }
             | Self::Direct(_)
             | Self::Mic { .. } => SessionLane::Control,
@@ -541,10 +642,12 @@ pub enum ControllerDatagram {
     },
     /// 界面收到了第 `seq` 帧（累积确认），用于被控端的在途控制和码率控制（防止延迟堆积）。
     ///
-    /// `arrived`：这一帧开始从网络上到达的时刻（读到它的长度前缀时，控制端的时钟，微秒，和
-    /// [`ControllerDatagram::Ping::t`] 同一个时钟）。确认要等界面收到才发，往返时延里混着
-    /// 界面那一段；到达时刻只算网络：被控端拿它减去自己的发送时刻，两边时钟之差是常数，变化的部分就是路上的排队
-    /// （用开始到达的时刻，这一帧自己要传多久不算在里面），两次到达之间收到的字节数就是交付速率。
+    /// `arrived`：这一帧的到达时刻（控制端的时钟，微秒，和 [`ControllerDatagram::Ping::t`] 同一个时钟）：
+    /// 它开始从网络上到达（第一个字节、第一块到了）和前一帧交出去这两个时刻里晚的那个，也就是画面是一条有序流时
+    /// 读到它的长度前缀的时刻（前面的帧在等重传时它也算晚到，见 `airhand_link::merge` 的"到达时刻"）。
+    /// 确认要等界面收到才发，往返时延里混着界面那一段；到达时刻只算网络：被控端拿它减去自己的发送时刻，
+    /// 两边时钟之差是常数，变化的部分就是路上的排队（这一帧自己要传多久不算在里面），两次到达之间收到的字节数
+    /// 就是交付速率。
     ///
     /// 数据报会丢：丢的要是最后一个（画面停了，或者被控端的在途帧满了、正等着它），被控端就一直等。所以控制端在没有
     /// 新的确认时把最近的一个重发几次，之后随每次 Ping 再发一次；被控端收到重复的确认什么也不做
@@ -554,6 +657,9 @@ pub enum ControllerDatagram {
         seq: u32,
         #[n(1)]
         arrived: u64,
+        /// 第几路画面（见模块说明的"多屏"）：每一路各自确认
+        #[cbor(n(2), skip_if = "is_zero")]
+        stream: u8,
     },
     /// 回答 [`HostDatagram::Probe`]：`t` 原样带回，从收到探测的那条路发回去
     #[n(2)]
@@ -561,6 +667,45 @@ pub enum ControllerDatagram {
         #[n(0)]
         t: u64,
     },
+    /// 等不到一帧了（见模块说明的"帧流"）：控制端交给解码器的最后一帧是第 `decoded` 帧（还没有时为 0），
+    /// 被控端从控制端有的参考帧恢复，控制端在恢复之前定时重报。
+    #[n(3)]
+    Lost {
+        #[n(0)]
+        decoded: u32,
+        /// 第几路画面（见模块说明的"多屏"）：只恢复这一路
+        #[cbor(n(1), skip_if = "is_zero")]
+        stream: u8,
+    },
+    /// 最近一个报告周期内该路帧流的交付情况，供被控端调整码率。
+    #[n(4)]
+    Report {
+        #[n(0)]
+        report: VideoReport,
+        #[cbor(n(1), skip_if = "is_zero")]
+        stream: u8,
+    },
+}
+
+/// 控制端多久报告一次画面收得怎么样（[`ControllerDatagram::Report`]）
+pub const REPORT_EVERY: Duration = Duration::from_millis(500);
+
+/// 一段时间里画面收得怎么样（[`ControllerDatagram::Report`]）。都是这段时间里的个数，不是累计的
+#[derive(Encode, Decode, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VideoReport {
+    /// 从帧流上收完的帧
+    #[n(0)]
+    pub frames: u32,
+    /// 其中等重传卡住过的：读到一半停住了一阵（丢了包，QUIC 只按顺序交出数据），后面的帧却先到了
+    #[n(1)]
+    pub stalled: u32,
+}
+
+impl VideoReport {
+    /// 什么都没收到
+    pub fn is_empty(&self) -> bool {
+        self.frames == 0
+    }
 }
 
 /// 被控端 → 控制端的控制数据报（见模块说明的"走哪条通道"）。变体的编号不能改、不能复用
@@ -607,11 +752,16 @@ pub struct QualitySettings {
     /// 期望的编码格式（被控端不支持时自动回退到 H.264；不认识的格式也是 H.264，见 [`QualitySettings::sanitized`]）
     #[n(4)]
     pub codec: Codec,
-    /// 缩放画面时优先低延迟还是清楚。低延迟（默认）不写进线上的数组，和之前的版本发的字节一样；
-    /// 之前的版本不发这一项，也就是低延迟
-    #[cbor(n(5), skip_if = "VideoPriority::is_latency")]
+    /// 把被控端的光标画进画面里（控制端的游戏模式，见模块说明的"鼠标"）：光标显示着、在这一路的显示器上时画上去，
+    /// 光标单独移动（画面没变）也出新的一帧。隐藏了就不画；已经是画面里的软件光标（[`CursorVisibility::InFrame`]）
+    /// 也不再画一遍。不画（默认）不写进线上的数组
+    #[cbor(n(5), skip_if = "is_false")]
     #[serde(default)]
-    pub priority: VideoPriority,
+    pub draw_cursor: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 impl Default for QualitySettings {
@@ -622,18 +772,17 @@ impl Default for QualitySettings {
             max_short: 1080,
             adaptive: true,
             codec: Codec::H264,
-            priority: VideoPriority::Latency,
+            draw_cursor: false,
         }
     }
 }
 
 impl QualitySettings {
-    /// 范围校验；不认识的编码格式（对方版本新增的）换成 H.264，不认识的优先项按低延迟
+    /// 范围校验；不认识的编码格式按 H.264、传输方式按自动处理
     pub fn sanitized(mut self) -> Self {
         self.fps = self.fps.clamp(1, 120);
         self.bitrate_kbps = self.bitrate_kbps.clamp(100, 100_000);
         self.codec = self.codec.or_h264();
-        self.priority = self.priority.or_latency();
         self
     }
 }
@@ -675,13 +824,16 @@ pub const MAX_TOUCH_POINTS: u8 = 10;
     rename_all_fields = "camelCase"
 )]
 pub enum InputEvent {
-    /// 移到这个位置：归一化坐标（0..=1），相对当前显示器画面
+    /// 移到这个位置：归一化坐标（0..=1），相对第 `stream` 路画面（见模块说明的"多屏"）
     #[n(0)]
     MouseMove {
         #[n(0)]
         x: f32,
         #[n(1)]
         y: f32,
+        #[cbor(n(2), skip_if = "is_zero")]
+        #[serde(default, skip_serializing_if = "is_zero")]
+        stream: u8,
     },
     /// 相对移动（被控端光标隐藏时，见模块说明）。单位是鼠标的原始计数，约等于被控端的一个像素；
     /// 被控端按真实鼠标的移动注入（游戏读到的就是这个移动量），不换算成坐标
@@ -752,8 +904,15 @@ impl InputEvent {
         let mut out: Vec<InputEvent> = Vec::with_capacity(events.len());
         for e in events.drain(..) {
             match (out.last_mut(), e) {
-                (Some(InputEvent::MouseMove { x, y }), InputEvent::MouseMove { x: nx, y: ny }) => {
-                    (*x, *y) = (nx, ny);
+                (
+                    Some(InputEvent::MouseMove { x, y, stream }),
+                    InputEvent::MouseMove {
+                        x: nx,
+                        y: ny,
+                        stream: ns,
+                    },
+                ) => {
+                    (*x, *y, *stream) = (nx, ny, ns);
                 }
                 (
                     Some(InputEvent::MouseDelta { dx, dy }),
@@ -785,9 +944,11 @@ mod tests {
 
     #[test]
     fn coalesce_keeps_order_and_sums_deltas() {
+        let mv = |x, y, stream| InputEvent::MouseMove { x, y, stream };
         let mut v = vec![
-            InputEvent::MouseMove { x: 0.1, y: 0.1 },
-            InputEvent::MouseMove { x: 0.2, y: 0.3 },
+            mv(0.1, 0.1, 0),
+            // 移到另一路画面上：只留最后一个，连同它在哪一路
+            mv(0.2, 0.3, 1),
             InputEvent::MouseButton {
                 button: MouseButton::Right,
                 down: true,
@@ -804,7 +965,7 @@ mod tests {
         assert_eq!(
             v,
             [
-                InputEvent::MouseMove { x: 0.2, y: 0.3 },
+                mv(0.2, 0.3, 1),
                 InputEvent::MouseButton {
                     button: MouseButton::Right,
                     down: true
@@ -846,37 +1007,18 @@ mod tests {
         assert_eq!(q.sanitized().codec, Codec::H264);
         let q: QualitySettings = minicbor::decode(&wire(2)).unwrap();
         assert_eq!(q.codec, Codec::AV1);
-        // 之前的版本没有优先项：低延迟
-        assert_eq!(q.priority, VideoPriority::Latency);
+        assert!(!q.draw_cursor);
 
-        // 新版本带了优先项（还有再新的版本加的字段）：认识的照用，不认识的优先项按低延迟
-        let newer = |priority: u8| {
-            let mut e = minicbor::Encoder::new(Vec::new());
-            e.array(7).unwrap();
-            e.u8(60).unwrap().u32(8000).unwrap().u16(1080).unwrap();
-            e.bool(true).unwrap().u8(1).unwrap().u8(priority).unwrap();
-            e.str("later").unwrap();
-            e.into_writer()
+        let report = VideoReport {
+            frames: 60,
+            stalled: 2,
         };
-        let q: QualitySettings = minicbor::decode(&newer(1)).unwrap();
-        assert_eq!((q.codec, q.priority), (Codec::H265, VideoPriority::Clarity));
-        let q: QualitySettings = minicbor::decode(&newer(5)).unwrap();
-        assert_eq!(q.priority, VideoPriority::Unknown(5));
-        assert_eq!(q.sanitized().priority, VideoPriority::Latency);
-        // 之前的版本解得出新版本发的（多出来的字段跳过）
-        #[derive(minicbor::Decode)]
-        struct Before {
-            #[n(0)]
-            fps: u8,
-            #[n(4)]
-            codec: Codec,
+        for stream in [0, 3] {
+            let r = ControllerDatagram::Report { report, stream };
+            let back: ControllerDatagram = minicbor::decode(&minicbor::to_vec(r).unwrap()).unwrap();
+            assert_eq!(back, r);
         }
-        let q = QualitySettings {
-            priority: VideoPriority::Clarity,
-            ..Default::default()
-        };
-        let old: Before = minicbor::decode(&minicbor::to_vec(q).unwrap()).unwrap();
-        assert_eq!((old.fps, old.codec), (q.fps, q.codec));
+        assert!(VideoReport::default().is_empty());
 
         // Bye(77)：[9, [77]]
         let mut e = minicbor::Encoder::new(Vec::new());
@@ -897,12 +1039,54 @@ mod tests {
             platform: Platform::Unknown(9),
             touch: true,
             actions: vec![SystemAction::Unknown(40), SystemAction::Home],
+            shown: vec![0],
+            streams: 9,
         };
         let back: HostHello = minicbor::decode(&minicbor::to_vec(&hello).unwrap()).unwrap();
         assert_eq!(back.codecs, hello.codecs);
         assert_eq!(back.platform.or_linux(), Platform::Linux);
         assert_eq!(back.actions, hello.actions);
         assert!(back.touch);
+        assert_eq!(back.shown, [0]);
+        // 最多几路不超过本端的上限；不说（0）就是只能看一个
+        assert_eq!(back.max_streams(), crate::MAX_STREAMS);
+        let one = HostHello { streams: 0, ..back };
+        assert_eq!(one.max_streams(), 1);
+
+        // 多屏：第 0 路的字段不写（和只有一路时的字节一样），别的路写上
+        let ack = |stream| ControllerDatagram::Ack {
+            seq: 5,
+            arrived: 6,
+            stream,
+        };
+        assert_eq!(minicbor::to_vec(ack(0)).unwrap(), [0x82, 1, 0x82, 5, 6]);
+        for m in [
+            ack(2),
+            ControllerDatagram::Lost {
+                decoded: 3,
+                stream: 1,
+            },
+        ] {
+            let back: ControllerDatagram = minicbor::decode(&minicbor::to_vec(m).unwrap()).unwrap();
+            assert_eq!(back, m);
+        }
+        let view = ControllerMsg::View {
+            streams: vec![
+                StreamView::display(1),
+                StreamView {
+                    display: 0,
+                    max_short: 720,
+                },
+            ],
+        };
+        let back: ControllerMsg = minicbor::decode(&minicbor::to_vec(&view).unwrap()).unwrap();
+        assert!(
+            matches!(back, ControllerMsg::View { ref streams } if streams.len() == 2 && streams[1].max_short == 720)
+        );
+        assert_eq!(view.lane(), SessionLane::Control);
+        assert_eq!(stricter_short(0, 720), 720);
+        assert_eq!(stricter_short(1080, 0), 1080);
+        assert_eq!(stricter_short(1080, 720), 720);
 
         // 麦克风的状态：新版本加的状态留着原值（控制端当作接不了），没有说明的不带 detail
         let mic = HostMsg::Mic {
@@ -944,20 +1128,29 @@ mod tests {
             max_short: 1080,
             adaptive: true,
             codec: Codec::AV1,
-            priority: VideoPriority::Clarity,
+            draw_cursor: true,
         };
         assert_eq!(
             serde_json::to_value(q).unwrap(),
-            json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1", "priority": "clarity" })
+            json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1", "drawCursor": true })
         );
-        // 之前的界面不带优先项：低延迟
+        // 省略光标设置时使用默认值
         let old: QualitySettings = serde_json::from_value(
             json!({ "fps": 60, "bitrateKbps": 8000, "maxShort": 1080, "adaptive": true, "codec": "av1" }),
         )
         .unwrap();
-        assert_eq!(old.priority, VideoPriority::Latency);
+        assert!(!old.draw_cursor);
         let events = vec![
-            InputEvent::MouseMove { x: 0.5, y: 0.25 },
+            InputEvent::MouseMove {
+                x: 0.5,
+                y: 0.25,
+                stream: 0,
+            },
+            InputEvent::MouseMove {
+                x: 0.0,
+                y: 1.0,
+                stream: 2,
+            },
             InputEvent::MouseButton {
                 button: MouseButton::Left,
                 down: true,
@@ -978,6 +1171,7 @@ mod tests {
             v,
             json!([
                 { "type": "mouseMove", "x": 0.5, "y": 0.25 },
+                { "type": "mouseMove", "x": 0.0, "y": 1.0, "stream": 2 },
                 { "type": "mouseButton", "button": "left", "down": true },
                 { "type": "touch", "id": 1, "phase": "cancel", "x": 0.0, "y": 1.0 },
                 { "type": "system", "action": "quickSettings" },
@@ -995,6 +1189,18 @@ mod tests {
         assert_eq!(
             serde_json::to_value([MicState::NoDevice, MicState::Ready]).unwrap(),
             json!(["noDevice", "ready"])
+        );
+        assert_eq!(
+            serde_json::to_value(StreamView {
+                display: 1,
+                max_short: 720
+            })
+            .unwrap(),
+            json!({ "display": 1, "maxShort": 720 })
+        );
+        assert_eq!(
+            serde_json::from_value::<StreamView>(json!({ "display": 2 })).unwrap(),
+            StreamView::display(2)
         );
     }
 }

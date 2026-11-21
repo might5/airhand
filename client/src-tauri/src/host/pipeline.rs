@@ -1,10 +1,12 @@
-//! 编码管线（每个会话一个线程）：取最新帧 → 节流 → 在途控制 → 编码 → 发送。
+//! 编码管线（每个会话的每一路画面一个线程，见 `airhand_proto::session` 的"多屏"）：取最新帧 → 节流 → 在途控制 → 编码 → 发送。
 //!
 //! 低延迟的关键：
 //! * 永远只编码**最新**的一帧，旧帧直接丢弃，不排队；
 //! * 帧率按画面的时间戳节流（见 [`super::pace`]），处理花的时间不会累积成延迟；
 //! * 在途（已发送未确认）字节受限，网络变慢时编码器等待而不是把数据堆进缓冲区；
-//! * 码率按网络上的排队和带宽估计每帧调整（见 [`airhand_link::flow`]）。
+//! * 码率按网络上的排队和带宽估计每帧调整（见 [`airhand_link::flow`]）；
+//! * 每一帧参考哪一帧写进画面包头；控制端等不到帧时，编码器支持长期参考帧就从控制端有的那一帧恢复（参考帧失效），
+//!   不支持就编关键帧（见 [`airhand_link::refs`]）。
 //!
 //! 画面停下来之后补画质：画面大面积变化（切换窗口、滚动）时，码率控制只能给这一帧分到大约一帧的码率，
 //! 文字是糊的；采集只在画面变化时才有新帧，不补的话控制端就一直停在这一帧上。把最后一帧再编几次，
@@ -16,7 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use airhand_link::flow::Flow;
-use airhand_link::host::{CursorCache, Outbox, SendError};
+use airhand_link::host::{Outbox, SendError};
+use airhand_link::refs::Plan;
 use airhand_proto::media::{self, VideoHeader};
 use airhand_proto::session::{HostMsg, Notice, QualitySettings};
 use bytes::Bytes;
@@ -24,7 +27,8 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use super::capture::{self, Frame};
-use super::encoder::Encoder;
+use super::cursor::{Reported, SharedCursor};
+use super::encoder::{Encoder, LtrControl};
 use super::pace::Pacer;
 
 /// 画面停下来之后，同一帧最多再编这么多次
@@ -47,21 +51,38 @@ struct Ctrl {
     last_key: AtomicU32,
     stop: AtomicBool,
     flow: Arc<Flow>,
-    /// 控制端缓存了哪些光标形状（整个会话一份）
-    cursors: Arc<Mutex<CursorCache>>,
+    /// 会话的光标（整个会话一份，几路画面谁报的算数见 [`SharedCursor`]）
+    cursor: Arc<Mutex<SharedCursor>>,
+}
+
+/// 一路画面的编码管线要的东西
+pub struct Config {
+    /// 第几路画面（写进画面包头和编码器信息）
+    pub stream: u8,
+    /// 看哪个显示器
+    pub display: u8,
+    /// 这一路的画质（短边上限已经和这一路按显示的大小要的取了较严的）
+    pub settings: QualitySettings,
+    /// 这一路画面的发送队列
+    pub video: mpsc::Sender<Bytes>,
+    /// 控制消息（编码器、采集失败和光标状态走控制通道，光标图像走大块通道：形状图像有几十 KB，不能挡控制消息）
+    pub out: Outbox,
+    /// 这一路的在途控制和码率（会话一开始就建好，换显示器时接着用）
+    pub flow: Arc<Flow>,
+    pub cursor: Arc<Mutex<SharedCursor>>,
 }
 
 impl Pipeline {
-    /// `video`：画面流的发送队列；`out`：控制消息（编码器、采集失败和光标状态走控制通道，光标图像走大块通道：
-    /// 形状图像有几十 KB，不能挡控制消息）；`cursors`：控制端缓存了哪些光标形状（动画光标的每一帧只发一次图像）
-    pub fn start(
-        display: u8,
-        settings: QualitySettings,
-        video: mpsc::Sender<Bytes>,
-        out: Outbox,
-        flow: Arc<Flow>,
-        cursors: Arc<Mutex<CursorCache>>,
-    ) -> Self {
+    pub fn start(config: Config) -> Self {
+        let Config {
+            stream,
+            display,
+            settings,
+            video,
+            out,
+            flow,
+            cursor,
+        } = config;
         let ctrl = Arc::new(Ctrl {
             settings: Mutex::new(settings),
             settings_ver: AtomicU64::new(0),
@@ -69,12 +90,12 @@ impl Pipeline {
             last_key: AtomicU32::new(0),
             stop: AtomicBool::new(false),
             flow,
-            cursors,
+            cursor,
         });
         let c = ctrl.clone();
         let thread = std::thread::Builder::new()
-            .name("airhand-encoder".into())
-            .spawn(move || run(c, display, video, out))
+            .name(format!("airhand-encoder-{stream}"))
+            .spawn(move || run(c, stream, display, video, out))
             .expect("spawn encoder");
         Self {
             ctrl,
@@ -151,13 +172,13 @@ fn send_msg_cancellable(out: &Outbox, stop: &AtomicBool, msg: &HostMsg) -> bool 
     }
 }
 
-fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
+fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
     capture::raise_priority();
     let mut settings = *ctrl.settings.lock().unwrap();
     let mut ver = ctrl.settings_ver.load(Ordering::Acquire);
-    // 要哪种画面取决于画质设置（macOS 让系统直接缩放，见 capture::output_for），设置变了可能要换一路采集
-    let mut output = capture::output_for(screen, &settings);
-    let mut sub = capture::subscribe(screen, settings.fps, output);
+    // 控制端的游戏模式要光标画进画面：读带光标的那一路（见 capture 的"带光标的画面"）
+    let mut draw = settings.draw_cursor;
+    let mut sub = capture::subscribe(screen, settings.fps, settings.max_short, draw);
     let mut enc: Option<Encoder> = None;
     // 硬件编码器连续失败时改用软件编码；GPU 零拷贝连续失败时硬件编码器改用内存里的画面
     let mut hw_failures = 0u32;
@@ -174,7 +195,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
     // 补画质：还要补几次、最早什么时候补
     let mut refine_left = 0u8;
     let mut refine_due = Instant::now();
-    info!(screen, ?settings, "encoding pipeline started");
+    info!(stream, screen, ?settings, "encoding pipeline started");
 
     // 控制通道的队列满了（网络跟不上）就等着，直到管线被停下
     let send = |msg: &HostMsg| send_msg_cancellable(&out, &ctrl.stop, msg);
@@ -184,17 +205,26 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
         let v = ctrl.settings_ver.load(Ordering::Acquire);
         if v != ver {
             ver = v;
+            let prev_short = settings.max_short;
             settings = *ctrl.settings.lock().unwrap();
-            let want = capture::output_for(screen, &settings);
-            if want != output {
-                // 换一路采集：旧的画面不再用，等新的一路的第一帧（采集一开始就会给）；光标状态重新发
-                info!(?output, ?want, "switching the capture");
-                output = want;
-                sub = capture::subscribe(screen, settings.fps, output);
+            // 只有 macOS 在采集时缩放，其余平台改分辨率不用换采集
+            let resized = cfg!(target_os = "macos") && settings.max_short != prev_short;
+            if resized || settings.draw_cursor != draw {
+                // 换一路采集：旧的画面不再用，等新的一路的第一帧（采集一开始就会给）；光标状态重新发。
+                // 只是要不要光标变了：画面只差一个光标，接着编增量帧，不用关键帧
+                info!(
+                    max_short = settings.max_short,
+                    draw = settings.draw_cursor,
+                    "switching the capture"
+                );
+                if resized {
+                    ctrl.force_key.store(true, Ordering::Release);
+                }
+                draw = settings.draw_cursor;
+                sub = capture::subscribe(screen, settings.fps, settings.max_short, draw);
                 (frame_seq, cursor_seq, shape_seq) = (0, 0, 0);
                 last_frame = None;
                 refine_left = 0;
-                ctrl.force_key.store(true, Ordering::Release);
             }
             sub.set_fps(settings.fps);
             pacer.set_fps(settings.fps);
@@ -221,10 +251,11 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
             Duration::from_millis(40)
         };
         let slot = sub.slot();
-        let (fs, cs) = slot.wait_change(frame_seq, cursor_seq, wait);
+        let (fs, cs) = slot.wait_change(frame_seq, cursor_seq, wait, draw);
 
         // 光标变化：可见性和形状引用走控制通道（只留最新值）；控制端还没有的形状（动画光标第一次转到的帧）
         // 先把图像排进大块通道，和剪贴板共用：队列满了不等，下一轮再发最新形状（见 CursorCache）。
+        // 同时看好几个显示器时只听光标所在的那一路（见 SharedCursor）
         if cs > cursor_seq {
             cursor_seq = cs;
             cursor_pending = true;
@@ -235,9 +266,19 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 Some(s) if c.shape_seq > shape_seq => Some(s.as_ref()),
                 _ => None,
             };
-            match ctrl.cursors.lock().unwrap().send(&out, c.visibility, shape) {
-                Ok(()) => {
+            let reported =
+                ctrl.cursor
+                    .lock()
+                    .unwrap()
+                    .report(stream, c.here, &out, c.visibility, shape);
+            match reported {
+                Ok(Reported::Sent) => {
                     shape_seq = c.shape_seq;
+                    cursor_pending = false;
+                }
+                // 不归这一路管：之后归它管的时候形状要重发一遍（别的一路可能换过形状）
+                Ok(Reported::Ignored) => {
+                    shape_seq = 0;
                     cursor_pending = false;
                 }
                 Err(e) => {
@@ -261,9 +302,10 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 }
                 reported_error = Some(err);
             }
-            // 画面静止但控制端需要关键帧（例如解码器重置），或者该补画质了：重新编码上一帧
+            // 画面静止但控制端需要关键帧（例如解码器重置）、等不到帧了要恢复，或者该补画质了：重新编码上一帧
             let refine = refine_left > 0 && Instant::now() >= refine_due;
-            if !((force || refine) && last_frame.is_some()) {
+            let recover = ctrl.flow.recovering();
+            if !((force || refine || recover) && last_frame.is_some()) {
                 continue;
             }
         } else if reported_error.take().is_some() {
@@ -288,7 +330,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
             }
         }
         // 取等待期间到达的最新一帧；没有的话重新编码上一帧（关键帧、补画质）
-        let (frame, fresh) = match slot.try_newer(frame_seq) {
+        let (frame, fresh) = match slot.try_newer(frame_seq, draw) {
             Some((s, f)) => {
                 frame_seq = s;
                 (f, true)
@@ -315,7 +357,9 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 gpu_failures < 2,
             ) {
                 Ok(e) => {
-                    if !send(&HostMsg::Encoder(e.info().clone())) {
+                    let mut info = e.info().clone();
+                    info.stream = stream;
+                    if !send(&HostMsg::Encoder(info)) {
                         break;
                     }
                     enc = Some(e);
@@ -332,6 +376,23 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
         let e = enc.as_mut().unwrap();
         // 不自适应时就是画质设置里的码率；编码器自己会跳过没变的
         e.set_bitrate(ctrl.flow.bitrate_kbps());
+        // 参考帧：控制端等不到帧时从它有的长期参考帧恢复（做不到就编关键帧），平时隔一阵标一个长期参考帧
+        let plan = ctrl.flow.plan(e.ltr_slots());
+        force |= plan.key;
+        let plan = if force {
+            Plan {
+                key: true,
+                ..Plan::default()
+            }
+        } else {
+            if plan.mark.is_some() || plan.recover.is_some() {
+                e.set_ltr(LtrControl {
+                    mark: plan.mark,
+                    recover: plan.recover,
+                });
+            }
+            plan
+        };
 
         // 新画面、关键帧之后从头开始补；补的帧本身只减次数
         if fresh || force {
@@ -360,7 +421,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                         return;
                     }
                 }
-                let seq = ctrl.flow.sent(size);
+                let (seq, reference) = ctrl.flow.sent_frame(size, ef.key, plan, ef.ltr);
                 if ef.key {
                     ctrl.last_key.store(seq, Ordering::Release);
                 }
@@ -371,6 +432,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                 }
                 let header = VideoHeader {
                     seq,
+                    stream,
                     key: ef.key,
                     codec: info.codec,
                     width: info.width as u16,
@@ -378,6 +440,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
                     // 重新编码的上一帧就是现在的画面（画面一直没变），采集时间记为现在：
                     // 控制端按采集时间做音画同步，用旧的时间会以为这一帧严重滞后，让声音跟着多等
                     capture_us: super::clock::us(if fresh { frame.captured } else { started }),
+                    reference,
                 };
                 let packet = Bytes::from(media::frame(&header.encode(), &[&ef.data]));
                 if !send_cancellable(&video, &ctrl.stop, packet) {
@@ -406,7 +469,7 @@ fn run(ctrl: Arc<Ctrl>, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
         }
         last_frame = Some(frame);
     }
-    info!(screen, "encoding pipeline stopped");
+    info!(stream, screen, "encoding pipeline stopped");
 }
 
 #[cfg(test)]

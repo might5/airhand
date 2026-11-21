@@ -19,7 +19,6 @@ import androidx.compose.material.icons.outlined.Mouse
 import androidx.compose.material.icons.outlined.Navigation
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Smartphone
-import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.VerifiedUser
 import androidx.compose.material.icons.automirrored.outlined.VolumeUp
@@ -41,6 +40,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -50,7 +50,6 @@ import app.airhand.android.R
 import app.airhand.android.core.Code
 import app.airhand.android.core.Native
 import app.airhand.android.core.Preset
-import app.airhand.android.core.VideoPriority
 import app.airhand.android.data.TouchMode
 import app.airhand.android.host.HostService
 import app.airhand.android.host.HostState
@@ -113,17 +112,17 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
             if (saved != null) stringResource(R.string.settings_current_code, Code.format(saved)) else stringResource(R.string.settings_no_code),
             enabled = saved != null,
         ) { dialog = "newCode" }
-
-        Toggle(
+        // 配对过的设备：它们只用控制码就能连本机；忘掉之后要重新输入配对码
+        val paired = app.pairing.flow.collectAsState().value?.paired?.size ?: 0
+        Item(
             Icons.Outlined.VerifiedUser,
-            stringResource(R.string.require_approval),
-            stringResource(R.string.require_approval_desc),
-            s.requireApproval,
-        ) { v -> app.updateSettings { it.copy(requireApproval = v) } }
+            stringResource(R.string.settings_paired),
+            if (paired > 0) pluralStringResource(R.plurals.settings_paired_count, paired, paired) else stringResource(R.string.settings_paired_none),
+            enabled = paired > 0,
+        ) { dialog = "forgetPaired" }
 
         SectionTitle(stringResource(R.string.settings_remote))
         Item(Icons.Outlined.HighQuality, stringResource(R.string.default_quality), presetName(Preset.of(s.preset))) { dialog = "preset" }
-        Item(Icons.Outlined.Speed, stringResource(R.string.scaling_priority), priorityName(VideoPriority.fromWire(s.priority))) { dialog = "priority" }
         Item(Icons.Outlined.Gesture, stringResource(R.string.touch_mode), touchModeName(s.touchMode)) { dialog = "mode" }
         Toggle(Icons.AutoMirrored.Outlined.VolumeUp, stringResource(R.string.play_audio), stringResource(R.string.play_audio_desc), s.audio) { v ->
             app.updateSettings { it.copy(audio = v) }
@@ -206,11 +205,24 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
                 if (host.running) {
                     HostService.newCode()
                 } else {
-                    // 没在共享：忘掉保存的控制码，下次共享时服务器分配新的（旧的绑定 180 天不用会被清理）
+                    // 没在共享：忘掉保存的控制码，下次共享时服务器分配新的（旧的绑定 180 天不用会被清理）；
+                    // 配对也全部重来（和共享时更换控制码一样）：新的配对码，配对过的都忘掉
                     app.hostCodes.save(null)
+                    app.pairing.save(null)
                     HostState.update { it.copy(code = null) }
                     scope.launch { snackbar.showSnackbar(ctx.getString(R.string.settings_code_reset)) }
                 }
+            },
+        )
+        "forgetPaired" -> ConfirmDialog(
+            title = stringResource(R.string.share_forget_paired_title),
+            text = stringResource(R.string.share_forget_paired_text),
+            confirm = stringResource(R.string.forget),
+            destructive = true,
+            onDismiss = { dialog = null },
+            onConfirm = {
+                dialog = null
+                app.forgetPaired()
             },
         )
         "preset" -> ChoiceDialog(
@@ -227,22 +239,6 @@ fun SettingsTab(modifier: Modifier, snackbar: SnackbarHostState) {
             onSelect = { p ->
                 dialog = null
                 app.updateSettings { it.copy(preset = p.id) }
-            },
-        )
-        "priority" -> ChoiceDialog(
-            title = stringResource(R.string.scaling_priority),
-            options = VideoPriority.entries,
-            selected = VideoPriority.fromWire(s.priority),
-            label = { p ->
-                Column {
-                    Text(priorityName(p))
-                    Text(priorityDesc(p), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            },
-            onDismiss = { dialog = null },
-            onSelect = { p ->
-                dialog = null
-                app.updateSettings { it.copy(priority = p.wire) }
             },
         )
         "mode" -> ChoiceDialog(
@@ -345,21 +341,6 @@ fun presetDesc(p: Preset): String = stringResource(
     },
 )
 
-@Composable
-fun priorityName(p: VideoPriority): String = stringResource(
-    when (p) {
-        VideoPriority.LATENCY -> R.string.priority_latency
-        VideoPriority.CLARITY -> R.string.priority_clarity
-    },
-)
-
-@Composable
-fun priorityDesc(p: VideoPriority): String = stringResource(
-    when (p) {
-        VideoPriority.LATENCY -> R.string.priority_latency_desc
-        VideoPriority.CLARITY -> R.string.priority_clarity_desc
-    },
-)
 
 @Composable
 fun touchModeName(m: TouchMode): String = stringResource(

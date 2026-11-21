@@ -11,8 +11,8 @@
 use airhand_link::controller::{Command, ConnectOptions};
 use airhand_proto::media::{self, AudioHeader, CursorSlot, CursorState, VideoHeader};
 use airhand_proto::session::{
-    Codec, CursorShape, CursorVisibility, InputEvent, MouseButton, QualitySettings, SystemAction,
-    TouchPhase, VideoPriority,
+    Codec, CursorShape, CursorVisibility, InputEvent, MouseButton, QualitySettings, StreamView,
+    SystemAction, TouchPhase,
 };
 use serde_json::{Value, json};
 
@@ -21,13 +21,18 @@ fn hex(b: &[u8]) -> String {
 }
 
 /// 交给界面的包（线上的包去掉长度前缀）
-fn packet(header: &[u8; media::HEADER_LEN], payload: &[u8]) -> Vec<u8> {
+fn packet(header: &[u8], payload: &[u8]) -> Vec<u8> {
     media::frame(header, &[payload])[4..].to_vec()
 }
 
 fn inputs() -> Vec<InputEvent> {
     vec![
-        InputEvent::MouseMove { x: 0.5, y: 0.25 },
+        // 第 0 路画面上的位置不写 stream（只看一个显示器的界面不用管它）
+        InputEvent::MouseMove {
+            x: 0.5,
+            y: 0.25,
+            stream: 0,
+        },
         InputEvent::MouseDelta { dx: -3, dy: 7 },
         InputEvent::MouseButton {
             button: MouseButton::Right,
@@ -61,8 +66,8 @@ fn settings() -> QualitySettings {
         max_short: 1080,
         adaptive: true,
         codec: Codec::H265,
-        // 界面不带优先项时是低延迟（之前的界面、Android 都不带）
-        priority: VideoPriority::Latency,
+        // 不带时不把光标画进画面（Android 不带）
+        draw_cursor: false,
     }
 }
 
@@ -85,11 +90,25 @@ fn commands() -> Vec<(Value, Command)> {
         ),
         (
             json!({ "cmd": "keyframe", "sid": 3 }),
-            Command::Keyframe { sid: 3 },
+            Command::Keyframe { sid: 3, stream: 0 },
         ),
         (
             json!({ "cmd": "display", "sid": 3, "index": 1 }),
             Command::Display { sid: 3, index: 1 },
+        ),
+        // 多屏同时显示：第 i 项是第 i 路画面（Android 只看一个显示器，不用它）
+        (
+            json!({ "cmd": "view", "sid": 3, "streams": [{ "display": 1, "maxShort": 720 }, { "display": 0, "maxShort": 0 }] }),
+            Command::View {
+                sid: 3,
+                streams: vec![
+                    StreamView {
+                        display: 1,
+                        max_short: 720,
+                    },
+                    StreamView::display(0),
+                ],
+            },
         ),
         (
             json!({ "cmd": "audio", "sid": 3, "enabled": true }),
@@ -120,8 +139,16 @@ fn commands() -> Vec<(Value, Command)> {
             },
         ),
         (
+            json!({ "cmd": "clipboardCleared", "sid": 3 }),
+            Command::ClipboardCleared { sid: 3 },
+        ),
+        (
             json!({ "cmd": "ack", "sid": 3, "seq": 99 }),
-            Command::Ack { sid: 3, seq: 99 },
+            Command::Ack {
+                sid: 3,
+                seq: 99,
+                stream: 0,
+            },
         ),
         (
             json!({ "cmd": "disconnect", "sid": 3 }),
@@ -146,6 +173,7 @@ fn connect_options() -> (Value, ConnectOptions) {
             pairing: Some("482913".into()),
             settings: settings(),
             audio: true,
+            view: Vec::new(),
         },
     )
 }
@@ -154,11 +182,13 @@ fn fixture() -> Value {
     let capture_us = 123_456_789_012u64;
     let video = VideoHeader {
         seq: 9,
+        stream: 0,
         key: true,
         codec: Codec::AV1,
         width: 1920,
         height: 1080,
         capture_us,
+        reference: None,
     };
     let audio = AudioHeader {
         seq: 3,
@@ -167,11 +197,32 @@ fn fixture() -> Value {
     };
     let delta = VideoHeader {
         seq: 10,
+        stream: 0,
         key: false,
         codec: Codec::H265,
         width: 1280,
         height: 720,
         capture_us: capture_us + 16_667,
+        reference: None,
+    };
+    // 带参考帧扩展的增量帧（协议 v10，头的长度是 30）：界面不用管它，照样按头的长度找负载
+    let referenced = VideoHeader {
+        seq: 11,
+        stream: 0,
+        reference: Some(10),
+        capture_us: capture_us + 33_333,
+        ..delta
+    };
+    // 第 1 路画面（多屏同时显示）的关键帧：第几路在第 12 个字节，界面交给那一路的解码器
+    let second = VideoHeader {
+        seq: 1,
+        stream: 1,
+        key: true,
+        codec: Codec::H264,
+        width: 1280,
+        height: 1024,
+        capture_us: capture_us + 5_000,
+        reference: None,
     };
     let shape = CursorShape {
         width: 2,
@@ -233,6 +284,16 @@ fn fixture() -> Value {
                 "name": "delta frame", "hex": hex(&packet(&delta.encode(), &[1])),
                 "kind": 1, "seq": 10, "key": false, "codec": "h265", "width": 1280, "height": 720,
                 "captureUs": capture_us + 16_667, "payload": "01"
+            },
+            {
+                "name": "delta frame with a reference", "hex": hex(&packet(&referenced.encode(), &[2, 3])),
+                "kind": 1, "seq": 11, "key": false, "codec": "h265", "width": 1280, "height": 720,
+                "captureUs": capture_us + 33_333, "payload": "0203"
+            },
+            {
+                "name": "keyframe of the second stream", "hex": hex(&packet(&second.encode(), &[4])),
+                "kind": 1, "seq": 1, "stream": 1, "key": true, "codec": "h264", "width": 1280, "height": 1024,
+                "captureUs": capture_us + 5_000, "payload": "04"
             },
             {
                 "name": "audio", "hex": hex(&packet(&audio.encode(), &[0xfc, 0xff, 0xfe])),
@@ -315,19 +376,6 @@ fn json_shapes_roundtrip() {
         assert_eq!(parsed, cmd);
         assert_eq!(parsed.sid(), 3);
     }
-    // 清楚优先：界面（桌面、网页、Android）只在选了它时带 priority
-    let mut sharp = json!({ "cmd": "settings", "sid": 3, "settings": serde_json::to_value(settings()).unwrap() });
-    sharp["settings"]["priority"] = json!("clarity");
-    assert_eq!(
-        serde_json::from_value::<Command>(sharp).unwrap(),
-        Command::Settings {
-            sid: 3,
-            settings: QualitySettings {
-                priority: VideoPriority::Clarity,
-                ..settings()
-            },
-        }
-    );
     // 认不出的命令是错误（界面会收到 failed）
     assert!(serde_json::from_value::<Command>(json!({ "cmd": "nope", "sid": 1 })).is_err());
     let (json, opts) = connect_options();
@@ -358,7 +406,11 @@ fn media_packets_decode() {
         (9, true, Codec::AV1, 1920)
     );
     assert_eq!(media::payload(&v), Some(&[7, 8, 9][..]));
-    let a = unhex(f["media"][2]["hex"].as_str().unwrap());
+    let r = unhex(f["media"][2]["hex"].as_str().unwrap());
+    assert_eq!(VideoHeader::decode(&r).unwrap().reference, Some(10));
+    let s = unhex(f["media"][3]["hex"].as_str().unwrap());
+    assert_eq!(VideoHeader::decode(&s).unwrap().stream, 1);
+    let a = unhex(f["media"][4]["hex"].as_str().unwrap());
     assert!(AudioHeader::decode(&a).unwrap().start);
     for m in f["media"].as_array().unwrap() {
         let p = unhex(m["hex"].as_str().unwrap());

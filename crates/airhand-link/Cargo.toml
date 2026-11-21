@@ -1,7 +1,7 @@
 [package]
 name = "airhand-link"
 description = "Airhand client side of the relay link: QUIC with certificate pinning and reconnects, session streams, UI-independent controller sessions and the host's server connection"
-version = "0.2.3"
+version = "0.3.1"
 edition = "2024"
 license = "MIT"
 
@@ -17,6 +17,8 @@ client = [
     "dep:anyhow",
     "dep:bytes",
     "dep:curve25519-dalek",
+    "dep:if-addrs",
+    "dep:libc",
     "dep:quinn",
     "dep:rand",
     "dep:rcgen",
@@ -51,6 +53,8 @@ anyhow = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
 curve25519-dalek = { version = "4", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
+# 直连时枚举活动网卡。两台只靠网线互连的电脑可能用 169.254/16。
+if-addrs = { version = "0.15", features = ["link-local"], optional = true }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
 rand = { version = "0.9", optional = true }
 # 被控端接受直连时用的自签名证书（每次运行生成一张；对面是谁由会话密钥证明，见 src/direct/tls.rs）
@@ -64,9 +68,13 @@ sha2 = { version = "0.10", optional = true }
 snow = { version = "0.10", features = ["risky-raw-split"], optional = true }
 spake2 = { version = "0.4", optional = true }
 
+# 剪贴板里的文件：打开文件时不跟随链接（O_NOFOLLOW，见 src/files/local.rs）
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
 [dev-dependencies]
 # rt、macros：#[tokio::test]（只有 wire 的时候也要能跑它的测试）；test-util：测试里让时间跳着走
-# （等 60 秒的同意、30 秒的失联不用真的等）
+# （等 10 秒的确认、30 秒的失联不用真的等）
 tokio = { version = "1", features = ["rt", "macros", "test-util"] }
 serde_json = "1"
 

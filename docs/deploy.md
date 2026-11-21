@@ -6,6 +6,8 @@
 
 The server listens on **UDP 4433**. On first start it generates a self-signed certificate in the `data/` directory next to `docker-compose.yml`. **Keep that directory**: clients recognise the server by the certificate's fingerprint, and it holds the SQLite database with the hosts' fixed control codes (`airhand.db`, plus its `-wal` / `-shm` files while the server runs). Every host that keeps its code (the desktop client with its `config.toml`, Android) gets the same code back from it, however long it has been offline.
 
+Upgrade the clients, web console service and relay together. All use signaling v10 and send video on one QUIC stream per frame. [Frame streams and reference invalidation](architecture.md#frame-streams-and-reference-invalidation)
+
 Environment variables (see `docker-compose.yml`):
 
 | Variable | Default | Description |
@@ -18,6 +20,7 @@ Environment variables (see `docker-compose.yml`):
 | `AIRHAND_MAX_CONNS_PER_IP` | `128` | Max simultaneous connections per IPv4 address / IPv6 /64 (a web console uses one per browser tab; raise it if many hosts share one public IP) |
 | `AIRHAND_NEW_CODES_PER_IP` | `30` | Max fresh control codes per IPv4 address / IPv6 /48 per 10 minutes (getting an existing code back doesn't count) |
 | `AIRHAND_CONNECTS_PER_MINUTE` | `6` | Max connections per minute from one IPv4 address / IPv6 /64 to the same host (never lower than `AIRHAND_MAX_SESSIONS`; raise it if many controllers behind one public IP connect to the same host) |
+| `AIRHAND_MAX_FILE_SIZE` | `50MiB` | Clipboard file transfer: the most one paste may send through the relay (`512KiB`, `2GiB` or a byte count; `0`: the relay carries no files; `unlimited`: no limit). Doesn't apply while the two ends have a direct path. The server only sees ciphertext and enforces it per stream: it's a resource limit, not a security boundary |
 | `RUST_LOG` | `info` | Log level |
 
 The image is based on distroless and is about 28 MB. It runs as root inside the container, so the bind-mounted `data/` is writable whoever owns it (Docker creates it as root if it doesn't exist). On a Linux host with rootful Docker, the files the server creates there belong to root: use `sudo` to read, back up or delete them.

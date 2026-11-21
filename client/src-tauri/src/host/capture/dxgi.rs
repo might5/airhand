@@ -4,14 +4,16 @@
 //! * 显卡支持视频处理器时（几乎都支持），画面复制进自己的纹理，留在显卡上（[`GpuFrame`]）：硬件编码器在同一个
 //!   设备上缩放、转换颜色、编码（见 `encoder/mf.rs`），需要像素时才读回内存（[`GpuFrame::read_pixels`]）。
 //!   不支持时每帧复制到 staging 纹理、读回内存；
-//! * 优先使用 `DuplicateOutput1`（支持 HDR 桌面自动转换为 BGRA8）；
+//! * `DuplicateOutput1` 可直接交付 BGRA8 或 FP16 桌面纹理。FP16 在显卡上转成下游共用的 SDR BGRA8；
 //! * 打开前先切到当前的输入桌面（见 [`crate::host::desktop`]）：UAC 确认框、锁屏出现时桌面复制会中断
 //!   （`DXGI_ERROR_ACCESS_LOST`），重新打开时就跟着切过去了；
 //! * 旋转了的显示器（竖屏）：桌面复制给出的是没有旋转的画面，复制时转成用户看到的方向（见 [`Rotation`]），
 //!   画面的宽高、方向与 [`DisplayInfo`]（桌面坐标）一致，控制端的鼠标坐标才能对上。
 
+mod hdr;
+
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use airhand_proto::session::{CursorShape, DisplayInfo};
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,15 +23,16 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_CPU_ACCESS_READ,
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
     D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
     ID3D11Multithread, ID3D11Texture2D, ID3D11VideoDevice,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE90,
-    DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_MODE_ROTATION,
+    DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
+    DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
@@ -43,6 +46,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::Interface;
 
+use super::overlay::{self, CursorBitmap};
 use super::{CaptureUpdate, Capturer, CursorVisibility, Frame, FramePool};
 
 // ───────────────────────────── GPU 上的画面 ─────────────────────────────
@@ -383,10 +387,14 @@ pub fn displays() -> Result<Vec<DisplayInfo>> {
         .collect())
 }
 
+const DESKTOP_FORMATS: [DXGI_FORMAT; 2] =
+    [DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT];
+
 pub struct DxgiCapturer {
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
     dup: IDXGIOutputDuplication,
+    pixels: hdr::DesktopPixels,
     /// 画面留在显卡上（显卡支持视频处理器时）；`None` 时每帧读回内存
     gpu: Option<Arc<D3dSource>>,
     staging: Option<(ID3D11Texture2D, u32, u32)>,
@@ -398,6 +406,45 @@ pub struct DxgiCapturer {
     desktop: RECT,
     /// 显示器的旋转方向（旋转方向变了桌面复制会中断，重新打开时更新）
     rotation: Rotation,
+    /// 硬件光标：带光标的画面把它画上去（见 `super` 的"带光标的画面"）
+    pointer: Pointer,
+    /// 最新的原始画面：只有光标动了的时候，带光标的画面画在它上面
+    last: Option<Arc<Frame>>,
+    /// 上一帧带光标的画面是按现在的画面和光标画的（不要带光标的画面时不再跟着更新）
+    drawn_fresh: bool,
+    /// 把光标那一块读回来用的 staging 纹理
+    pointer_staging: PointerStaging,
+}
+
+/// 把光标那一块从显卡上读回来用的 staging 纹理（够大就接着用）
+#[derive(Default)]
+struct PointerStaging(Option<(ID3D11Texture2D, u32, u32)>);
+
+impl PointerStaging {
+    /// 至少 `w`×`h` 的
+    fn get(&mut self, device: &ID3D11Device, w: u32, h: u32) -> Result<ID3D11Texture2D> {
+        if let Some((t, sw, sh)) = &self.0
+            && *sw >= w
+            && *sh >= h
+        {
+            return Ok(t.clone());
+        }
+        // 光标大小差不多：按 64 取整，形状变一点点不用重建
+        let (w, h) = (w.div_ceil(64) * 64, h.div_ceil(64) * 64);
+        let t = staging_texture(device, w, h)?;
+        self.0 = Some((t.clone(), w, h));
+        Ok(t)
+    }
+}
+
+/// 桌面复制报的硬件光标。按微软的文档，位置就是形状左上角的位置（画的时候不用热点），
+/// 是用户看到的方向、这块显示器的画面坐标。光标在别的显示器上、隐藏了、改用了软件光标（已经在画面里了）
+/// 时都是不可见
+#[derive(Default)]
+struct Pointer {
+    visible: bool,
+    pos: (i32, i32),
+    bitmap: Option<Arc<CursorBitmap>>,
 }
 
 // D3D11 设备只在采集线程内使用
@@ -426,7 +473,7 @@ impl DxgiCapturer {
         };
         unsafe {
             let dup = match o.output.cast::<IDXGIOutput5>() {
-                Ok(o5) => match o5.DuplicateOutput1(&device, 0, &[DXGI_FORMAT_B8G8R8A8_UNORM]) {
+                Ok(o5) => match o5.DuplicateOutput1(&device, 0, &DESKTOP_FORMATS) {
                     Ok(d) => d,
                     Err(e) => {
                         tracing::debug!(
@@ -444,7 +491,7 @@ impl DxgiCapturer {
                     .context("DuplicateOutput")?,
             };
             let desc = dup.GetDesc();
-            if desc.ModeDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+            if !DESKTOP_FORMATS.contains(&desc.ModeDesc.Format) {
                 let format = desc.ModeDesc.Format;
                 bail!("unsupported desktop pixel format: {format:?}");
             }
@@ -456,6 +503,7 @@ impl DxgiCapturer {
                 device,
                 ctx,
                 dup,
+                pixels: hdr::DesktopPixels::new(o.desc.DeviceName),
                 gpu,
                 staging: None,
                 first: true,
@@ -463,6 +511,10 @@ impl DxgiCapturer {
                 hw_cursor: true,
                 desktop: o.desc.DesktopCoordinates,
                 rotation,
+                pointer: Pointer::default(),
+                last: None,
+                drawn_fresh: false,
+                pointer_staging: PointerStaging::default(),
             })
         }
     }
@@ -486,7 +538,8 @@ impl DxgiCapturer {
         let (w, h) = (desc.Width, desc.Height);
         let Some(source) = &self.gpu else {
             let staging = self.staging(w, h)?;
-            unsafe { self.ctx.CopyResource(&staging, tex) };
+            self.pixels
+                .copy(&self.device, &self.ctx, tex, &desc, &staging, true)?;
             return Ok(Copied::Staging(staging, w, h));
         };
         let (fw, fh) = self.rotation.rotated_size(w, h);
@@ -497,11 +550,10 @@ impl DxgiCapturer {
         }
         let g = f.gpu.as_mut().expect("just set");
         g.rotation = self.rotation;
-        unsafe {
-            self.ctx.CopyResource(&g.texture, tex);
-            // 马上交给显卡去复制，不等用的一方提交
-            self.ctx.Flush();
-        }
+        self.pixels
+            .copy(&self.device, &self.ctx, tex, &desc, &g.texture, false)?;
+        // 马上交给显卡去复制，不等用的一方提交
+        unsafe { self.ctx.Flush() };
         Ok(Copied::Gpu(frame))
     }
 }
@@ -513,7 +565,25 @@ enum Copied {
 }
 
 impl Capturer for DxgiCapturer {
-    fn next(&mut self, timeout: Duration, pool: &mut FramePool) -> Result<CaptureUpdate> {
+    fn next(
+        &mut self,
+        timeout: Duration,
+        pool: &mut FramePool,
+        draw: bool,
+    ) -> Result<CaptureUpdate> {
+        if !draw {
+            self.drawn_fresh = false;
+        } else if !self.drawn_fresh
+            && let Some(base) = self.last.clone()
+        {
+            // 刚开始要带光标的画面：用最新的画面马上给一帧，不等画面变化
+            let drawn = self.draw_pointer(&base, Instant::now(), pool)?;
+            self.drawn_fresh = true;
+            return Ok(CaptureUpdate {
+                drawn: Some(drawn),
+                ..Default::default()
+            });
+        }
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut res: Option<IDXGIResource> = None;
         if let Err(e) = unsafe {
@@ -530,18 +600,33 @@ impl Capturer for DxgiCapturer {
         // 光标：位置由控制端本地光标负责，这里只同步可见性与形状。
         // 硬件光标不可见时不一定是隐藏了，可能是改成了画进画面里的软件光标（见 software_cursor）：
         // 这期间每一帧都再看一次，软件光标期间程序隐藏了光标（画面会变）也能发现
+        // 带光标的画面要不要重画：光标动了、出现 / 隐藏了、换了形状
+        let mut pointer_changed = false;
         if info.LastMouseUpdateTime != 0 {
             self.hw_cursor = info.PointerPosition.Visible.as_bool();
+            let pos = (
+                info.PointerPosition.Position.x,
+                info.PointerPosition.Position.y,
+            );
+            pointer_changed = self.hw_cursor != self.pointer.visible
+                || (self.hw_cursor && pos != self.pointer.pos);
+            self.pointer.visible = self.hw_cursor;
+            self.pointer.pos = pos;
         }
         if info.LastMouseUpdateTime != 0 || !self.hw_cursor {
-            update.cursor_visibility = Some(if self.hw_cursor {
+            let visibility = if self.hw_cursor {
                 CursorVisibility::Shown
             } else {
                 software_cursor(&self.desktop)
-            });
+            };
+            update.cursor_visibility = Some(visibility);
+            // 硬件光标不在这块显示器上、显示着：它在别的显示器上（见 software_cursor）。同时看好几个显示器时
+            // 这块显示器报的不算数（见 CursorSnapshot::here）
+            update.cursor_here = Some(self.hw_cursor || visibility != CursorVisibility::Shown);
         }
         if info.PointerShapeBufferSize > 0 {
             update.cursor_shape = self.pointer_shape(info.PointerShapeBufferSize);
+            pointer_changed = true;
         }
 
         // 仅鼠标移动（画面未变）时 LastPresentTime 为 0
@@ -558,6 +643,14 @@ impl Capturer for DxgiCapturer {
         // 尽早释放，让 DWM 继续合成
         let _ = unsafe { self.dup.ReleaseFrame() };
         let Some(copied) = copied? else {
+            // 画面没变：光标动了的话，把它画在最新的画面上
+            if draw
+                && (pointer_changed || !self.drawn_fresh)
+                && let Some(base) = self.last.clone()
+            {
+                update.drawn = Some(self.draw_pointer(&base, Instant::now(), pool)?);
+                self.drawn_fresh = true;
+            }
             return Ok(update);
         };
         self.first = false;
@@ -587,9 +680,124 @@ impl Capturer for DxgiCapturer {
             Arc::get_mut(&mut frame).expect("unique frame").captured = t;
         }
         pool.keep(&frame);
+        self.last = Some(frame.clone());
+        if draw {
+            update.drawn = Some(self.draw_pointer(&frame, frame.captured, pool)?);
+            self.drawn_fresh = true;
+        }
         update.frame = Some(frame);
         Ok(update)
     }
+}
+
+impl DxgiCapturer {
+    /// 带光标的画面：把硬件光标画在 `base` 上（另外一帧，`base` 不动：只有光标动了的时候还要画在它上面，
+    /// 不要光标的会话也在用它）。光标不可见、不在画面里时就是 `base` 本身。`captured`：这一帧的采集时间
+    fn draw_pointer(
+        &mut self,
+        base: &Arc<Frame>,
+        captured: Instant,
+        pool: &mut FramePool,
+    ) -> Result<Arc<Frame>> {
+        let p = &self.pointer;
+        let (w, h) = (base.width, base.height);
+        let Some(bitmap) = p.bitmap.clone().filter(|b| p.visible && b.valid()) else {
+            return Ok(base.clone());
+        };
+        let Some(rect) = overlay::bounds(&bitmap, p.pos, (w, h)) else {
+            return Ok(base.clone());
+        };
+        let pos = p.pos;
+        let mut frame = match &base.gpu {
+            Some(g) => draw_on_gpu(&mut self.pointer_staging, g, &bitmap, pos, rect, pool)?,
+            None => {
+                let mut frame = pool.checkout(w, h);
+                let f = Arc::get_mut(&mut frame).expect("unique frame");
+                let dst = f.pixels_mut();
+                dst.copy_from_slice(base.pixels()?);
+                overlay::draw(&bitmap, pos, (w, h), dst, |x, y| {
+                    Some((y as usize * w as usize + x as usize) * 4)
+                });
+                frame
+            }
+        };
+        Arc::get_mut(&mut frame).expect("unique frame").captured = captured;
+        pool.keep(&frame);
+        Ok(frame)
+    }
+}
+
+/// 显卡上的画面画上光标：复制一份（显卡上复制，很快），只把光标那一块（`rect`，见 [`overlay::bounds`]）
+/// 读回来画上光标、写回去。纹理是没有旋转的方向，光标的位置是用户看到的方向：按 [`Rotation::texel`] 换算
+fn draw_on_gpu(
+    staging: &mut PointerStaging,
+    src: &GpuFrame,
+    bitmap: &CursorBitmap,
+    pos: (i32, i32),
+    (x0, y0, x1, y1): (u32, u32, u32, u32),
+    pool: &mut FramePool,
+) -> Result<Arc<Frame>> {
+    let source = src.source.clone();
+    let (tw, th) = src.texture_size();
+    let rot = src.rotation;
+    let size = rot.rotated_size(tw, th);
+    let mut frame = pool.checkout_with(size.0, size.1, |g| g.reusable(&source, tw, th));
+    let f = Arc::get_mut(&mut frame).expect("unique frame");
+    if f.gpu.is_none() {
+        f.gpu = Some(GpuFrame::new(source.clone(), tw, th, rot)?);
+    }
+    let dst = f.gpu.as_mut().expect("just set");
+    dst.rotation = rot;
+    // 光标那一块在纹理上的范围：两个角换算过去
+    let (ax, ay) = rot.texel((x0, y0), size);
+    let (bx, by) = rot.texel((x1 - 1, y1 - 1), size);
+    let (sx0, sy0) = (ax.min(bx), ay.min(by));
+    let (rw, rh) = (ax.max(bx) - sx0 + 1, ay.max(by) - sy0 + 1);
+    let region = D3D11_BOX {
+        left: sx0,
+        top: sy0,
+        front: 0,
+        right: sx0 + rw,
+        bottom: sy0 + rh,
+        back: 1,
+    };
+    let staging = staging.get(&source.device, rw, rh)?;
+    let ctx = source.context();
+    let mut buf = vec![0u8; rw as usize * rh as usize * 4];
+    unsafe {
+        ctx.CopyResource(&dst.texture, &src.texture);
+        ctx.CopySubresourceRegion(&staging, 0, 0, 0, 0, &src.texture, 0, Some(&region));
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            .context("Map")?;
+        let row = rw as usize * 4;
+        for y in 0..rh as usize {
+            std::ptr::copy_nonoverlapping(
+                (mapped.pData as *const u8).add(y * mapped.RowPitch as usize),
+                buf.as_mut_ptr().add(y * row),
+                row,
+            );
+        }
+        ctx.Unmap(&staging, 0);
+    }
+    overlay::draw(bitmap, pos, size, &mut buf, |x, y| {
+        let (tx, ty) = rot.texel((x, y), size);
+        let (rx, ry) = (tx.checked_sub(sx0)?, ty.checked_sub(sy0)?);
+        (rx < rw && ry < rh).then(|| (ry as usize * rw as usize + rx as usize) * 4)
+    });
+    unsafe {
+        ctx.UpdateSubresource(
+            &dst.texture,
+            0,
+            Some(&region),
+            buf.as_ptr().cast(),
+            rw * 4,
+            0,
+        );
+        // 马上交给显卡去做，不等用的一方提交
+        ctx.Flush();
+    }
+    Ok(frame)
 }
 
 /// 显示器的旋转方向（`DXGI_OUTDUPL_DESC::Rotation`）。
@@ -620,6 +828,16 @@ impl Rotation {
         match self {
             Self::R90 | Self::R270 => (h, w),
             Self::None | Self::R180 => (w, h),
+        }
+    }
+
+    /// 用户看到的画面（`dw`×`dh`）上的 (x, y) 是没有旋转的原始画面上的哪个像素（和 [`copy_rotated`] 一样的对应）
+    fn texel(self, (x, y): (u32, u32), (dw, dh): (u32, u32)) -> (u32, u32) {
+        match self {
+            Self::None => (x, y),
+            Self::R90 => (y, dw - 1 - x),
+            Self::R180 => (dw - 1 - x, dh - 1 - y),
+            Self::R270 => (dh - 1 - y, x),
         }
     }
 }
@@ -683,8 +901,53 @@ impl DxgiCapturer {
                 )
                 .ok()?;
         }
+        // 画进画面用原样的（反色的部分真的和画面异或），控制端的本地光标用转成 RGBA 的
+        self.pointer.bitmap = pointer_bitmap(&self.shape_buf, &si).map(Arc::new);
         convert_pointer(&self.shape_buf, &si)
     }
+}
+
+/// 桌面复制的光标形状 → 画进画面用的图像（见 [`overlay`]）
+fn pointer_bitmap(buf: &[u8], si: &DXGI_OUTDUPL_POINTER_SHAPE_INFO) -> Option<CursorBitmap> {
+    let (w, pitch) = (si.Width as usize, si.Pitch as usize);
+    let ty = si.Type as i32;
+    let bitmap = if ty == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 {
+        let h = si.Height as usize / 2;
+        CursorBitmap::Monochrome {
+            width: w as u32,
+            height: h as u32,
+            pitch: pitch as u32,
+            bits: buf.get(..pitch * h * 2)?.to_vec(),
+        }
+    } else {
+        let h = si.Height as usize;
+        if pitch < w * 4 || buf.len() < pitch * h {
+            return None;
+        }
+        // 每行去掉填充，紧密排列
+        let mut px = Vec::with_capacity(w * h * 4);
+        for row in buf.chunks(pitch).take(h) {
+            px.extend_from_slice(&row[..w * 4]);
+        }
+        if ty == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 {
+            CursorBitmap::MaskedColor {
+                width: w as u32,
+                height: h as u32,
+                bgrm: px,
+            }
+        } else {
+            // 彩色：BGRA，和 convert_pointer 一样当成非预乘的
+            for p in px.as_chunks_mut::<4>().0 {
+                p.swap(0, 2);
+            }
+            CursorBitmap::Rgba {
+                width: w as u32,
+                height: h as u32,
+                rgba: px,
+            }
+        }
+    };
+    (w > 0 && w <= 256 && bitmap.valid()).then_some(bitmap)
 }
 
 /// 硬件光标不可见时，光标到底怎么样了（`desktop`：这块显示器在桌面上的范围）。
@@ -939,5 +1202,167 @@ mod tests {
         }
         // 池里只有一帧：同一个纹理一直在用
         assert_eq!(pool.frames.len(), 1);
+    }
+
+    /// 真的采集第 0 个显示器（要有桌面，光标在这块显示器上、显示着；不会动鼠标）：带光标的画面只在光标那一块
+    /// 和原始画面不一样。`cargo test --lib live_pointer -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_pointer() {
+        let mut cap = DxgiCapturer::open(0).unwrap();
+        let mut pool = FramePool::default();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut drawn = None;
+        while Instant::now() < deadline {
+            let u = cap
+                .next(Duration::from_millis(100), &mut pool, true)
+                .unwrap();
+            if u.drawn.is_some() {
+                drawn = u.drawn;
+            }
+            if drawn.is_some() && cap.pointer.visible && cap.pointer.bitmap.is_some() {
+                break;
+            }
+        }
+        let (Some(drawn), Some(bitmap)) = (drawn, cap.pointer.bitmap.clone()) else {
+            println!("the pointer isn't visible on display 0, skipping");
+            return;
+        };
+        let base = cap.last.clone().unwrap();
+        let (w, h) = (base.width, base.height);
+        let Some((x0, y0, x1, y1)) = overlay::bounds(&bitmap, cap.pointer.pos, (w, h)) else {
+            println!("the pointer is off the picture, skipping");
+            return;
+        };
+        println!(
+            "{w}x{h} on the GPU: {}, pointer {:?} at {:?}",
+            base.gpu.is_some(),
+            bitmap.size(),
+            cap.pointer.pos
+        );
+        let (a, b) = (base.pixels().unwrap(), drawn.pixels().unwrap());
+        let mut inside = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let differs = a[i..i + 3] != b[i..i + 3];
+                if (x0..x1).contains(&x) && (y0..y1).contains(&y) {
+                    inside += differs as u32;
+                } else {
+                    assert!(!differs, "({x}, {y}) is outside the pointer");
+                }
+            }
+        }
+        println!("{inside} pixels changed under the pointer");
+        assert!(inside > 0, "the pointer was drawn");
+    }
+
+    /// [`Rotation::texel`] 和 [`copy_rotated`] 的对应关系一样
+    #[test]
+    fn texel_matches_copy_rotated() {
+        let (w, h) = (7usize, 4usize);
+        let (src, pitch) = image(w, h, 0);
+        for rot in [
+            Rotation::None,
+            Rotation::R90,
+            Rotation::R180,
+            Rotation::R270,
+        ] {
+            let (d, dw, dh) = rotate(&src, w, h, pitch, rot);
+            for y in 0..dh {
+                for x in 0..dw {
+                    let (tx, ty) = rot.texel((x as u32, y as u32), (dw as u32, dh as u32));
+                    assert_eq!(
+                        from(&d, dw, x, y),
+                        (tx as u8, ty as u8),
+                        "{rot:?} ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 显卡上的画面画上光标：和先转成用户看到的方向、再在内存里画的一样（显示器转过方向也一样）；
+    /// 原来的那一帧不动，光标一半在画面外也行
+    #[test]
+    fn pointer_drawn_on_the_gpu() {
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.unwrap();
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(0) }) else {
+            return;
+        };
+        let Ok((device, ctx, true)) = create_device(&adapter) else {
+            println!("no D3D11 video support, skipping");
+            return;
+        };
+        let source = Arc::new(D3dSource::new(device, ctx).unwrap());
+        let (w, h) = (77usize, 45usize);
+        let (img, _) = image(w, h, 0);
+        // 半透明的白、不透明的红、反色：5×3
+        let mut bgrm = Vec::new();
+        for i in 0..15 {
+            bgrm.extend_from_slice(if i % 2 == 0 {
+                &[0xFF, 0xFF, 0xFF, 0xFF]
+            } else {
+                &[0, 0, 0xFF, 0]
+            });
+        }
+        let cursors = [
+            CursorBitmap::Rgba {
+                width: 4,
+                height: 3,
+                rgba: [[255, 255, 255, 128], [255, 0, 0, 255], [0, 0, 0, 0]]
+                    .concat()
+                    .repeat(4),
+            },
+            CursorBitmap::MaskedColor {
+                width: 5,
+                height: 3,
+                bgrm,
+            },
+        ];
+        let mut pool = FramePool::default();
+        let mut staging = PointerStaging::default();
+        for rot in [
+            Rotation::None,
+            Rotation::R90,
+            Rotation::R180,
+            Rotation::R270,
+        ] {
+            let (fw, fh) = rot.rotated_size(w as u32, h as u32);
+            let mut gpu = GpuFrame::new(source.clone(), w as u32, h as u32, rot).unwrap();
+            gpu.rotation = rot;
+            unsafe {
+                source.ctx.UpdateSubresource(
+                    &gpu.texture,
+                    0,
+                    None,
+                    img.as_ptr().cast(),
+                    (w * 4) as u32,
+                    0,
+                );
+            }
+            let mut base = Frame::empty(fw, fh);
+            base.gpu = Some(gpu.clone());
+            let base = Arc::new(base);
+            let (user, ..) = rotate(&img, w, h, w * 4, rot);
+            for cursor in &cursors {
+                for pos in [(10, 20), (-2, -1), (fw as i32 - 3, fh as i32 - 2)] {
+                    let rect = overlay::bounds(cursor, pos, (fw, fh)).unwrap();
+                    let drawn =
+                        draw_on_gpu(&mut staging, &gpu, cursor, pos, rect, &mut pool).unwrap();
+                    let mut want = user.clone();
+                    overlay::draw(cursor, pos, (fw, fh), &mut want, |x, y| {
+                        Some((y as usize * fw as usize + x as usize) * 4)
+                    });
+                    assert_ne!(want, user, "{rot:?} {pos:?}: the cursor is on the picture");
+                    assert_eq!(drawn.pixels().unwrap(), want, "{rot:?} {pos:?}");
+                    assert_eq!(
+                        Frame::uncached(&base).pixels().unwrap(),
+                        user,
+                        "the base frame is untouched"
+                    );
+                }
+            }
+        }
     }
 }

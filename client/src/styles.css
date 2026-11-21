@@ -765,7 +765,6 @@ kbd {
   background: var(--good);
 }
 .dot.connecting,
-.dot.approving,
 .dot.reconnecting,
 .dot.waiting {
   background: var(--ok);
@@ -1108,6 +1107,37 @@ kbd {
   opacity: 0.45;
   cursor: default;
 }
+.dd-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--edge);
+}
+.display-menu {
+  width: 340px;
+}
+/* 显示器菜单的一行：选它 + 右边放到单独窗口里 / 放回来的按钮 */
+.dd-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.dd-row > .dd-item {
+  flex: 1;
+  min-width: 0;
+}
+.dd-icon {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  color: var(--text-2);
+}
+.dd-icon:hover {
+  color: var(--text);
+  background: var(--hover-2);
+}
 .dd-main {
   min-width: 0;
   display: flex;
@@ -1116,6 +1146,24 @@ kbd {
 }
 .audio-menu {
   width: 350px;
+}
+/* 鼠标菜单：三种模式（图标 + 名称 + 说明）、本机光标的开关、怎么放开鼠标 */
+.mouse-menu {
+  width: 360px;
+}
+.mouse-menu .dd-title {
+  padding: 6px 11px 4px;
+}
+.dd-item.mode {
+  justify-content: flex-start;
+  align-items: flex-start;
+}
+.dd-item.mode svg {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.dd-foot {
+  padding: 4px 11px 6px;
 }
 .session-menu {
   min-width: 300px;
@@ -1755,14 +1803,19 @@ kbd {
   align-items: safe center;
   justify-content: safe center;
 }
-.remote-canvas {
-  display: block;
+/* 一个会话的画面：每一路画面一个 canvas（同时看对方的好几个显示器时按它们在对方桌面上的位置拼在一起，见 session.ts 的 layout）。
+   键盘焦点、鼠标事件、锁定指针都在它上面 */
+.remote-screen {
   /* 1:1 显示时用 left/top 把画面对齐到设备像素（见 session.ts 的 layout） */
   position: relative;
-  outline: none;
   flex-shrink: 0;
-  image-rendering: auto;
+  outline: none;
   touch-action: none;
+}
+.remote-canvas {
+  display: block;
+  position: absolute;
+  image-rendering: auto;
 }
 .stage-overlay {
   position: absolute;
@@ -1831,6 +1884,55 @@ kbd {
 .notice svg {
   flex-shrink: 0;
 }
+/* 对方复制了文件（网页版）：在画面下方提示下载，见 lib/files.ts */
+.files-bar {
+  position: absolute;
+  left: 50%;
+  bottom: 70px;
+  transform: translateX(-50%);
+  max-width: min(720px, calc(100% - 40px));
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px 8px 16px;
+  border-radius: 12px;
+  font-size: 13px;
+  z-index: 3;
+  background: var(--pop);
+  border: 1px solid var(--edge-2);
+  box-shadow: var(--shadow);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+}
+.files-bar-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 往画面上拖文件时 */
+.stage.dropping::after {
+  content: "";
+  position: absolute;
+  inset: 8px;
+  border: 2px dashed var(--accent, #6aa8ff);
+  border-radius: 14px;
+  pointer-events: none;
+  z-index: 2;
+}
+.drop-hint {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  padding: 10px 18px;
+  border-radius: 12px;
+  background: var(--pop);
+  border: 1px solid var(--edge-2);
+  font-size: 14px;
+  z-index: 3;
+  pointer-events: none;
+}
 .toast {
   bottom: 22px;
   background: var(--pop);
@@ -1838,6 +1940,24 @@ kbd {
   -webkit-backdrop-filter: blur(14px);
   backdrop-filter: blur(14px);
   animation: rise 0.2s ease-out;
+}
+/* 游戏模式下指针没锁定：提示点画面锁定。不挡点击（点的就是它下面的画面） */
+.lock-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%);
+  padding: 7px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  color: var(--text-2);
+  background: var(--pop);
+  border: 1px solid var(--edge-2);
+  box-shadow: var(--shadow);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+  pointer-events: none;
+  z-index: 2;
 }
 @keyframes rise {
   from {
@@ -1933,6 +2053,88 @@ kbd {
 .orb:active {
   cursor: grabbing;
   transform: scale(0.96);
+}
+
+/* ───────── 弹出窗口（对方的一个显示器放在单独的窗口里，见 lib/popout.ts、components/PopoutView.tsx） ─────────
+ * 画面铺满窗口（平时让出顶上的工具栏），工具栏和提示在上面一层（.popout-ui，不挡画面上的鼠标）。
+ * 全屏时和主窗口一样：工具栏悬浮在顶端，鼠标碰到顶端时出现 */
+.popout {
+  --popout-bar-h: 40px;
+  position: fixed;
+  inset: 0;
+  background: #05060a;
+}
+.popout.immersive {
+  background: #000;
+}
+.popout-stage {
+  position: absolute;
+  inset: var(--popout-bar-h) 0 0 0;
+}
+.popout.immersive .popout-stage {
+  top: 0;
+}
+.popout-ui {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 5;
+}
+.popout-ui > :not(.lock-hint) {
+  pointer-events: auto;
+}
+.popout:not(.immersive) .popout-ui .stage-overlay {
+  top: var(--popout-bar-h);
+}
+.popout-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--popout-bar-h);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 6px 0 14px;
+  background: rgba(12, 14, 22, 0.92);
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  z-index: 5;
+}
+.popout-title {
+  flex: 0 1 auto;
+  font-weight: 600;
+}
+.popout-stats {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+.popout.immersive .popout-bar {
+  top: 8px;
+  left: 50%;
+  right: auto;
+  width: min(620px, calc(100% - 40px));
+  height: 44px;
+  border: 1px solid var(--edge-2);
+  border-radius: 14px;
+  background: var(--pop);
+  -webkit-backdrop-filter: var(--blur);
+  backdrop-filter: var(--blur);
+  box-shadow:
+    var(--shadow),
+    var(--sheen);
+  transform: translate(-50%, calc(-100% - 16px));
+  transition: transform 0.2s ease;
+}
+.popout.immersive .popout-bar.revealed {
+  transform: translate(-50%, 0);
 }
 
 /* ───────── 画质面板 ─────────

@@ -6,6 +6,8 @@
 
 服务器监听 **UDP 4433**。首次启动时会在 `docker-compose.yml` 同目录的 `data/` 下生成自签名证书，**请保留这个目录**：客户端靠证书指纹认出服务器，被控端固定的控制码也记在这里的 SQLite 数据库里（`airhand.db`，服务器运行时旁边还有 `-wal`、`-shm` 两个文件）。保存控制码的被控端（有 `config.toml` 的桌面客户端、Android）不管离线多久，都能从这里取回原来的控制码。
 
+客户端、网页控制台服务和中转服务器均使用信令 v10，请一起升级。视频每帧独占一条 QUIC 流。[帧流与参考帧失效](architecture.zh-CN.md#帧流与参考帧失效)
+
 环境变量（见 `docker-compose.yml`）：
 
 | 变量 | 默认值 | 说明 |
@@ -18,6 +20,7 @@
 | `AIRHAND_MAX_CONNS_PER_IP` | `128` | 同一个 IPv4 地址 / IPv6 的 /64 同时最多几条连接（网页控制台每个标签页一条；很多被控端共用一个出口 IP 时调大） |
 | `AIRHAND_NEW_CODES_PER_IP` | `30` | 同一个 IPv4 地址 / IPv6 的 /48 每 10 分钟最多分配几个新控制码（取回原来的控制码不算） |
 | `AIRHAND_CONNECTS_PER_MINUTE` | `6` | 同一个 IPv4 地址 / IPv6 的 /64 一分钟内最多向同一台被控端发起几次连接（不低于 `AIRHAND_MAX_SESSIONS`；很多控制端共用一个出口 IP 连同一台被控端时调大） |
+| `AIRHAND_MAX_FILE_SIZE` | `50MiB` | 剪贴板传文件时，一次粘贴经中转最多传多少（可以写 `512KiB`、`2GiB` 或字节数；`0`：中转不传文件；`unlimited`：不限）。两端直连通着时不经中转，不受它限制。服务器只看得到密文，按单条流兜底，这是资源上的限制，不是安全边界 |
 | `RUST_LOG` | `info` | 日志级别 |
 
 镜像基于 distroless，约 28 MB，容器里以 root 运行：挂载进来的 `data/` 不管属于谁都写得进去（目录不存在时 Docker 会替你建一个属于 root 的）。Linux 宿主机上用 rootful Docker 时，服务在里面生成的文件属于 root，读取、备份、删除要用 sudo。

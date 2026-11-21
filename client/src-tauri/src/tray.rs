@@ -81,7 +81,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<TrayIcon> {
         .icon(icon_offline())
         .tooltip("Airhand")
         .menu(&build_menu(app, &st)?)
-        // macOS 的菜单栏图标习惯上左键就弹出菜单；Windows / Linux 左键在控制端模式下打开控制台
+        // macOS 保留左键菜单；Windows 用左键双击打开控制台。
         .show_menu_on_left_click(cfg!(target_os = "macos"))
         .on_menu_event(|app, event| crate::on_menu(app, event.id().as_ref()))
         .on_tray_icon_event(|tray, event| {
@@ -89,13 +89,18 @@ pub fn create(app: &AppHandle) -> tauri::Result<TrayIcon> {
             if cfg!(target_os = "macos") {
                 return;
             }
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                crate::on_tray_left_click(tray.app_handle());
+            match event {
+                #[cfg(windows)]
+                TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                } => crate::set_mode(tray.app_handle(), Mode::Controller),
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } => crate::on_tray_left_click(tray.app_handle()),
+                _ => {}
             }
         })
         .build(app)
@@ -106,6 +111,14 @@ pub fn create(app: &AppHandle) -> tauri::Result<TrayIcon> {
 #[cfg(target_os = "macos")]
 pub fn remove(app: &AppHandle) {
     drop(app.remove_tray_by_id(TRAY_ID));
+}
+
+/// 菜单栏程序没有前台窗口，把选目录面板、提示和卸载确认带到用户面前。
+#[cfg(target_os = "macos")]
+pub fn front_panel(mtm: objc2::MainThreadMarker, window: &objc2_app_kit::NSWindow) {
+    #[allow(deprecated)]
+    objc2_app_kit::NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+    window.setLevel(objc2_app_kit::NSModalPanelWindowLevel);
 }
 
 fn label(app: &AppHandle, text: impl AsRef<str>) -> tauri::Result<MenuItem<Wry>> {
@@ -165,6 +178,11 @@ fn build_menu(app: &AppHandle, st: &AppStatus) -> tauri::Result<Menu<Wry>> {
                 menu.append(&login_item_entry(app, s)?)?;
             }
         }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (id, title, enabled) = crate::clipfiles::macos::menu_item();
+        menu.append(&MenuItem::with_id(app, id, title, enabled, None::<&str>)?)?;
     }
     menu.append(&language_menu(app)?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
@@ -314,7 +332,7 @@ fn host_items(app: &AppHandle, menu: &Menu<Wry>, st: &AppStatus) -> tauri::Resul
 }
 
 /// 配对（见 [`crate::host::gate`]）：配对码，暂停了的话提示换一个；配对过的控制端可以全部忘掉。
-/// 不要配对码（config.toml 的 `access = "open"`）时什么也不显示
+/// 还不知道配对码（托盘还没连上服务里的被控端）时什么也不显示
 fn pairing_items(app: &AppHandle, menu: &Menu<Wry>, st: &AppStatus) -> tauri::Result<()> {
     let Some(pairing) = &st.host.pairing else {
         return Ok(());

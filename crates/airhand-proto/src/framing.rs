@@ -26,10 +26,7 @@
 //!   放在哪里都不会出错，由收的一方决定怎么对待；
 //! * **带字段的枚举加变体**：作为一整条消息时，旧版本跳过整条消息；作为字段时写成 `Option<枚举>` 并且用
 //!   [`crate::cbor::opt`]（不认识的是 `None`）；在列表里用 [`crate::cbor::open_vec`]，只跳过不认识的元素。
-//!   只有这三个地方能跳过，别的地方不能放带字段的枚举（为什么见 [`crate::cbor`]）；
-//! * **对方可能不认识的新消息**：只在对方的能力位（[`crate::Features`]）表明它认识时才发。
-//!
-//! 只有改不下去的时候（例如要删掉必填字段）才加版本号（[`crate::SIGNAL_VERSION`] / [`crate::SESSION_VERSION`]）。
+//!   只有这三个地方能跳过，别的地方不能放带字段的枚举（为什么见 [`crate::cbor`]）。
 
 use minicbor::{Decode, Encode};
 
@@ -54,11 +51,17 @@ pub fn encode<T: Encode<()>>(msg: &T) -> Vec<u8> {
 /// 同 [`encode`]，多留 `spare` 字节的容量：加密时在后面追加标签和计数（[`crate::handshake::SEAL_OVERHEAD`]）不用重新分配
 pub fn encode_with_spare<T: Encode<()>>(msg: &T, spare: usize) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64 + spare);
-    buf.extend_from_slice(&[0u8; 4]);
-    minicbor::encode(msg, &mut buf).expect("writing to a Vec can't fail");
-    let len = buf.len() - 4;
-    buf[..4].copy_from_slice(&(len as u32).to_le_bytes());
+    append_msg(&mut buf, msg);
     buf
+}
+
+/// 向现有缓冲区追加一条带长度前缀的 CBOR 消息。
+pub fn append_msg<T: Encode<()>>(buf: &mut Vec<u8>, msg: &T) {
+    let start = buf.len();
+    buf.extend_from_slice(&[0u8; PREFIX]);
+    minicbor::encode(msg, &mut *buf).expect("writing to a Vec can't fail");
+    let len = (buf.len() - start - PREFIX) as u32;
+    buf[start..start + PREFIX].copy_from_slice(&len.to_le_bytes());
 }
 
 /// 一条消息的负载（不带长度前缀，CBOR）
@@ -158,7 +161,6 @@ mod tests {
     #[test]
     fn roundtrip() {
         let msgs = vec![
-            HostMsg::AwaitingApproval,
             HostMsg::Notice(Some(Notice::CaptureFailed {
                 detail: "AcquireNextFrame: 0x887A0026".into(),
             })),
@@ -231,7 +233,7 @@ mod tests {
         let clip = |t: &str| HostMsg::Clipboard { text: t.into() };
         let mut wire = encode(&clip("a"));
         let whole = wire.len();
-        wire.extend(encode(&clip("b")));
+        append_msg(&mut wire, &clip("b"));
         let mut r = &wire[..wire.len() - 1];
         assert!(matches!(next(&mut r), HostMsg::Clipboard { text } if text == "a"));
         assert!(take_msg::<HostMsg>(&mut r, 1 << 20).unwrap().is_none());
@@ -264,12 +266,12 @@ mod tests {
         }
         let mut wire = encode(&Future::Hologram { depth: 3 });
         wire.extend(encode(&FutureNotice::Notice(Smell::Burnt { how: 1 })));
-        wire.extend(encode(&HostMsg::Bye(ByeReason::Declined)));
+        wire.extend(encode(&HostMsg::Bye(ByeReason::CodeChanged)));
         let mut r = &wire[..];
         let m: HostMsg = next(&mut r);
         assert!(matches!(m, HostMsg::Notice(None)), "{m:?}");
         let m: HostMsg = next(&mut r);
-        assert!(matches!(m, HostMsg::Bye(ByeReason::Declined)));
+        assert!(matches!(m, HostMsg::Bye(ByeReason::CodeChanged)));
         let Decoded::<HostMsg>::Unknown(v) =
             decode(&to_vec(&Future::Hologram { depth: 3 })).unwrap()
         else {
@@ -412,12 +414,11 @@ mod tests {
         }
     }
 
-    /// 会话开始、等待同意、触摸和系统操作
+    /// 会话开始、结束、触摸和系统操作
     #[test]
     fn session_start_and_touch_roundtrip() {
         let mut wire = Vec::new();
-        wire.extend(encode(&HostMsg::AwaitingApproval));
-        wire.extend(encode(&HostMsg::Bye(ByeReason::Declined)));
+        wire.extend(encode(&HostMsg::Bye(ByeReason::Kicked)));
         wire.extend(encode(&HostMsg::Hello(HostHello {
             hostname: "Pixel".into(),
             os: "Android 15".into(),
@@ -428,12 +429,12 @@ mod tests {
             platform: Platform::Android,
             touch: true,
             actions: vec![SystemAction::Back, SystemAction::VolumeDown],
+            shown: vec![0],
+            streams: 1,
         })));
         let mut r = &wire[..];
-        let a: HostMsg = next(&mut r);
-        assert!(matches!(a, HostMsg::AwaitingApproval));
         let b: HostMsg = next(&mut r);
-        assert!(matches!(b, HostMsg::Bye(ByeReason::Declined)));
+        assert!(matches!(b, HostMsg::Bye(ByeReason::Kicked)));
         let h: HostMsg = next(&mut r);
         assert!(
             matches!(h, HostMsg::Hello(ref h) if h.platform == Platform::Android && h.touch
@@ -479,6 +480,12 @@ mod tests {
             ControllerDatagram::Ack {
                 seq: 9,
                 arrived: 77,
+                stream: 0,
+            },
+            ControllerDatagram::Ack {
+                seq: 9,
+                arrived: 77,
+                stream: 3,
             },
             ControllerDatagram::Echo { t: 3 },
         ] {
@@ -615,8 +622,8 @@ mod tests {
         let header = SessionHeader::new(7, SessionLane::Bulk).encode();
 
         let try_all = |hello: &[u8], signal: &[u8], header: &[u8; SessionHeader::LEN]| {
-            let _ = decode_known::<Versions>(hello);
             let _ = decode_known::<ClientHello>(hello);
+            let _ = decode_known::<ServerHello>(hello);
             let mut r = signal;
             while let Ok(Some(_)) = take_msg::<ClientMsg>(&mut r, MAX_SIGNAL_MSG) {}
             let _ = SessionHeader::decode(header);

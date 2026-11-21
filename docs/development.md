@@ -10,7 +10,7 @@ cargo test
 # the server only uses airhand-link's wire module (default client feature off); the cargo test above always builds it with client, so check this separately
 cargo test -p airhand-link --no-default-features
 
-# crates/airhand-proto/fuzz/: what the server parses before any authentication (version handshake, signaling messages, session headers); needs nightly and cargo-fuzz
+# crates/airhand-proto/fuzz/ covers the signaling handshake, signaling messages and session headers (nightly and cargo-fuzz)
 cargo +nightly fuzz run signal    # also hello, session_header
 
 # web/: web console (WebSocket protocol, password, HTTPS certificate)
@@ -20,11 +20,17 @@ cargo test
 npm test
 
 # client/src-tauri/: client Rust (encoders incl. hardware probing, Opus packing, format conversion…)
+# with ffmpeg installed, ltr_recovery_decodes_without_the_lost_frames also uses it to check that frames
+# recovered from a long-term reference decode bit-identically to the stream without loss
 cargo test --lib
+# what each hardware encoder reports about long-term reference frames (for investigating new GPUs)
+cargo test --lib ltr_probe -- --ignored --nocapture
 # audio loopback capture (needs an audio output device; plays a 1.5 s test tone at -60 dBFS, barely audible)
 cargo test --lib loopback_captures_tone -- --ignored --nocapture
 # Windows: the controller's microphone into Steam Streaming Microphone (needs it on this computer), recorded back as a 1 kHz tone
 cargo test --lib mic_reaches_steam_streaming_microphone -- --ignored --nocapture
+# macOS 14.2+ / Linux with PipeWire and pactl: crash recovery, disconnect and uninstall during forwarding
+cargo test --lib native_mic_cleanup -- --ignored --nocapture
 
 # android/native/: Android Rust core (runs on this computer: in-flight control, keyframes, audio fan-out, command format)
 cargo test
@@ -32,13 +38,13 @@ cargo test
 ./gradlew testDebugUnitTest -Pairhand.abis=x86_64
 ```
 
-Testing the Android host doesn't need a second phone: `android/native` has a protocol-level controller that connects to the phone's code from a computer, counts frames / audio, and can tap and type:
+Testing the Android host doesn't need a second phone: `android/native` has a protocol-level controller that connects to the phone's code from a computer, counts frames / audio, and can tap and type. Each run is a new controller identity, so pass the pairing code from the phone's Share screen tab:
 
 ```bash
 # android/native/ (an app in the emulator reaches a server on this computer at 10.0.2.2:4433)
-cargo run --example probe -- <phone's control code> 8 --tap 0.5,0.5 --text hello --audio
-# multi-touch and system actions: pinch out, open quick settings (with "Ask before someone connects" on, allow it on the phone first; timing starts then)
-cargo run --example probe -- <phone's control code> 6 --pinch --action QuickSettings
+cargo run --example probe -- <phone's control code> 8 --tap 0.5,0.5 --text hello --audio --pairing <pairing code>
+# multi-touch and system actions: pinch out, open quick settings
+cargo run --example probe -- <phone's control code> 6 --pinch --action QuickSettings --pairing <pairing code>
 ```
 
 On macOS the screen / audio capture tests (`sck_capture`, `loopback_captures_tone`, video and audio in the end-to-end test) and the input injection test (`mac_move_to_center`) need the Screen & System Audio Recording and Accessibility permissions for the terminal that runs them (System Settings → Privacy & Security). Without them `sck_capture`, `loopback_captures_tone` and `mac_move_to_center` skip themselves; the end-to-end test checks that the host reports the missing permission (rather than a capture failure) and then skips the video and audio checks (clipboard, ping, disconnect and the rest are still checked).
@@ -51,9 +57,19 @@ cargo build -p airhand-server
 AIRHAND_CERT=target/e2e/cert.pem AIRHAND_KEY=target/e2e/key.pem ./target/debug/airhand-server &
 
 # client/src-tauri/
-cargo test --lib e2e_roundtrip -- --ignored --nocapture   # video / codec switching / clipboard / audio / ping / disconnect
+cargo test --lib e2e_roundtrip -- --ignored --nocapture   # video frame streams / codec switching / clipboard / audio / ping / disconnect
 cargo test --lib e2e_reconnect -- --ignored --nocapture   # getting the code back after a server restart, changing the code
-cargo test --lib e2e_mic -- --ignored --nocapture         # Windows: the controller's microphone through the relay into Steam Streaming Microphone
+cargo test --lib e2e_multi_display -- --ignored --nocapture  # showing two displays at once, then one (skipped with a single display)
+cargo test --lib e2e_mic -- --ignored --nocapture         # record a 1 kHz tone from the OS device (Swift on Mac, pipewire-pulse and parec on Linux, Steam driver on Windows)
+```
+
+The clipboard file tests use this computer's real clipboard and replace what's on it, so they're skipped by default too (run them one at a time):
+
+```bash
+# client/src-tauri/
+cargo test --lib clipfiles -- --ignored --test-threads=1
+# Windows: puts virtual files on the clipboard, then has Explorer really paste them into a temporary folder (explorer_pastes_the_virtual_files)
+# Linux: needs FUSE and X11 (WSLg works); mounts, reads the files and checks text/uri-list on the clipboard
 ```
 
 ## Debugging tools
@@ -71,7 +87,7 @@ cargo run --release --example headless_host
 cargo run --release --example encode_bench
 ```
 
-Use release builds when judging smoothness or A/V sync: CPU scaling is very slow in debug builds (used for "Sharp text" or when the GPU can't scale; 4K → 1080p takes about 0.5 s per frame). To compare the GPU zero-copy and CPU paths: `cargo run --release --example encode_bench`.
+Use release builds when judging smoothness or A/V sync: if the host falls back to CPU scaling, a debug build can take about 0.5 s per frame to shrink 4K to 1080p.
 
 ## Debugging the Windows service
 
@@ -117,24 +133,22 @@ cd ~/airhand && bash client/scripts/linux-test.sh
 
 ### Protocol versions
 
-There are two version numbers (`crates/airhand-proto/src/lib.rs`); the rules are in [How it works → Protocol evolution](architecture.md#protocol-evolution):
+There are two version numbers (`crates/airhand-proto/src/lib.rs`). Each must match exactly; there are no version ranges or protocol capability bits:
 
-- `SIGNAL_VERSION` / `SIGNAL_MIN`: client ⇄ server (signaling, the session header, the datagram's session ID). The server accepts clients within its range; without a common version it replies `Incompatible` (with its own range) and the client tells the user whether to update Airhand or the server, then retries once a minute
-- `SESSION_VERSION` / `SESSION_MIN`: host ⇄ controller, negotiated in the end-to-end handshake; the server never looks at it. Without a common version the controller shows `peerIncompatible`
+- `SIGNAL_VERSION` (10): the client and relay each report one version in `ClientHello` / `ServerHello`. The relay does not process further requests if it differs.
+- `SESSION_VERSION` (1): the host and controller check it in the authenticated end-to-end handshake. The relay does not see it; a mismatch prevents admission.
 
-Before changing the protocol, look for a compatible way; if there is one, don't bump a version:
+During v10 development the wire format can change without keeping paths for older clients. Build the relay, desktop, Android and web service from the same revision rather than mixing earlier v10 builds. See [Protocol evolution](architecture.md#protocol-evolution) for codec conventions.
 
-- New message: add an enum variant with a **new number**; older versions skip it. If the peer may not know it, add a capability bit in `features` and only send it when the peer advertises the bit
-- New field: only `Option` fields (or `#[cbor(default)]`), with a new number; required fields must stay forever
-- New enum values: enums that are just a number are declared with `open_enum!` (`crate::cbor`), so an unknown value decodes as `Unknown(n)` wherever it appears; decide what the receiver does with it (ignore it, fall back to a default, treat it as "the peer is newer")
-- New variants of enums with fields: they can only be skipped as a whole message, in an `Option` field marked `crate::cbor::opt`, or as a list element marked `crate::cbor::open_vec`. Anywhere else an unknown variant is a decoding error, on purpose. Never put an enum with fields inside a plain derived `Option<…>` (also not inside a struct that sits in an `Option`): minicbor's derive treats any unknown variant inside as `None` and skips from the wrong position (see the notes in `cbor.rs`)
-- Numbers can't be changed or reused once released; bump the version only when there's no other way (e.g. removing a required field)
+Relay latency benchmark (local loopback over real QUIC, excluding media encode and decode):
 
-The version range in the version handshake (keys 0 and 1 of the `ClientHello` / `ServerHello` CBOR maps, `signal::Versions`) and the ALPN must **never** change, otherwise different versions can't even tell each other that they differ. The `version_handshake_is_frozen` test guards this. The `airhand-proto` tests include examples of a newer peer sending new messages, fields and enum values; write one like them when adding a compatibility rule.
+```bash
+cargo test --release -p airhand-server relay_video_bench -- --ignored --nocapture
+```
 
 ### One protocol, three implementations
 
-`crates/airhand-proto/tests/v9.rs` holds the v9 CBOR bytes. Once v9 is released they are fixed and must not be regenerated from the implementation: existing message numbers and field positions stay compatible, and new messages get separate fixtures. Cursor receiver tests cover ordering across both lanes, and a server test uses real QUIC and the controller session to verify that unknown video formats are acknowledged and subsequent frames still arrive.
+`crates/airhand-proto/tests/v10.rs` pins the current v10 wire bytes for handshakes, stream headers, control messages and media headers.
 
 The Rust side, the console (TypeScript) and Android (Kotlin) all speak the same formats: media packets (`crates/airhand-proto/src/media.rs`), input events, UI commands and connect options (`airhand_link::controller::Command`, `ConnectOptions`). All the JSON between the UIs and Rust is camelCase: field names, enum values (`"h264"`, `"android"`, `"quickSettings"`), and a field naming the variant of tagged unions (`cmd` for commands, `type` for events and input, `kind` for problems and notices). `crates/airhand-link/tests/protocol.json` holds samples of each, generated by a Rust test; `npm test` (`tests/protocol.test.ts`) and `./gradlew testDebugUnitTest` (`ProtocolTest`) check their parsers and builders against the same file. After changing a format, regenerate it with `AIRHAND_UPDATE_FIXTURES=1 cargo test -p airhand-link --test protocol`, then make the other two pass.
 

@@ -4,11 +4,26 @@
 //!
 //! * **GPU 上**（[`GpuFrame`]）：Windows 的桌面复制把画面复制进自己的纹理，macOS 的 ScreenCaptureKit 直接按编码尺寸
 //!   输出 NV12。硬件编码器直接用（见 `encoder` 的"GPU 零拷贝"），画面不离开显卡；
-//! * **内存里**：X11、macOS 的原始分辨率 BGRA，以及 GPU 上的画面第一次要用像素时读回来的（CPU 缩放、软件编码，
+//! * **内存里**：X11 的 BGRA，以及 GPU 上的画面第一次要用像素时读回来的（CPU 缩放、软件编码，
 //!   见 [`Frame::pixels`]）。读回的结果留在这一帧里，几个会话共用。
+//!
+//! # 带光标的画面
+//!
+//! 采集到的画面里没有光标（控制端用本地光标显示它，见 `airhand_proto::session` 的"鼠标"）。控制端在游戏模式时要
+//! 被控端把光标画进画面里（`QualitySettings::draw_cursor`），所以一路采集出两种画面（[`FrameSlot`] 里各存最新的一帧）：
+//!
+//! * 原始的：一直有；
+//! * 带光标的：有订阅者要（[`subscribe`] 的 `draw`）才有，光标单独移动、换了形状也出新的一帧（只是把光标重新画在
+//!   最新的原始画面上）。光标隐藏着、不在这块显示器上时和原始的是同一帧。
+//!
+//! Windows、X11 自己画（[`overlay`]）。macOS 由系统画（ScreenCaptureKit 的 `showsCursor`），一路采集只能有一种：
+//! 要不要光标也算进"同一种画面"里，各开一路。
 
 #[cfg(windows)]
 mod dxgi;
+// macOS 由系统画光标，用不到；Linux 只用彩色的（黑白、带掩码的是 Windows 的格式）
+#[cfg_attr(not(windows), allow(dead_code))]
+mod overlay;
 #[cfg(target_os = "macos")]
 mod sck;
 #[cfg(target_os = "linux")]
@@ -19,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use airhand_proto::session::{CursorShape, CursorVisibility, DisplayInfo, Notice, QualitySettings};
+use airhand_proto::session::{CursorShape, CursorVisibility, DisplayInfo, Notice};
 use anyhow::{Result, anyhow};
 use tracing::{info, warn};
 
@@ -252,9 +267,14 @@ impl FramePool {
 /// 采集器一次产出的更新。
 #[derive(Default)]
 pub struct CaptureUpdate {
+    /// 新的原始画面
     pub frame: Option<Arc<Frame>>,
+    /// 新的带光标的画面（见模块说明）：只在要的时候有
+    pub drawn: Option<Arc<Frame>>,
     /// 光标可见性（变没变都可以给，没变不算变化）
     pub cursor_visibility: Option<CursorVisibility>,
+    /// 光标在不在这块显示器上（见 [`CursorSnapshot::here`]；不给就是没变）
+    pub cursor_here: Option<bool>,
     /// 光标形状变化
     pub cursor_shape: Option<CursorShape>,
 }
@@ -267,6 +287,9 @@ pub struct CursorSnapshot {
     /// 形状变化时递增
     pub shape_seq: u64,
     pub visibility: CursorVisibility,
+    /// 光标在这块显示器上（或者看不出来在哪里：隐藏了、这个平台只有一个全局的光标状态）。在别的显示器上时
+    /// 这块显示器报的可见性、形状不算数：同时看好几个显示器时只听光标所在的那一块（见 `super::cursor`）
+    pub here: bool,
     pub shape: Option<Arc<CursorShape>>,
 }
 
@@ -279,6 +302,9 @@ pub struct FrameSlot {
 struct SlotState {
     seq: u64,
     frame: Option<Arc<Frame>>,
+    /// 带光标的画面（见模块说明）：各自的序号
+    drawn_seq: u64,
+    drawn: Option<Arc<Frame>>,
     error: Option<String>,
     cursor: CursorSnapshot,
 }
@@ -289,11 +315,14 @@ impl FrameSlot {
             state: Mutex::new(SlotState {
                 seq: 0,
                 frame: None,
+                drawn_seq: 0,
+                drawn: None,
                 error: None,
                 cursor: CursorSnapshot {
                     seq: 0,
                     shape_seq: 0,
                     visibility: CursorVisibility::Hidden,
+                    here: true,
                     shape: None,
                 },
             }),
@@ -308,11 +337,22 @@ impl FrameSlot {
             st.frame = Some(f);
             st.error = None;
         }
+        if let Some(f) = u.drawn {
+            st.drawn_seq += 1;
+            st.drawn = Some(f);
+            st.error = None;
+        }
         let mut cursor_changed = false;
         if let Some(v) = u.cursor_visibility
             && v != st.cursor.visibility
         {
             st.cursor.visibility = v;
+            cursor_changed = true;
+        }
+        if let Some(here) = u.cursor_here
+            && here != st.cursor.here
+        {
+            st.cursor.here = here;
             cursor_changed = true;
         }
         if let Some(shape) = u.cursor_shape
@@ -333,21 +373,28 @@ impl FrameSlot {
         self.state.lock().unwrap().cursor.clone()
     }
 
-    /// 等待新帧或光标变化，返回 (帧序号, 光标序号)。超时也会返回。
+    /// 等待新帧或光标变化，返回 (帧序号, 光标序号)。超时也会返回。`drawn`：看带光标的那一路画面（见模块说明），
+    /// 帧序号也是那一路的
     pub fn wait_change(
         &self,
         frame_after: u64,
         cursor_after: u64,
         timeout: Duration,
+        drawn: bool,
     ) -> (u64, u64) {
         let st = self.state.lock().unwrap();
         let (st, _) = self
             .cv
             .wait_timeout_while(st, timeout, |s| {
-                s.seq <= frame_after && s.cursor.seq <= cursor_after
+                s.seq_of(drawn) <= frame_after && s.cursor.seq <= cursor_after
             })
             .unwrap();
-        (st.seq, st.cursor.seq)
+        (st.seq_of(drawn), st.cursor.seq)
+    }
+
+    /// 没有订阅者要带光标的画面了：最后一帧不留着，之后再要时不会先拿到过时的画面
+    fn clear_drawn(&self) {
+        self.state.lock().unwrap().drawn = None;
     }
 
     fn set_error(&self, e: Option<String>) {
@@ -359,64 +406,64 @@ impl FrameSlot {
         self.state.lock().unwrap().error.clone()
     }
 
-    /// 非阻塞地取最新帧（如果比 `after` 新）。
-    pub fn try_newer(&self, after: u64) -> Option<(u64, Arc<Frame>)> {
+    /// 非阻塞地取最新帧（如果比 `after` 新）。`drawn`：带光标的那一路（见 [`FrameSlot::wait_change`]）
+    pub fn try_newer(&self, after: u64, drawn: bool) -> Option<(u64, Arc<Frame>)> {
         let st = self.state.lock().unwrap();
-        if st.seq > after {
-            st.frame.clone().map(|f| (st.seq, f))
+        let seq = st.seq_of(drawn);
+        if seq > after {
+            let f = if drawn { &st.drawn } else { &st.frame };
+            f.clone().map(|f| (seq, f))
         } else {
             None
         }
     }
 }
 
+impl SlotState {
+    /// 这一路最新的一帧的序号。带光标的那一路没人要了被清掉（见 [`FrameSlot::clear_drawn`]）之后是 0：
+    /// 再要的时候等新的一帧，不会以为有新帧却拿不到
+    fn seq_of(&self, drawn: bool) -> u64 {
+        match drawn {
+            true if self.drawn.is_some() => self.drawn_seq,
+            true => 0,
+            false => self.seq,
+        }
+    }
+}
+
 trait Capturer {
     /// 获取下一次更新；超时（画面无变化）时返回空更新。出错时调用方会重建采集器。
-    fn next(&mut self, timeout: Duration, pool: &mut FramePool) -> anyhow::Result<CaptureUpdate>;
+    ///
+    /// `draw`：有订阅者要带光标的画面（见模块说明）。要的时候除了原始画面，还要在光标移动、换形状、原始画面变了的时候
+    /// 给出新的带光标的画面；刚开始要（之前不要）时马上用最新的原始画面给一帧，不等画面变化。
+    /// 不要了以后再要，也要马上给一帧
+    fn next(
+        &mut self,
+        timeout: Duration,
+        pool: &mut FramePool,
+        draw: bool,
+    ) -> anyhow::Result<CaptureUpdate>;
 
     /// 订阅者期望的最高帧率变化。由系统按帧率推送画面的采集器（macOS）据此调整，其余忽略。
     fn set_fps(&mut self, _fps: u8) {}
 }
 
-/// 订阅者要什么样的画面。同一个显示器、同一种画面的订阅者共用一路采集
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Output {
-    /// 原始分辨率（Windows 上在 GPU 上，编码器自己在 GPU 上缩放）
-    Native,
-    /// 系统采集时就按这个短边上限缩放好（见 `encoder::target_size`），直接输出编码器要的 NV12，在 GPU 上
-    ///（macOS 的 ScreenCaptureKit，见 sck.rs）。别的平台没有这种，当作 `Native`
-    Scaled(u16),
-}
+/// 哪个显示器、采集时的短边上限、系统画不画光标。后两项只影响 macOS，其余平台同一显示器共用一路采集
+type Key = (u8, u16, bool);
 
-/// 按画质设置该订阅哪种画面。
-///
-/// macOS：低延迟优先时让系统直接缩放成编码尺寸的 NV12；清楚优先、而且需要缩小时要原始分辨率的 BGRA，
-/// 在 CPU 上缩放（见 `encoder` 的说明）。不用缩放时两种一样，都用系统输出的 NV12。
-pub fn output_for(index: u8, s: &QualitySettings) -> Output {
-    #[cfg(target_os = "macos")]
-    {
-        use airhand_proto::session::VideoPriority;
-        if s.priority.or_latency() == VideoPriority::Clarity
-            && let Ok(d) = super::macos::display(index)
-            && super::encoder::needs_scaling(d.width, d.height, s.max_short)
-        {
-            return Output::Native;
-        }
-        Output::Scaled(s.max_short)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (index, s);
-        Output::Native
-    }
+/// 一个订阅者要什么
+#[derive(Clone, Copy)]
+struct Want {
+    fps: u8,
+    /// 要带光标的画面
+    draw: bool,
 }
 
 struct CaptureShared {
-    key: (u8, Output),
+    key: Key,
     slot: FrameSlot,
     stop: AtomicBool,
-    /// 订阅者 -> 期望帧率
-    subs: Mutex<HashMap<u64, u8>>,
+    subs: Mutex<HashMap<u64, Want>>,
 }
 
 impl CaptureShared {
@@ -425,10 +472,15 @@ impl CaptureShared {
             .lock()
             .unwrap()
             .values()
-            .copied()
+            .map(|w| w.fps)
             .max()
             .unwrap_or(30)
             .max(1)
+    }
+
+    /// 有订阅者要带光标的画面
+    fn wants_drawn(&self) -> bool {
+        self.subs.lock().unwrap().values().any(|w| w.draw)
     }
 }
 
@@ -444,7 +496,9 @@ impl Subscription {
     }
 
     pub fn set_fps(&self, fps: u8) {
-        self.shared.subs.lock().unwrap().insert(self.id, fps);
+        if let Some(w) = self.shared.subs.lock().unwrap().get_mut(&self.id) {
+            w.fps = fps;
+        }
     }
 }
 
@@ -461,31 +515,33 @@ impl Drop for Subscription {
     }
 }
 
-type Hub = HashMap<(u8, Output), Weak<CaptureShared>>;
+type Hub = HashMap<Key, Weak<CaptureShared>>;
 static HUB: LazyLock<Mutex<Hub>> = LazyLock::new(Default::default);
 static NEXT_SUB: AtomicU64 = AtomicU64::new(1);
 
 /// 订阅显示器画面。若该显示器已在按同样的方式采集则直接复用。
-pub fn subscribe(index: u8, fps: u8, output: Output) -> Subscription {
-    #[cfg(not(target_os = "macos"))]
-    let output = {
-        let _ = output;
-        Output::Native
+/// `max_short`：macOS 让系统按这个短边上限直接交付 NV12；其余平台由编码器缩放。
+/// `draw`：要带光标的画面（见模块说明，读的时候给 [`FrameSlot::wait_change`] 和 [`FrameSlot::try_newer`] 也带上它）
+pub fn subscribe(index: u8, fps: u8, max_short: u16, draw: bool) -> Subscription {
+    let key = if cfg!(target_os = "macos") {
+        (index, max_short, draw)
+    } else {
+        (index, 0, false)
     };
-    let key = (index, output);
+    let want = Want { fps, draw };
     let mut hub = HUB.lock().unwrap();
     let id = NEXT_SUB.fetch_add(1, Ordering::Relaxed);
     if let Some(shared) = hub.get(&key).and_then(Weak::upgrade)
         && !shared.stop.load(Ordering::Acquire)
     {
-        shared.subs.lock().unwrap().insert(id, fps);
+        shared.subs.lock().unwrap().insert(id, want);
         return Subscription { shared, id };
     }
     let shared = Arc::new(CaptureShared {
         key,
         slot: FrameSlot::new(),
         stop: AtomicBool::new(false),
-        subs: Mutex::new(HashMap::from([(id, fps)])),
+        subs: Mutex::new(HashMap::from([(id, want)])),
     });
     hub.insert(key, Arc::downgrade(&shared));
     let thread_shared = shared.clone();
@@ -500,8 +556,8 @@ pub fn subscribe(index: u8, fps: u8, output: Output) -> Subscription {
 const REPORT_AFTER: u32 = 4;
 
 fn capture_loop(shared: Arc<CaptureShared>) {
-    let (index, output) = shared.key;
-    info!(screen = index, ?output, "capture started");
+    let (index, max_short, system_cursor) = shared.key;
+    info!(screen = index, max_short, system_cursor, "capture started");
     raise_priority();
     // 采集线程整体使用物理像素坐标
     #[cfg(windows)]
@@ -519,7 +575,7 @@ fn capture_loop(shared: Arc<CaptureShared>) {
     while !shared.stop.load(Ordering::Acquire) {
         let c = match cap.as_mut() {
             Some(c) => c,
-            None => match open(index, shared.max_fps(), output) {
+            None => match open(index, shared.max_fps(), max_short, system_cursor) {
                 Ok(c) => {
                     failures = 0;
                     fps = shared.max_fps();
@@ -555,12 +611,22 @@ fn capture_loop(shared: Arc<CaptureShared>) {
         if !wait.is_zero() {
             std::thread::sleep(wait);
         }
-        match c.next(Duration::from_millis(100), &mut pool) {
+        let draw = shared.wants_drawn();
+        if !draw {
+            shared.slot.clear_drawn();
+        }
+        match c.next(Duration::from_millis(100), &mut pool, draw) {
             Ok(u) => {
-                if let Some(f) = &u.frame {
+                // 只有光标动了（带光标的画面）也算一帧：鼠标一动就是每秒几百次更新，也要按帧率来
+                if let Some(f) = u.frame.as_ref().or(u.drawn.as_ref()) {
                     pacer.done(f.captured);
                 }
-                if u.frame.is_some() || u.cursor_visibility.is_some() || u.cursor_shape.is_some() {
+                if u.frame.is_some()
+                    || u.drawn.is_some()
+                    || u.cursor_visibility.is_some()
+                    || u.cursor_here.is_some()
+                    || u.cursor_shape.is_some()
+                {
                     shared.slot.publish(u);
                 }
             }
@@ -602,23 +668,26 @@ pub(crate) fn wire_detail(e: &anyhow::Error) -> String {
     e.chain().map(part).collect::<Vec<_>>().join(": ")
 }
 
+/// `cursor`：让系统把光标画进采集到的画面里（macOS，见模块说明）；别的平台总是 false
 #[cfg(windows)]
-fn open(index: u8, _fps: u8, _output: Output) -> anyhow::Result<Box<dyn Capturer>> {
+fn open(index: u8, _fps: u8, _max_short: u16, _cursor: bool) -> anyhow::Result<Box<dyn Capturer>> {
     Ok(Box::new(dxgi::DxgiCapturer::open(index)?))
 }
 
 #[cfg(target_os = "linux")]
-fn open(index: u8, _fps: u8, _output: Output) -> anyhow::Result<Box<dyn Capturer>> {
+fn open(index: u8, _fps: u8, _max_short: u16, _cursor: bool) -> anyhow::Result<Box<dyn Capturer>> {
     Ok(Box::new(x11::X11Capturer::open(index)?))
 }
 
 #[cfg(target_os = "macos")]
-fn open(index: u8, fps: u8, output: Output) -> anyhow::Result<Box<dyn Capturer>> {
-    Ok(Box::new(sck::SckCapturer::open(index, fps, output)?))
+fn open(index: u8, fps: u8, max_short: u16, cursor: bool) -> anyhow::Result<Box<dyn Capturer>> {
+    Ok(Box::new(sck::SckCapturer::open(
+        index, fps, max_short, cursor,
+    )?))
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn open(_index: u8, _fps: u8, _output: Output) -> anyhow::Result<Box<dyn Capturer>> {
+fn open(_index: u8, _fps: u8, _max_short: u16, _cursor: bool) -> anyhow::Result<Box<dyn Capturer>> {
     anyhow::bail!("screen capture isn't supported on this platform yet")
 }
 
@@ -717,6 +786,43 @@ mod tests {
             super::nv12_to_bgra((w, h), (&py[..100], 64), (&puv, 64), &mut scratch, &mut got)
                 .is_err()
         );
+    }
+
+    /// 真的采集第 0 个显示器（不会动鼠标）：要带光标的订阅者和不要的共用一路采集，从带光标的那一路拿到画面；
+    /// 没人要了之后那一路清空，不会把过时的画面留给之后再要的。
+    /// `cargo test --lib drawn_channel -- --ignored --nocapture`
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn drawn_channel() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let raw = super::subscribe(0, 30, 1080, false);
+        let drawn = super::subscribe(0, 30, 720, true);
+        assert!(Arc::ptr_eq(&raw.shared, &drawn.shared), "one capture");
+        let (seq, _) = drawn
+            .slot()
+            .wait_change(0, u64::MAX, Duration::from_secs(3), true);
+        assert!(seq > 0, "a frame with the cursor");
+        let (_, d) = drawn.slot().try_newer(0, true).unwrap();
+        let (_, r) = raw.slot().try_newer(0, false).unwrap();
+        println!(
+            "{}x{}, the cursor is drawn on it: {}",
+            d.width,
+            d.height,
+            !Arc::ptr_eq(&d, &r)
+        );
+        drop(drawn);
+        let started = Instant::now();
+        while raw.slot().try_newer(0, true).is_some() {
+            assert!(started.elapsed() < Duration::from_secs(2), "not cleared");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // 不要带光标的画面了：等它的时候不会马上返回（序号是 0）
+        let (seq, _) = raw
+            .slot()
+            .wait_change(0, u64::MAX, Duration::from_millis(50), true);
+        assert_eq!(seq, 0);
     }
 
     /// 发给控制端的说明只有错误码，没有操作系统按本机语言给出的文字

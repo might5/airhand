@@ -1,5 +1,6 @@
 package app.airhand.android.ui.session
 
+import android.content.pm.ActivityInfo
 import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
@@ -54,8 +55,11 @@ import app.airhand.android.AirhandApp
 import app.airhand.android.R
 import app.airhand.android.controller.RemoteSession
 import app.airhand.android.core.Code
+import app.airhand.android.core.DisplayInfo
 import app.airhand.android.ui.Messages
 import app.airhand.android.ui.theme.AirhandTheme
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.launch
 
 /**
@@ -63,12 +67,16 @@ import kotlinx.coroutines.launch
  *
  * 会话本身在 [RemoteSession] 里（属于整个应用），这个界面只是显示它：旋转、弹出键盘都不会重建，
  * 切到后台时会话降到很低的帧率，回来时马上恢复。离开这个界面（确认断开）才结束会话。
+ *
+ * 横屏还是竖屏跟着对方的画面走，手机上可以在菜单里换（见 [ScreenOrientation]）；电视一直横着。
  */
 class SessionActivity : ComponentActivity(), RemoteView.Host {
     private val app get() = AirhandApp.instance
     private var session: RemoteSession? = null
     private lateinit var view: RemoteView
     private val keyboardOpen = mutableStateOf(false)
+    private val orientation = ScreenOrientation()
+    private val landscape = mutableStateOf(true)
 
     override val keyboard = KeyboardController { events -> session?.input(events, true) }
 
@@ -99,6 +107,17 @@ class SessionActivity : ComponentActivity(), RemoteView.Host {
                 showCursor = false
             }
         }
+        // 横竖屏：对方的画面，还没收到画面时用对方当前显示器的尺寸。先按已经知道的定下来，进来时不用再转一次
+        if (!AirhandApp.isTv(this)) {
+            remoteSize(s.videoSize.value, s.displays.value, s.currentDisplay.value)?.let { (w, h) -> orientation.remote(w, h) }
+            applyOrientation()
+            lifecycleScope.launch {
+                combine(s.videoSize, s.displays, s.currentDisplay, ::remoteSize).filterNotNull().collect { (w, h) ->
+                    orientation.remote(w, h)
+                    applyOrientation()
+                }
+            }
+        }
         // 对方复制了文本：已经写进本机剪贴板，提示一下
         lifecycleScope.launch {
             s.clipboardIn.collect { Toast.makeText(this@SessionActivity, R.string.clipboard_received, Toast.LENGTH_SHORT).show() }
@@ -108,10 +127,29 @@ class SessionActivity : ComponentActivity(), RemoteView.Host {
                 if (tv) {
                     TvSession(s, view, onExit = ::exit)
                 } else {
-                    PhoneSession(s, view, keyboard, keyboardOpen, onExit = ::exit)
+                    PhoneSession(s, view, keyboard, keyboardOpen, landscape.value, onRotate = ::rotate, onExit = ::exit)
                 }
             }
         }
+    }
+
+    /** 对方画面的尺寸：收到的画面；还没收到时用对方当前显示器的尺寸 */
+    private fun remoteSize(video: Pair<Int, Int>?, displays: List<DisplayInfo>, current: Int): Pair<Int, Int>? =
+        video ?: displays.firstOrNull { it.index == current }?.let { it.width to it.height }
+
+    private fun applyOrientation() {
+        landscape.value = orientation.landscape
+        requestedOrientation = if (orientation.landscape) {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+        }
+    }
+
+    /** 菜单里的"横屏 / 竖屏"：换到另一个方向 */
+    private fun rotate() {
+        orientation.toggle()
+        applyOrientation()
     }
 
     /** 结束会话并离开 */
@@ -157,7 +195,6 @@ fun SessionStatus(session: RemoteSession, big: Boolean, onExit: () -> Unit): Boo
     val phase by session.phase.collectAsState()
     val video by session.videoSize.collectAsState()
     val name by session.hostName.collectAsState()
-    val safety by session.safety.collectAsState()
     val who = name.ifBlank { Code.format(session.code) }
     LaunchedEffect(phase) { if (phase is RemoteSession.Phase.Closed) onExit() }
 
@@ -165,15 +202,6 @@ fun SessionStatus(session: RemoteSession, big: Boolean, onExit: () -> Unit): Boo
 
     val st: St? = when (val p = phase) {
         RemoteSession.Phase.Connecting -> St(true, ctx.getString(R.string.session_connecting, who), null, false, false, true)
-        // 安全码：对方在请它的用户同意时显示的是同一个，两边可以对一下
-        RemoteSession.Phase.Approving -> St(
-            true,
-            ctx.getString(R.string.approving_title, who),
-            ctx.getString(R.string.approving_text) + (safety?.let { "\n" + ctx.getString(R.string.session_safety, it) } ?: ""),
-            false,
-            false,
-            true,
-        )
         RemoteSession.Phase.Live -> if (video == null) St(true, ctx.getString(R.string.session_waiting_video), null, false, false, false) else null
         is RemoteSession.Phase.Reconnecting -> St(true, ctx.getString(R.string.session_reconnecting), Messages.problem(ctx, p.reason), false, false, true)
         is RemoteSession.Phase.WaitingHost -> St(true, ctx.getString(R.string.session_waiting_host, who), ctx.getString(R.string.session_waiting_host_detail), true, false, true)

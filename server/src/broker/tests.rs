@@ -5,7 +5,7 @@ use airhand_link::Problem;
 use airhand_link::controller::{
     ConnectOptions, ControllerService, Frontend, SessionEvent, SessionUi, UiClosed, establish,
 };
-use airhand_link::host::{Access, Gate, HostStreams, Incoming, Request, Router};
+use airhand_link::host::{Gate, HostStreams, Incoming, Request, Router};
 use airhand_link::lanes::open_lane;
 use airhand_link::net::{LinkConfig, Signal, connect_signal};
 use airhand_link::secure::{self, Identity, Initiator, InitiatorParams};
@@ -26,18 +26,17 @@ use super::registry::MAX_WAITING;
 use super::tokens::{ct_eq, hmac_sha256};
 use super::*;
 
-/// 谁都让进来的被控端（测试用）
-struct OpenGate(Identity);
+mod relay_bench;
 
-impl Gate for OpenGate {
+/// 认得所有控制端的被控端（测试用：省掉配对）
+struct KnownGate(Identity);
+
+impl Gate for KnownGate {
     fn identity(&self) -> Identity {
         self.0.clone()
     }
-    fn access(&self) -> Access {
-        Access::Open
-    }
     fn is_known(&self, _: &PublicKey) -> bool {
-        false
+        true
     }
 }
 
@@ -66,8 +65,8 @@ fn incoming(
         code,
         peer,
         kick,
-        approvals: Default::default(),
         direct: None,
+        file_limit: host.file_limit,
     };
     (inc, kick_tx)
 }
@@ -75,7 +74,8 @@ fn incoming(
 /// 控制端握手的第一条消息（第一次连这个控制码，不配对）
 fn initiate(code: u32) -> (Initiator, Vec<u8>) {
     let me = Identity::generate();
-    let intro = secure::controller_intro("ctl", "test", QualitySettings::default(), false);
+    let intro =
+        secure::controller_intro("ctl", "test", QualitySettings::default(), false, Vec::new());
     secure::initiate(InitiatorParams {
         code,
         me: &me,
@@ -88,7 +88,7 @@ fn initiate(code: u32) -> (Initiator, Vec<u8>) {
 
 /// 回应这个被控端收到的会话请求：端到端握手、打开会话。会话一直开着，直到任务被中止
 fn answer(sig: Signal, code: u32) -> tokio::task::JoinHandle<()> {
-    let gate = OpenGate(Identity::generate());
+    let gate = KnownGate(Identity::generate());
     tokio::spawn(async move {
         let mut sessions = Vec::new();
         let mut buf = Vec::new();
@@ -176,6 +176,7 @@ fn test_config(db: Option<std::path::PathBuf>) -> Config {
         max_conns_per_ip: Config::DEFAULT_MAX_CONNS_PER_IP,
         new_codes_per_ip: 1000,
         connects_per_minute: 1000,
+        file_limit: Some(Config::DEFAULT_FILE_LIMIT),
     }
 }
 
@@ -188,15 +189,20 @@ async fn start_with(db: Option<std::path::PathBuf>) -> (Arc<Broker>, LinkConfig)
     start_cfg(test_config(db)).await
 }
 
-async fn start_cfg(cfg: Config) -> (Arc<Broker>, LinkConfig) {
+fn test_endpoint() -> (quinn::Endpoint, CertificateDer<'static>) {
     let ck = rcgen::generate_simple_self_signed(vec!["airhand".into()]).unwrap();
-    let chain = vec![CertificateDer::from(ck.cert.der().to_vec())];
+    let cert = ck.cert.der().clone();
     let key = PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()).into();
     let endpoint = quinn::Endpoint::server(
-        crate::server_config(chain, key).unwrap(),
+        crate::server_config(vec![cert.clone()], key).unwrap(),
         "127.0.0.1:0".parse().unwrap(),
     )
     .unwrap();
+    (endpoint, cert)
+}
+
+async fn start_cfg(cfg: Config) -> (Arc<Broker>, LinkConfig) {
+    let (endpoint, _) = test_endpoint();
     let server = endpoint.local_addr().unwrap().to_string();
     let broker = Broker::new(cfg).unwrap();
     let b = broker.clone();
@@ -207,6 +213,115 @@ async fn start_cfg(cfg: Config) -> (Arc<Broker>, LinkConfig) {
     });
     let cfg = LinkConfig::new(server, "", "test", "test").unwrap();
     (broker, cfg)
+}
+
+#[tokio::test]
+async fn a_signal_version_mismatch_cannot_register() {
+    let (server, cert) = test_endpoint();
+    let addr = server.local_addr().unwrap();
+    let broker = Broker::new(test_config(None)).unwrap();
+    let b = broker.clone();
+    let task = tokio::spawn(async move {
+        while let Some(c) = server.accept().await {
+            tokio::spawn(b.clone().handle_incoming(c));
+        }
+    });
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert).unwrap();
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    tls.alpn_protocols = vec![airhand_proto::ALPN.to_vec()];
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+
+    for version in [SIGNAL_VERSION - 1, SIGNAL_VERSION + 1] {
+        let conn = client.connect(addr, "airhand").unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let hello = ClientHello {
+            version,
+            ..ClientHello::new(Role::Host, "test".into(), "test".into())
+        };
+        let mut out = framing::encode(&hello);
+        framing::append_msg(
+            &mut out,
+            &ClientMsg::Register {
+                reclaim: None,
+                keep: false,
+                rekey: false,
+            },
+        );
+        send.write_all(&out).await.unwrap();
+        let mut buf = Vec::new();
+        let reply: ServerHello = timeout(
+            Duration::from_secs(2),
+            read_msg(&mut recv, MAX_SIGNAL_MSG, &mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(reply.version, SIGNAL_VERSION);
+        assert!(matches!(
+            timeout(
+                Duration::from_secs(2),
+                read_msg::<_, ServerMsg>(&mut recv, MAX_SIGNAL_MSG, &mut buf)
+            )
+            .await
+            .unwrap(),
+            Ok(None) | Err(_)
+        ));
+        assert_eq!(broker.stats(), (0, 0, 0));
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn the_client_reports_the_servers_signal_version() {
+    let (endpoint, _) = test_endpoint();
+    let cfg = LinkConfig::new(
+        endpoint.local_addr().unwrap().to_string(),
+        "",
+        "test",
+        "test",
+    )
+    .unwrap();
+    let version = SIGNAL_VERSION + 1;
+    let server = async {
+        let conn = endpoint.accept().await.unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+        let mut buf = Vec::new();
+        let request: ClientHello = read_msg(&mut recv, MAX_SIGNAL_MSG, &mut buf)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.version, SIGNAL_VERSION);
+        write_msg(
+            &mut send,
+            &ServerHello {
+                version,
+                file_limit: None,
+            },
+        )
+        .await
+        .unwrap();
+        send.finish().unwrap();
+        let _ = send.stopped().await;
+    };
+    let (client, ()) = timeout(Duration::from_secs(2), async {
+        tokio::join!(connect_signal(&cfg, Role::Controller, None), server)
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(client, Err(Problem::Incompatible { server, client: SIGNAL_VERSION }) if server == version)
+    );
 }
 
 async fn next(sig: &mut Signal) -> ServerMsg {
@@ -322,7 +437,7 @@ async fn blocked_video_lane_does_not_block_control_or_audio() {
     let mut host_control = open_lane(&host.conn, sid, SessionLane::Control)
         .await
         .unwrap();
-    let mut video_tx = open_lane(&host.conn, sid, SessionLane::Video)
+    let mut video_tx = open_lane(&host.conn, sid, SessionLane::Video(0))
         .await
         .unwrap();
     // 控制端从来不读画面通道
@@ -372,7 +487,7 @@ async fn blocked_video_lane_does_not_block_control_or_audio() {
     let grant = ask_with(&mut ctrl, 2, id.code, None, init).await.unwrap();
     let msg = next(&mut host).await;
     let (inc, _kick) = incoming(&host, &host_router, id.code, msg);
-    let gate = OpenGate(Identity::generate());
+    let gate = KnownGate(Identity::generate());
     let (io, link) = tokio::join!(
         HostStreams::open(&inc, 2, 16, &gate),
         establish(&ctrl_router, &ctrl.conn, grant.session_id, initiator)
@@ -545,7 +660,7 @@ async fn unknown_video_codec_does_not_end_the_controller_session() {
     /// 确认在读任务里就交给平台（Ping 也在那里回了）
     struct AckTx(mpsc::UnboundedSender<(u32, u64)>);
     impl Acks for AckTx {
-        fn ack(&self, seq: u32, arrived: u64) {
+        fn ack(&self, _stream: u8, seq: u32, arrived: u64) {
             let _ = self.0.send((seq, arrived));
         }
     }
@@ -564,24 +679,26 @@ async fn unknown_video_codec_does_not_end_the_controller_session() {
         let msg = next(&mut host).await;
         let (inc, _kick) = incoming(&host, &router, id.code, msg);
         let session_id = inc.session_id;
-        let gate = OpenGate(Identity::generate());
+        let gate = KnownGate(Identity::generate());
         let (io, _) = HostStreams::open(&inc, 2, 16, &gate).await.unwrap();
         let (ack_tx, mut acks) = mpsc::unbounded_channel();
         io.incoming.set_acks(Arc::new(AckTx(ack_tx)));
         for seq in [1, 2] {
             let mut header = VideoHeader {
                 seq,
+                stream: 0,
                 key: true,
                 codec: Codec::H264,
                 width: 8,
                 height: 8,
                 capture_us: 0,
+                reference: None,
             }
             .encode();
             if seq == 1 {
                 header[2] = 99;
             }
-            io.video
+            io.video[0]
                 .send(media::frame(&header, &[&[1]]).into())
                 .await
                 .unwrap();
@@ -641,8 +758,115 @@ async fn unknown_video_codec_does_not_end_the_controller_session() {
                 Codec::H264
             }
         );
-        svc.ack(session.sid, seq).unwrap();
+        svc.ack(session.sid, 0, seq).unwrap();
     }
+    host_task.await.unwrap();
+}
+
+/// 多屏：两路画面各走自己的通道经过真的中转（1 号和 3 号通道，服务器不用认识它们），控制端服务各自合并、
+/// 原样交给界面；界面按路确认，被控端收到的确认带着是第几路
+#[tokio::test]
+async fn two_video_streams_travel_through_the_relay() {
+    use airhand_link::host::Acks;
+    use airhand_proto::media::{self, VideoHeader};
+    use airhand_proto::session::Codec;
+    struct Ui(mpsc::UnboundedSender<Vec<u8>>);
+    struct AckTx(mpsc::UnboundedSender<(u8, u32)>);
+    impl Acks for AckTx {
+        fn ack(&self, stream: u8, seq: u32, _arrived: u64) {
+            let _ = self.0.send((stream, seq));
+        }
+    }
+    impl SessionUi for Ui {
+        fn packet(&self, p: Vec<u8>) -> Result<(), UiClosed> {
+            self.0.send(p).map_err(|_| UiClosed)
+        }
+        fn event(&self, _: SessionEvent) -> Result<(), UiClosed> {
+            Ok(())
+        }
+    }
+    let (_broker, cfg) = start().await;
+    let (mut host, id) = register(&cfg, None).await;
+    let host_task = tokio::spawn(async move {
+        let (router, _router) = Router::start(&host.conn);
+        let msg = next(&mut host).await;
+        let (inc, _kick) = incoming(&host, &router, id.code, msg);
+        let session_id = inc.session_id;
+        let gate = KnownGate(Identity::generate());
+        let (io, _) = HostStreams::open(&inc, 2, 16, &gate).await.unwrap();
+        let (ack_tx, mut acks) = mpsc::unbounded_channel();
+        io.incoming.set_acks(Arc::new(AckTx(ack_tx)));
+        for seq in 1..=3u32 {
+            for stream in [1u8, 0] {
+                let header = VideoHeader {
+                    seq,
+                    stream,
+                    key: seq == 1,
+                    codec: Codec::H264,
+                    width: 8 << stream,
+                    height: 8,
+                    capture_us: 0,
+                    reference: (seq > 1).then(|| seq - 1),
+                }
+                .encode();
+                io.video[stream as usize]
+                    .send(media::frame(&header, &[&[stream; 100]]).into())
+                    .await
+                    .unwrap();
+            }
+        }
+        // 每一路都确认到了第 3 帧
+        let mut last = [0u32; 2];
+        while last != [3, 3] {
+            let (stream, seq) = timeout(Duration::from_secs(5), acks.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            last[stream as usize] = last[stream as usize].max(seq);
+        }
+        io.close(session_id, Ok(())).await.unwrap();
+    });
+    let (packets, mut received) = mpsc::unbounded_channel();
+    let svc = ControllerService::start(
+        Arc::new(cfg),
+        tokio::runtime::Handle::current(),
+        Arc::new(|_| {}),
+        Arc::new(|_| {}),
+        Identity::generate(),
+    );
+    let ui = Arc::new(Ui(packets));
+    let session = timeout(Duration::from_secs(5), async {
+        loop {
+            match svc
+                .connect(
+                    &id.code.to_string(),
+                    ConnectOptions::default(),
+                    ui.clone(),
+                    Frontend::Browser,
+                )
+                .await
+            {
+                Err(Problem::NotConnected) => tokio::time::sleep(Duration::from_millis(10)).await,
+                result => break result.unwrap(),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // 每一路各自按顺序到，头里的第几路和负载对得上
+    let mut got: [Vec<u32>; 2] = Default::default();
+    while got[0].len() + got[1].len() < 6 {
+        let packet = timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let h = VideoHeader::decode(&packet).unwrap();
+        assert_eq!(h.width, 8 << h.stream);
+        assert_eq!(media::payload(&packet).unwrap()[0], h.stream);
+        got[h.stream as usize].push(h.seq);
+        svc.ack(session.sid, h.stream, h.seq).unwrap();
+    }
+    assert_eq!(got, [vec![1, 2, 3], vec![1, 2, 3]]);
     host_task.await.unwrap();
 }
 
@@ -729,7 +953,7 @@ async fn session_lane_limits_reject_oversized_control_and_wrong_lanes() {
         let grant = ask_with(&mut ctrl, 1, id.code, None, init).await.unwrap();
         let msg = next(&mut host).await;
         let (inc, _kick) = incoming(&host, &host_router, id.code, msg);
-        let gate = OpenGate(Identity::generate());
+        let gate = KnownGate(Identity::generate());
         let (host_io, link) = tokio::join!(
             HostStreams::open(&inc, 2, 16, &gate),
             establish(&ctrl_router, &ctrl.conn, grant.session_id, initiator)
@@ -747,7 +971,10 @@ async fn session_lane_limits_reject_oversized_control_and_wrong_lanes() {
         assert!(matches!(req, Request::Clipboard(ref t) if *t == text));
         if wrong_lane {
             // 已知消息发到错误通道，即使密文认证成功也应拒绝。
-            let keyframe = ControllerMsg::RequestKeyframe { after: 1 };
+            let keyframe = ControllerMsg::RequestKeyframe {
+                after: 1,
+                stream: 0,
+            };
             assert_eq!(keyframe.lane(), SessionLane::Control);
             let mut frame = framing::encode(&keyframe);
             link.bulk.1.seal_frame(&mut frame).unwrap();
@@ -944,14 +1171,7 @@ async fn host_service_retries_an_unanswered_rekey() {
         fn offline(&self) {}
     }
     // 只会说信令的假服务器
-    let ck = rcgen::generate_simple_self_signed(vec!["airhand".into()]).unwrap();
-    let chain = vec![CertificateDer::from(ck.cert.der().to_vec())];
-    let key = PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()).into();
-    let endpoint = quinn::Endpoint::server(
-        crate::server_config(chain, key).unwrap(),
-        "127.0.0.1:0".parse().unwrap(),
-    )
-    .unwrap();
+    let (endpoint, _) = test_endpoint();
     let cfg = LinkConfig::new(endpoint.local_addr().unwrap().to_string(), "", "t", "t").unwrap();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     // 不保存控制码的被控端
@@ -979,11 +1199,8 @@ async fn host_service_retries_an_unanswered_rekey() {
         );
         let hello: ClientHello = airhand_proto::framing::decode_known(&buf).unwrap();
         assert_eq!(hello.role, Role::Host);
-        let answer = ServerHello::answer(hello.versions(), airhand_proto::Features::NONE);
-        assert!(answer.version.is_some());
-        write_frame(&mut send, &airhand_proto::framing::to_vec(&answer))
-            .await
-            .unwrap();
+        assert_eq!(hello.version, SIGNAL_VERSION);
+        write_msg(&mut send, &ServerHello::new(None)).await.unwrap();
         let reg: ClientMsg = read_msg(&mut recv, MAX_SIGNAL_MSG, &mut buf)
             .await
             .unwrap()
@@ -1157,24 +1374,20 @@ async fn a_host_that_isnt_ready_is_answered_like_an_unknown_code() {
     assert_eq!(broker.failure_count(ip), 2);
 }
 
-/// 服务器不管会话有几条通道、各是什么：以后新加的通道（这里是 5 号）照样转给另一端；
-/// 同一端把同一条通道开两次的拒绝；任何一端的控制通道结束，整个会话结束，其它通道随之断开
+/// 未知通道和重复常驻流都被拒绝。控制通道结束时，其他通道随会话一起关闭。
 #[tokio::test]
-async fn lanes_the_server_has_never_heard_of_are_relayed() {
+async fn unknown_lanes_and_duplicate_persistent_streams_are_rejected() {
     use airhand_proto::SessionHeader;
     let (broker, cfg) = start().await;
     let (mut host, id) = register(&cfg, None).await;
     let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
     let sid = ask(&mut ctrl, 1, id.code, None).await.unwrap().session_id;
     assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
-    let lane = async |conn: &quinn::Connection, lane: u8| {
+    let lane = async |conn: &quinn::Connection, lane: SessionLane| {
         let mut send = conn.open_uni().await.unwrap();
-        let h = SessionHeader {
-            session_id: sid,
-            lane,
-            priority: 3,
-        };
-        send.write_all(&h.encode()).await.unwrap();
+        send.write_all(&SessionHeader::new(sid, lane).encode())
+            .await
+            .unwrap();
         send
     };
     // 另一端收到的：同样的会话头，然后是数据
@@ -1187,22 +1400,33 @@ async fn lanes_the_server_has_never_heard_of_are_relayed() {
         recv.read_exact(&mut hdr).await.unwrap();
         (SessionHeader::decode(&hdr).unwrap(), recv)
     };
-    // 新的通道：不用等控制通道，另一端马上收到
-    let mut h5 = lane(&host.conn, 5).await;
-    h5.write_all(b"future lane").await.unwrap();
-    let (h, mut c5) = accept(&ctrl.conn).await;
-    assert_eq!((h.session_id, h.lane, h.priority), (sid, 5, 3));
-    let mut buf = [0u8; 11];
-    timeout(Duration::from_secs(2), c5.read_exact(&mut buf))
+    let mut unknown = host.conn.open_uni().await.unwrap();
+    let mut header = SessionHeader::new(sid, SessionLane::Bulk).encode();
+    header[SessionHeader::LEN - 1] = u8::MAX;
+    unknown.write_all(&header).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), unknown.stopped())
+            .await
+            .unwrap()
+            .unwrap(),
+        Some(VarInt::from_u32(1))
+    );
+    // 大块流不用等控制通道，另一端马上收到。
+    let mut bulk = lane(&host.conn, SessionLane::Bulk).await;
+    bulk.write_all(b"bulk message").await.unwrap();
+    let (h, mut bulk_recv) = accept(&ctrl.conn).await;
+    assert_eq!(h, SessionHeader::new(sid, SessionLane::Bulk));
+    let mut buf = [0u8; 12];
+    timeout(Duration::from_secs(2), bulk_recv.read_exact(&mut buf))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(&buf, b"future lane");
-    let hc = lane(&host.conn, SessionLane::Control as u8).await;
-    let mut cc = lane(&ctrl.conn, SessionLane::Control as u8).await;
+    assert_eq!(&buf, b"bulk message");
+    let hc = lane(&host.conn, SessionLane::Control).await;
+    let mut cc = lane(&ctrl.conn, SessionLane::Control).await;
     cc.write_all(b"ping").await.unwrap();
     let (h, mut hcr) = accept(&host.conn).await;
-    assert_eq!(h.lane, SessionLane::Control as u8);
+    assert_eq!(h.lane, SessionLane::Control);
     let mut b4 = [0u8; 4];
     timeout(Duration::from_secs(2), hcr.read_exact(&mut b4))
         .await
@@ -1210,13 +1434,13 @@ async fn lanes_the_server_has_never_heard_of_are_relayed() {
         .unwrap();
     assert_eq!(&b4, b"ping");
     let (_, _ccr) = accept(&ctrl.conn).await;
-    // 同一端再开一次 5 号通道：拒绝
-    let dup = lane(&host.conn, 5).await;
-    assert!(
+    let dup = lane(&host.conn, SessionLane::Bulk).await;
+    assert_eq!(
         timeout(Duration::from_secs(2), dup.stopped())
             .await
             .unwrap()
-            .is_ok()
+            .unwrap(),
+        Some(VarInt::from_u32(1))
     );
     assert!(broker.sessions.lock().contains_key(&sid));
     // 一端的控制通道结束：整个会话结束，别的通道随之断开
@@ -1226,12 +1450,201 @@ async fn lanes_the_server_has_never_heard_of_are_relayed() {
     })
     .await;
     assert!(
-        timeout(Duration::from_secs(2), c5.read(&mut buf))
+        timeout(Duration::from_secs(2), bulk_recv.read(&mut buf))
             .await
             .unwrap()
             .is_err()
     );
     drop(cc);
+}
+
+/// 同一个视频通道可以打开多条帧流，每条独立转发和 reset。
+#[tokio::test]
+async fn frame_streams_are_relayed_one_frame_each() {
+    use airhand_proto::{MAX_FRAME_STREAMS, SessionHeader};
+    let (broker, cfg) = start().await;
+    let (mut host, id) = register(&cfg, None).await;
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
+    let sid = ask(&mut ctrl, 1, id.code, None).await.unwrap().session_id;
+    assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
+    let frame = async |lane: SessionLane, body: &[u8]| {
+        let mut send = open_lane(&host.conn, sid, lane).await.unwrap();
+        send.write_all(body).await.unwrap();
+        send
+    };
+    let accept = async || {
+        let mut recv = timeout(Duration::from_secs(2), ctrl.conn.accept_uni())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut hdr = [0u8; SessionHeader::LEN];
+        recv.read_exact(&mut hdr).await.unwrap();
+        (SessionHeader::decode(&hdr).unwrap(), recv)
+    };
+    // 两条画面的帧流：另一端各收到一条，会话头一样。
+    for body in [&b"first"[..], b"second"] {
+        let mut s = frame(SessionLane::Video(0), body).await;
+        s.finish().unwrap();
+        let (h, mut r) = accept().await;
+        assert_eq!(h, SessionHeader::new(sid, SessionLane::Video(0)));
+        let got = timeout(Duration::from_secs(2), r.read_to_end(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, body);
+    }
+    // 放弃了的帧流：另一端读到一半就断了
+    let mut abandoned = frame(SessionLane::Video(0), b"stale").await;
+    let (_, mut r) = accept().await;
+    let mut b = [0u8; 5];
+    timeout(Duration::from_secs(2), r.read_exact(&mut b))
+        .await
+        .unwrap()
+        .unwrap();
+    abandoned.reset(VarInt::from_u32(0)).unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), r.read_to_end(64))
+            .await
+            .unwrap(),
+        Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(_)))
+    ));
+    // 同时开着的帧流有上限
+    wait_until("the finished frame streams are gone", || {
+        broker.host_frame_streams(sid) == 0
+    })
+    .await;
+    let mut open = Vec::new();
+    for _ in 0..MAX_FRAME_STREAMS {
+        open.push(frame(SessionLane::Video(0), b"x").await);
+    }
+    wait_until("all frame streams are relayed", || {
+        broker.host_frame_streams(sid) == MAX_FRAME_STREAMS
+    })
+    .await;
+    let over = frame(SessionLane::Video(0), b"x").await;
+    assert!(
+        timeout(Duration::from_secs(2), over.stopped())
+            .await
+            .unwrap()
+            .is_ok()
+    );
+    // 结束了一条：又能开了
+    let mut done = open.pop().unwrap();
+    done.finish().unwrap();
+    wait_until("a frame stream finished", || {
+        broker.host_frame_streams(sid) < MAX_FRAME_STREAMS
+    })
+    .await;
+    assert!(broker.sessions.lock().contains_key(&sid));
+    drop(open);
+}
+
+/// 文件流不能超过换算成线上的限额；取消错误码应透传，即使文件发送方正在等待。
+#[tokio::test]
+async fn file_streams_are_limited_by_the_relay() {
+    use airhand_proto::SessionHeader;
+    use airhand_proto::files::{reset, wire_size};
+    const LIMIT: u64 = 1000;
+    let (broker, cfg) = start_cfg(Config {
+        file_limit: Some(LIMIT),
+        ..test_config(None)
+    })
+    .await;
+    let (mut host, id) = register(&cfg, None).await;
+    assert_eq!(host.file_limit, Some(LIMIT));
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
+    assert_eq!(ctrl.file_limit, Some(LIMIT));
+    let sid = ask(&mut ctrl, 1, id.code, None).await.unwrap().session_id;
+    assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
+    let open = async |header: SessionHeader| {
+        let mut send = host.conn.open_uni().await.unwrap();
+        send.write_all(&header.encode()).await.unwrap();
+        send
+    };
+    let accept = async || {
+        let mut recv = timeout(Duration::from_secs(2), ctrl.conn.accept_uni())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut hdr = [0u8; SessionHeader::LEN];
+        recv.read_exact(&mut hdr).await.unwrap();
+        (SessionHeader::decode(&hdr).unwrap(), recv)
+    };
+    let file = SessionHeader::new(sid, SessionLane::File);
+    // 正好是上限：转过去
+    let body = vec![7u8; wire_size(LIMIT) as usize];
+    let mut s = open(file).await;
+    s.write_all(&body).await.unwrap();
+    s.finish().unwrap();
+    let (h, mut r) = accept().await;
+    assert_eq!(h, file);
+    let got = timeout(Duration::from_secs(2), r.read_to_end(1 << 20))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, body);
+    wait_until("the relayed bytes are counted", || {
+        broker.session_file_bytes(sid) == body.len() as u64
+    })
+    .await;
+    // 多一个字节：两头都 reset，错误码说明原因
+    let mut s = open(file).await;
+    let (_, mut r) = accept_after(&mut s, &body, &accept).await;
+    let _ = s.write_all(&[1]).await;
+    let read = timeout(Duration::from_secs(2), r.read_to_end(1 << 20))
+        .await
+        .unwrap();
+    assert!(
+        matches!(read, Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(c))) if c == VarInt::from_u32(reset::RELAY_LIMIT)),
+        "{read:?}"
+    );
+    let stopped = timeout(Duration::from_secs(2), s.stopped()).await.unwrap();
+    assert_eq!(stopped.unwrap(), Some(VarInt::from_u32(reset::RELAY_LIMIT)));
+    // 取的一方叫停：发送端不再写新数据，也应立即看到同一个错误码。
+    let mut s = open(file).await;
+    let (_, mut r) = accept_after(&mut s, b"part", &accept).await;
+    r.stop(VarInt::from_u32(reset::CANCELLED)).unwrap();
+    let stopped = timeout(Duration::from_secs(2), s.stopped()).await.unwrap();
+    assert_eq!(stopped.unwrap(), Some(VarInt::from_u32(reset::CANCELLED)));
+    assert!(broker.sessions.lock().contains_key(&sid));
+
+    // 上限是 0：不转文件流
+    let (_broker, cfg) = start_cfg(Config {
+        file_limit: Some(0),
+        ..test_config(None)
+    })
+    .await;
+    let (mut host, id) = register(&cfg, None).await;
+    assert_eq!(host.file_limit, Some(0));
+    let mut ctrl = connect_signal(&cfg, Role::Controller, None).await.unwrap();
+    let sid = ask(&mut ctrl, 1, id.code, None).await.unwrap().session_id;
+    assert!(matches!(next(&mut host).await, ServerMsg::Incoming { .. }));
+    let mut s = host.conn.open_uni().await.unwrap();
+    s.write_all(&SessionHeader::new(sid, SessionLane::File).encode())
+        .await
+        .unwrap();
+    let stopped = timeout(Duration::from_secs(2), s.stopped()).await.unwrap();
+    assert_eq!(stopped.unwrap(), Some(VarInt::from_u32(reset::RELAY_LIMIT)));
+}
+
+/// 写完 `body`（不结束），等另一端接到这条流、读完这些字节
+async fn accept_after<F, Fut>(
+    s: &mut quinn::SendStream,
+    body: &[u8],
+    accept: &F,
+) -> (airhand_proto::SessionHeader, quinn::RecvStream)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = (airhand_proto::SessionHeader, quinn::RecvStream)>,
+{
+    s.write_all(body).await.unwrap();
+    let (h, mut r) = accept().await;
+    let mut got = vec![0u8; body.len()];
+    timeout(Duration::from_secs(2), r.read_exact(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    (h, r)
 }
 
 /// 数据报按开头的会话 ID 在会话的两端之间转发（服务器批准了就转，不用等通道）；不是这个会话的连接发的、
@@ -1338,7 +1751,7 @@ async fn controller_service_gets_audio_over_datagrams() {
             }
         }
     };
-    let gate = OpenGate(Identity::generate());
+    let gate = KnownGate(Identity::generate());
     let (router, _router) = Router::start(&host.conn);
     let accepting = async {
         let msg = next(&mut host).await;
@@ -1376,6 +1789,188 @@ async fn controller_service_gets_audio_over_datagrams() {
     drop(session);
 }
 
+/// 剪贴板里的文件经过中转，两个方向：被控端复制、控制端（网页版那样由界面取）粘贴；控制端复制、被控端粘贴。
+/// 控制端刚公告了文件时，之后的输入等被控端放好了才发；一次粘贴超过中转的上限时读不了，控制端的界面知道为什么
+#[tokio::test]
+async fn clipboard_files_cross_the_relay_both_ways() {
+    use airhand_link::controller::Command;
+    use airhand_link::files::{LocalFs, RemoteFile};
+    use airhand_proto::files::{FileError, FileKind};
+    use airhand_proto::session::InputEvent;
+    struct Ui(mpsc::UnboundedSender<SessionEvent>);
+    impl SessionUi for Ui {
+        fn packet(&self, _: Vec<u8>) -> Result<(), UiClosed> {
+            Ok(())
+        }
+        fn event(&self, e: SessionEvent) -> Result<(), UiClosed> {
+            let _ = self.0.send(e);
+            Ok(())
+        }
+    }
+    async fn read_all(f: &mut RemoteFile) -> Result<Vec<u8>, FileError> {
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = timeout(Duration::from_secs(10), f.read(&mut buf))
+                .await
+                .expect("reading timed out")?;
+            if n == 0 {
+                return Ok(out);
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "airhand-relay-files-{}-{}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    std::fs::create_dir_all(dir.join("folder").join("sub")).unwrap();
+    let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir.join("folder").join("sub").join("big.bin"), &big).unwrap();
+    std::fs::write(dir.join("folder").join("a.txt"), b"from the host").unwrap();
+    std::fs::write(dir.join("note.txt"), b"from the controller").unwrap();
+
+    // 中转的上限：文件夹不到它，大的那个单独复制时超过它
+    let (_broker, cfg) = start_cfg(Config {
+        file_limit: Some(400_000),
+        ..test_config(None)
+    })
+    .await;
+    let (mut host, id) = register(&cfg, None).await;
+    let svc = ControllerService::start(
+        Arc::new(cfg.clone()),
+        tokio::runtime::Handle::current(),
+        Arc::new(|_| {}),
+        Arc::new(|_| {}),
+        Identity::generate(),
+    );
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let ui = Arc::new(Ui(tx));
+    let code = id.code.to_string();
+    let connecting = async {
+        loop {
+            let r = svc
+                .connect(
+                    &code,
+                    ConnectOptions::default(),
+                    ui.clone(),
+                    Frontend::Browser,
+                )
+                .await;
+            match r {
+                Err(Problem::NotConnected) => tokio::time::sleep(Duration::from_millis(20)).await,
+                r => break r,
+            }
+        }
+    };
+    let gate = KnownGate(Identity::generate());
+    let (router, _router) = Router::start(&host.conn);
+    let accepting = async {
+        let msg = next(&mut host).await;
+        let (inc, kick) = incoming(&host, &router, id.code, msg);
+        let (s, _) = HostStreams::open(&inc, 2, 16, &gate).await.unwrap();
+        (s, kick)
+    };
+    let (info, (mut session, _kick)) = tokio::join!(connecting, accepting);
+    let sid = info.unwrap().sid;
+    let host_files = session
+        .files
+        .clone()
+        .expect("both ends support clipboard files");
+    let next_event = async |events: &mut mpsc::UnboundedReceiver<SessionEvent>,
+                            f: &dyn Fn(&SessionEvent) -> bool| {
+        loop {
+            let e = timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("no event")
+                .unwrap();
+            if f(&e) {
+                return e;
+            }
+        }
+    };
+
+    // 被控端复制了一个文件夹：界面只收到清单，要内容时去取
+    host_files.offer(Arc::new(LocalFs::new(&[dir.join("folder")])));
+    let SessionEvent::ClipboardFiles { clip, items } = next_event(&mut events, &|e| {
+        matches!(e, SessionEvent::ClipboardFiles { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!((items[0].name(), items[0].kind), ("folder", FileKind::Dir));
+    let offer = svc.remote_files(sid, clip).unwrap();
+    let tree = offer.list(&["folder".to_string()], true).await.unwrap();
+    let files: Vec<_> = tree.iter().filter(|e| e.kind == FileKind::File).collect();
+    assert_eq!(files.len(), 2);
+    for e in files {
+        let mut path = vec!["folder".to_string()];
+        path.extend(e.path.iter().cloned());
+        let mut f = offer.open(path, e.size, e.mtime);
+        let got = read_all(&mut f).await.unwrap();
+        let want = std::fs::read(dir.join("folder").join(e.path.join("/"))).unwrap();
+        assert!(got == want, "{:?}", e.path);
+    }
+
+    // 控制端复制了一个文件：被控端的平台收到公告；它放好之前，控制端的输入扣着
+    svc.offer_files(sid, Arc::new(LocalFs::new(&[dir.join("note.txt")])))
+        .unwrap();
+    svc.command(Command::Input {
+        sid,
+        events: vec![InputEvent::Text { text: "v".into() }],
+    })
+    .unwrap();
+    let offer = match timeout(Duration::from_secs(5), session.incoming.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        Request::ClipboardFiles(offer) => offer,
+        other => panic!("the input overtook the offer: {other:?}"),
+    };
+    assert!(
+        timeout(Duration::from_millis(300), session.incoming.recv())
+            .await
+            .is_err(),
+        "the input wasn't held back"
+    );
+    offer.ready();
+    assert!(matches!(
+        timeout(Duration::from_secs(5), session.incoming.recv()).await,
+        Ok(Some(Request::Input(_)))
+    ));
+    let item = offer.items()[0].clone();
+    let mut f = offer.open(item.path.clone(), item.size, item.mtime);
+    assert_eq!(read_all(&mut f).await.unwrap(), b"from the controller");
+
+    // 只有中转、一次粘贴超过了上限：取不到，控制端的界面知道为什么
+    std::fs::write(dir.join("huge.bin"), vec![1u8; 500_000]).unwrap();
+    host_files.offer(Arc::new(LocalFs::new(&[dir.join("huge.bin")])));
+    let SessionEvent::ClipboardFiles { clip, items } = next_event(&mut events, &|e| {
+        matches!(e, SessionEvent::ClipboardFiles { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let offer = svc.remote_files(sid, clip).unwrap();
+    let mut f = offer.open(items[0].path.clone(), items[0].size, items[0].mtime);
+    assert_eq!(read_all(&mut f).await, Err(FileError::TooLarge));
+    let e = next_event(&mut events, &|e| {
+        matches!(e, SessionEvent::FileError { .. })
+    })
+    .await;
+    assert!(
+        matches!(&e, SessionEvent::FileError { name, error: FileError::TooLarge } if name == "huge.bin"),
+        "{e:?}"
+    );
+    drop(session);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// 新分配的控制码按来源限量；取回自己原来的控制码不算
 #[tokio::test]
 async fn new_codes_are_limited_per_network() {
@@ -1409,8 +2004,8 @@ async fn new_codes_are_limited_per_network() {
     assert_eq!(back, a);
 }
 
-/// 控制码对了的连接请求也限速（按来源和控制码），不然知道控制码的人反复发起连接，就能一直占满被控端的会话槽位、
-/// 让它不停地问本机用户。带凭证的也算，换一条连接也一样；被拒绝的请求到不了被控端、不占槽位、不算猜错；
+/// 控制码对了的连接请求也限速（按来源和控制码），不然知道控制码的人反复发起连接，就能一直占满被控端的会话槽位。
+/// 带凭证的也算，换一条连接也一样；被拒绝的请求到不了被控端、不占槽位、不算猜错；
 /// 别的被控端不受影响
 #[tokio::test]
 async fn sessions_are_limited_per_source_and_code() {
@@ -1568,7 +2163,7 @@ async fn video_takes_the_direct_path_and_falls_back_to_the_relay() {
         changed: AtomicU32,
     }
     impl Acks for Paths {
-        fn ack(&self, _: u32, _: u64) {}
+        fn ack(&self, _: u8, _: u32, _: u64) {}
         fn path_changed(&self, lost: bool) {
             self.changed.fetch_add(1, Ordering::Relaxed);
             if lost {
@@ -1614,7 +2209,7 @@ async fn video_takes_the_direct_path_and_falls_back_to_the_relay() {
             }
         }
     };
-    let gate = OpenGate(Identity::generate());
+    let gate = KnownGate(Identity::generate());
     let host_endpoint = host.endpoint.local_addr().unwrap();
     let accepting = async {
         let msg = next(&mut host).await;
@@ -1660,14 +2255,16 @@ async fn video_takes_the_direct_path_and_falls_back_to_the_relay() {
                         seq += 1;
                         let header = VideoHeader {
                             seq,
+                            stream: 0,
                             key: std::mem::take(&mut key),
                             codec: Codec::H264,
                             width: 8,
                             height: 8,
                             capture_us: 0,
+                            reference: None,
                         }
                         .encode();
-                        io.video
+                        io.video[0]
                             .send(media::frame(&header, &[&[0; 600]]).into())
                             .await
                             .unwrap();
@@ -1704,7 +2301,7 @@ async fn video_takes_the_direct_path_and_falls_back_to_the_relay() {
                 );
                 last = h.seq;
                 frames.fetch_add(1, Ordering::Relaxed);
-                let _ = svc.ack(sid, h.seq);
+                let _ = svc.ack(sid, 0, h.seq);
             }
         })
     };

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use crate::wire::read_frame;
 use airhand_proto::framing;
 use airhand_proto::signal::{ClientHello, ClientMsg, ServerHello};
-use airhand_proto::{ALPN, Features, MAX_SIGNAL_MSG, Role, SIGNAL_MIN, SIGNAL_VERSION};
+use airhand_proto::{ALPN, MAX_SIGNAL_MSG, Role, SIGNAL_VERSION};
 use anyhow::{Context, Result, anyhow, bail};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{
@@ -200,29 +200,31 @@ pub struct Signal {
     pub conn: Connection,
     pub send: SendStream,
     pub recv: RecvStream,
-    /// 和服务器商定的信令版本，双方都支持的信令能力位（见 `airhand_proto::signal` 的"版本握手"）
-    pub version: u16,
-    pub features: Features,
+    /// 一次粘贴经中转最多传多少（剪贴板里的文件，见 `airhand_proto::files`）：`None` 不限
+    pub file_limit: Option<u64>,
     /// 连服务器的 endpoint：直连也用它（同一个 socket，见模块说明的"直连"）
     pub endpoint: Endpoint,
     /// 从这个 socket 发打洞包
     pub punch: Punch,
 }
 
+/// 数据报的发送缓冲（见 [`transport_config`]），直连也一样
+pub(crate) const DATAGRAM_SEND_BUFFER: usize = 16 * 1024;
+
 pub fn transport_config() -> TransportConfig {
     let mut t = TransportConfig::default();
-    // 服务器不开双向流（信令流是客户端开的）；会话的通道是服务器转过来的单向流，每个会话每端几条
+    // 服务器不开双向流（信令流是客户端开的）；会话的通道是服务器转过来的单向流，每个会话每端几条，
+    // 画面每帧一条（见 airhand_proto::session 的"帧流"），控制台同时开着好几个会话
     t.max_concurrent_bidi_streams(VarInt::from_u32(0));
-    t.max_concurrent_uni_streams(VarInt::from_u32(256));
+    t.max_concurrent_uni_streams(VarInt::from_u32(1024));
     // 短保活间隔：既能防止 NAT 映射过期，也能让掉线在 10 秒内被发现并重连
     t.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
     t.keep_alive_interval(Some(Duration::from_secs(2)));
     t.stream_receive_window(VarInt::from_u32(16 * 1024 * 1024));
     t.receive_window(VarInt::from_u32(64 * 1024 * 1024));
     t.send_window(64 * 1024 * 1024);
-    // 声音数据报（带着之前两包的副本，约 40 KB/s）：网络跟不上时宁可丢掉旧的，也不要在发送缓冲里越积越晚
-    // （缓冲满了 quinn 丢最旧的）
-    t.datagram_send_buffer_size(64 * 1024);
+    // 限制声音和控制数据报的排队时延。
+    t.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
     t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     t
 }
@@ -330,7 +332,7 @@ async fn attempt(
     Ok((endpoint, punch, conn, fp))
 }
 
-/// Happy Eyeballs（RFC 8305）：按顺序每隔 [`STAGGER`] 多试一个地址（前一个失败了马上试下一个），
+/// Happy Eyeballs（RFC 8305）：按顺序每隔 250 ms 多试一个地址（前一个失败了马上试下一个），
 /// 先连上的胜出，其余的取消
 async fn connect_any(
     server: &str,
@@ -420,9 +422,9 @@ async fn handshake(
         connect_any(&cfg.server, addrs, sni, expected, mismatch).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
     let hello = ClientHello::new(role, cfg.name.clone(), cfg.os.clone());
-    let mut out = framing::frame(&framing::to_vec(&hello));
+    let mut out = framing::encode(&hello);
     if let Some(m) = first {
-        out.extend(framing::encode(m));
+        framing::append_msg(&mut out, m);
     }
     send.write_all(&out).await?;
     let mut buf = Vec::new();
@@ -442,37 +444,21 @@ async fn handshake(
         info!(server = %cfg.server, fingerprint = %format_fingerprint(&fp), "first connection to this server, remembering its certificate");
         store.save(&cfg.server, fp);
     }
-    let Some(version) = resp.version else {
-        return Err(incompatible(resp.min, resp.max).into());
-    };
-    anyhow::ensure!(
-        (SIGNAL_MIN..=SIGNAL_VERSION).contains(&version),
-        "the server chose signal version {version}, which we can't speak"
-    );
+    if resp.version != SIGNAL_VERSION {
+        return Err(Problem::Incompatible {
+            server: resp.version,
+            client: SIGNAL_VERSION,
+        }
+        .into());
+    }
     Ok(Signal {
         conn,
         send,
         recv,
-        version,
-        features: resp.features.common(hello.features),
+        file_limit: resp.file_limit,
         endpoint,
         punch,
     })
-}
-
-/// 服务器能说 `min..=max`，和本端没有交集：谁太旧了（`server` 比 `client` 大就是客户端该更新）
-fn incompatible(min: u16, max: u16) -> Problem {
-    if max < SIGNAL_MIN {
-        Problem::Incompatible {
-            server: max,
-            client: SIGNAL_MIN,
-        }
-    } else {
-        Problem::Incompatible {
-            server: min,
-            client: SIGNAL_VERSION,
-        }
-    }
 }
 
 /// 证书固定校验器：只比较叶子证书的 SHA-256 指纹，但仍然校验 TLS 1.3 握手签名。

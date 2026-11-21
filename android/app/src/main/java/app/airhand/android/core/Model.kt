@@ -20,21 +20,6 @@ enum class Codec(val id: Int, val wire: String, val mime: String, val label: Str
     }
 }
 
-/**
- * 被控端（电脑）缩小画面时优先什么，与 Rust 的 `airhand_proto::session::VideoPriority` 对应：
- * 低延迟（默认）在对方的显卡上缩放，画面不经过 CPU；文字清晰在对方的 CPU 上用更锐利的算法缩放，延迟和 CPU 占用更高。
- * 不需要缩放时两者一样；被控端是手机时没有区别
- */
-enum class VideoPriority(val wire: String) {
-    LATENCY("latency"),
-    CLARITY("clarity");
-
-    companion object {
-        /** 不认识的、没有的（之前的版本）都是低延迟 */
-        fun fromWire(s: String?): VideoPriority = entries.firstOrNull { it.wire == s } ?: LATENCY
-    }
-}
-
 /** 画质设置，与 `QualitySettings` 对应（JSON 是 camelCase，和其它界面 JSON 一样） */
 data class Quality(
     val fps: Int,
@@ -42,16 +27,13 @@ data class Quality(
     val maxShort: Int,
     val adaptive: Boolean = true,
     val codec: Codec = Codec.H264,
-    val priority: VideoPriority = VideoPriority.LATENCY,
 ) {
-    /** 低延迟（默认）不写：和 Rust 一样，没有这一项就是低延迟 */
     fun toJson(): JSONObject = JSONObject()
         .put("fps", fps)
         .put("bitrateKbps", kbps)
         .put("maxShort", maxShort)
         .put("adaptive", adaptive)
         .put("codec", codec.wire)
-        .apply { if (priority != VideoPriority.LATENCY) put("priority", priority.wire) }
 }
 
 /** 画质预设：与桌面控制台（client/src/lib/presets.ts）相同 */
@@ -62,7 +44,8 @@ enum class Preset(val id: String, val fps: Int, val kbps: Int, val maxShort: Int
     HD("hd", 60, 16000, 1440),
     NATIVE("native", 60, 30000, 0);
 
-    fun quality(codec: Codec, priority: VideoPriority = VideoPriority.LATENCY) = Quality(fps, kbps, maxShort, true, codec, priority)
+    fun quality(codec: Codec) =
+        Quality(fps, kbps, maxShort, true, codec)
 
     companion object {
         val DEFAULT = BALANCED
@@ -178,8 +161,17 @@ data class EncoderInfo(val codec: Codec, val name: String, val hardware: Boolean
 /** 被控端发来的提示（`NoticeView`） */
 data class Notice(val kind: String, val detail: String? = null, val screen: Boolean = false, val input: Boolean = false)
 
-/** `direct`：画面是从直连来的（两台设备之间打通的路，不经过服务器），否则经过中转 */
-data class Stats(val fps: Float, val kbps: Float, val rttMs: Float?, val width: Int, val height: Int, val direct: Boolean)
+/**
+ * `direct`：画面是从直连来的（两台设备之间打通的路，不经过服务器），否则经过中转。
+ */
+data class Stats(
+    val fps: Float,
+    val kbps: Float,
+    val rttMs: Float?,
+    val width: Int,
+    val height: Int,
+    val direct: Boolean,
+)
 
 /**
  * 被控端是哪种系统：决定默认的操作方式、快捷键和导航键。

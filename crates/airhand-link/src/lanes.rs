@@ -6,7 +6,10 @@
 //! 直连上由 [`accept_direct`] 做（一条直连只属于一个会话）。数据报也一样按会话 ID 和种类分发。
 //!
 //! 一个会话在收的一端是一个 [`Inbox`]：每条通道一个信箱（中转、直连上来的流都放进来，交给 [`crate::merge::Merge`]
-//! 合并），声音、控制数据报各一个信箱。往里放东西的是 [`Feed`]（两条路各拿一个）。
+//! 合并），声音、控制数据报各一个信箱。
+//! 往里放东西的是 [`Feed`]（两条路各拿一个）。
+//!
+//! 视频每帧一条单向流，同一路视频的帧流进入同一个信箱。
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -18,7 +21,6 @@ use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tracing::debug;
 
 use crate::tasks::OwnedTask;
 
@@ -30,8 +32,14 @@ pub enum Via {
     Direct = 1,
 }
 
-/// 一条通道的流：中转上的一条，直连上的（每次直连通了一条）
-pub type LaneStreams = mpsc::UnboundedReceiver<(RecvStream, Via)>;
+/// 对方开过来的一条流
+pub struct LaneStream {
+    pub recv: RecvStream,
+    pub via: Via,
+}
+
+/// 一条通道的流：中转上的一条，直连上的（每次直连通了一条），还有帧流
+pub type LaneStreams = mpsc::UnboundedReceiver<LaneStream>;
 
 /// 每个会话最多排着这么多个还没交出去的声音数据报。再多就丢：本来就可能丢
 const AUDIO_QUEUE: usize = 16;
@@ -46,7 +54,8 @@ const EARLY_TTL: Duration = Duration::from_secs(10);
 /// 往一个会话放东西（见模块说明）
 #[derive(Clone)]
 pub struct Feed {
-    lanes: [mpsc::UnboundedSender<(RecvStream, Via)>; SessionLane::ALL.len()],
+    /// 按通道的编号（[`SessionLane::number`]）
+    lanes: [mpsc::UnboundedSender<LaneStream>; SessionLane::COUNT],
     audio: mpsc::Sender<Bytes>,
     control: mpsc::Sender<(Via, Bytes)>,
 }
@@ -54,8 +63,11 @@ pub struct Feed {
 /// 一个会话收的一端（见模块说明）
 pub struct Inbox {
     pub control: LaneStreams,
-    pub video: LaneStreams,
+    /// 画面的每一路（第 `i` 项是第 `i` 路，一共 [`airhand_proto::MAX_STREAMS`] 路）
+    pub video: Vec<LaneStreams>,
     pub bulk: LaneStreams,
+    /// 文件通道：剪贴板里的文件，每次取用一条帧流（见 `airhand_proto::files`）
+    pub files: LaneStreams,
     /// 声音数据报（整个数据报，还是密文）
     pub audio: mpsc::Receiver<Bytes>,
     /// 控制数据报（同上）和它从哪条路来（探测要从同一条路弹回去）。直连通着时 Ping、Pong、确认两条路各来一份，
@@ -67,19 +79,30 @@ pub struct Inbox {
 
 impl Inbox {
     pub fn new() -> Self {
-        let (control_tx, control) = mpsc::unbounded_channel();
-        let (video_tx, video) = mpsc::unbounded_channel();
-        let (bulk_tx, bulk) = mpsc::unbounded_channel();
+        let mut streams = [const { None }; SessionLane::COUNT];
+        let lanes = std::array::from_fn(|i| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            streams[i] = Some(rx);
+            tx
+        });
+        let mut take = |lane: SessionLane| streams[lane.number() as usize].take().unwrap();
+        let control = take(SessionLane::Control);
+        let bulk = take(SessionLane::Bulk);
+        let files = take(SessionLane::File);
+        let video = (0..airhand_proto::MAX_STREAMS)
+            .map(|s| take(SessionLane::Video(s)))
+            .collect();
         let (audio_tx, audio) = mpsc::channel(AUDIO_QUEUE);
         let (datagrams_tx, datagrams) = mpsc::channel(CONTROL_QUEUE);
         Self {
             control,
             video,
             bulk,
+            files,
             audio,
             datagrams,
             feed: Feed {
-                lanes: [control_tx, video_tx, bulk_tx],
+                lanes,
                 audio: audio_tx,
                 control: datagrams_tx,
             },
@@ -94,15 +117,11 @@ impl Default for Inbox {
 }
 
 impl Feed {
-    /// 一条通道的流到了。会话不认识的通道（对方版本新增的）、不再收的通道：叫对方别发了
-    pub fn stream(&self, lane: u8, recv: RecvStream, via: Via) {
-        let Some(lane) = SessionLane::from_u8(lane) else {
-            debug!(lane, "ignoring a lane this version doesn't know");
-            return stop(recv);
-        };
-        if let Err(mpsc::error::SendError((recv, _))) = self.lanes[lane as usize].send((recv, via))
-        {
-            stop(recv);
+    /// 通道不再接收时通知对方停发。
+    fn stream(&self, lane: SessionLane, recv: RecvStream, via: Via) {
+        let s = LaneStream { recv, via };
+        if let Err(mpsc::error::SendError(s)) = self.lanes[lane.number() as usize].send(s) {
+            stop(s.recv);
         }
     }
 
@@ -124,7 +143,8 @@ fn stop(mut recv: RecvStream) {
     let _ = recv.stop(0u32.into());
 }
 
-/// 开一条本端发的通道：一条单向流，开头写好会话头
+/// 开一条本端发的通道：一条单向流，开头写好会话头。开流、写会话头各最多等 [`HEADER_TIMEOUT`]
+/// （写会话头也会被流量控制挡住）；会话头没写完就 reset 这条流
 pub async fn open_lane(
     conn: &Connection,
     session_id: u64,
@@ -133,19 +153,25 @@ pub async fn open_lane(
     let mut send = tokio::time::timeout(HEADER_TIMEOUT, conn.open_uni())
         .await
         .context("timed out opening a session lane")??;
-    send.set_priority(lane.priority() as i32)?;
-    send.write_all(&SessionHeader::new(session_id, lane).encode())
-        .await?;
-    Ok(send)
+    send.set_priority(lane.priority())?;
+    let header = SessionHeader::new(session_id, lane).encode();
+    let written = tokio::time::timeout(HEADER_TIMEOUT, send.write_all(&header))
+        .await
+        .context("timed out writing a session header")
+        .and_then(|r| r.map_err(Into::into));
+    if written.is_err() {
+        let _ = send.reset(0u32.into());
+    }
+    written.map(|()| send)
 }
 
 /// 对方在这条通道上开的第一条流（中转上的那条）。握手用：那时还没有直连
 pub async fn first_stream(lane: &mut LaneStreams, wait: Duration) -> Result<RecvStream> {
-    let (recv, _) = tokio::time::timeout(wait, lane.recv())
+    let s = tokio::time::timeout(wait, lane.recv())
         .await
         .context("the peer didn't open its lane")?
         .context("the session ended")?;
-    Ok(recv)
+    Ok(s.recv)
 }
 
 /// 读一条流开头的会话头；读不出来（超时、不是会话头）就叫对方别发了
@@ -249,14 +275,8 @@ impl Router {
         let Some(session_id) = datagram::session(&d) else {
             return;
         };
-        let feed = self
-            .state
-            .lock()
-            .unwrap()
-            .sessions
-            .get(&session_id)
-            .cloned();
-        if let Some(feed) = feed {
+        // try_send 不等待；在同一把锁内分发，无需逐包克隆整个 Feed。
+        if let Some(feed) = self.state.lock().unwrap().sessions.get(&session_id) {
             feed.datagram(d, Via::Relay);
         }
     }
@@ -347,7 +367,13 @@ mod tests {
         lane.write_all(&header[8..]).await.unwrap();
         let got = tokio::time::timeout(Duration::from_secs(2), inbox.control.recv()).await;
         assert!(
-            matches!(got, Ok(Some((_, Via::Relay)))),
+            matches!(
+                got,
+                Ok(Some(LaneStream {
+                    via: Via::Relay,
+                    ..
+                }))
+            ),
             "the lane was held up"
         );
     }
