@@ -12,6 +12,9 @@
 //!   所在的目录（`server-trust.txt`）；都没有设置时只记在内存里，重启后重新记
 //! * `AIRHAND_WEB_IDENTITY`    网页控制台的端到端加密身份存在这个文件里（见 [`identity`]）。默认放在 `AIRHAND_WEB_CERT`
 //!   所在的目录（`controller-key.txt`）；都没有设置时只记在内存里，重启后配对过的电脑要重新配对
+//! * `AIRHAND_WEB_DEVICES`     网页控制台的"我的设备"存在这个文件里（见 [`devices`]）。默认放在 `AIRHAND_WEB_CERT`
+//!   所在的目录（`devices.json`，Docker 镜像里是 `/data/devices.json`，权限 600）；都没有设置时只记在内存里，
+//!   重启后列表就空了。里面是控制码、重连凭证和对方的公钥，靠文件权限保护，**对外暴露端口时一定要设置访问密码**
 //! * `AIRHAND_NAME`            被控端托盘里显示的控制端名称，默认 `Airhand Web`
 //! * `AIRHAND_WEB_LISTEN`      监听地址（TCP），默认 `0.0.0.0:8080`。同一个端口同时支持 HTTP 和 HTTPS
 //! * `AIRHAND_WEB_PASSWORD`    访问密码（浏览器弹出登录框，用户名随意）；不设置则不需要密码
@@ -24,6 +27,7 @@
 
 mod auth;
 mod console;
+mod devices;
 mod http;
 mod identity;
 mod tls;
@@ -113,10 +117,21 @@ async fn main() -> Result<()> {
         env("AIRHAND_WEB_CERT")
             .and_then(|c| Some(Path::new(&c).parent()?.join("controller-key.txt")))
     });
+    let devices_file = env("AIRHAND_WEB_DEVICES").map(PathBuf::from).or_else(|| {
+        env("AIRHAND_WEB_CERT")
+            .and_then(|c| Some(Path::new(&c).parent()?.join("devices.json")))
+    });
+    if devices_file.is_some() && password.is_none() {
+        warn!(
+            "AIRHAND_WEB_PASSWORD is not set: anyone who can reach this port can read My devices (control codes, keys and resume tokens of the computers you connected to)"
+        );
+    }
+    let devices = Arc::new(devices::load(devices_file.as_deref()));
     let app = Arc::new(http::App {
         link: Arc::new(link),
         auth: password.map(auth::Auth::new),
         identity: identity::load(identity_file.as_deref()),
+        devices,
     });
     let router = http::router(app.clone(), &root);
     let listener = tokio::net::TcpListener::bind(listen)

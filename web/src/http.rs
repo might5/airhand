@@ -1,4 +1,4 @@
-//! HTTP(S) 服务：控制台网页（静态文件）+ WebSocket（`/ws`）。
+//! HTTP(S) 服务：控制台网页（静态文件）+ WebSocket（`/ws`）+ "我的设备"（`/api/devices`，见 [`crate::devices`]）。
 //!
 //! 同一个端口同时支持 HTTP 和 HTTPS：看连接的第一个字节，是 TLS 握手（0x16）就按 HTTPS 处理。
 //! 本机用 `http://localhost:端口`（浏览器把 localhost 当作安全页面），其它电脑用 `https://地址:端口`。
@@ -32,12 +32,15 @@ use tracing::{debug, warn};
 
 use crate::auth::{self, Auth};
 use crate::console;
+use crate::devices;
 
 pub struct App {
     pub link: Arc<LinkConfig>,
     pub auth: Option<Auth>,
     /// 网页控制台的身份（端到端加密，见 [`crate::identity`]）：所有标签页共用，配对过的电脑靠它认出这个控制台
     pub identity: airhand_link::secure::Identity,
+    /// "我的设备"存在服务器上（见 [`crate::devices`]）：所有浏览器共用一份
+    pub devices: Arc<devices::Devices>,
 }
 
 /// 连接信息（放在请求的 extensions 里）
@@ -55,6 +58,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub fn router(app: Arc<App>, root: &Path) -> Router {
     Router::new()
         .route("/ws", get(console::upgrade))
+        // 浏览器每次变化都发整个列表（和桌面版写 config.toml 一样）
+        .route(
+            "/api/devices",
+            get(devices::get).put(devices::put).layer(devices::body_limit()),
+        )
         .fallback_service(ServeDir::new(root))
         .layer(middleware::from_fn_with_state(app.clone(), auth::check))
         .layer(middleware::from_fn(headers))

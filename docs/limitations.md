@@ -45,7 +45,7 @@
 
 ## Web console
 
-- Reloading or closing the tab disconnects its sessions; My devices isn't saved and is cleared when the page reloads
+- Reloading or closing the tab disconnects its sessions; My devices is kept on the console server (`devices.json`), so another browser or cleared site data still sees it. Delete that file, or move to another console server, and the list is gone. Without `AIRHAND_WEB_DEVICES` (in the image it defaults to `/data/devices.json`) the list lives in memory and is cleared when the page reloads
 - In Firefox, text copied locally isn't synced to the remote side automatically
 - Local files only go to the other side when you press the paste key on the remote screen or drop them on it (web pages can't read files from the clipboard). Files copied on the other side don't go into the local clipboard: click "Download". Chrome / Edge save into a folder you pick; other browsers assemble the download in memory (several files or a folder become a ZIP) and are limited to 1 GiB
 - Outside fullscreen some shortcuts (Ctrl+W…) can't reach the remote computer

@@ -78,6 +78,7 @@ AIRHAND_SERVER=relay.example.com:4433 AIRHAND_SERVER_FP=<服务器证书指纹> 
 | `AIRHAND_SERVER_FP` | 空 | 中转服务器的证书指纹。留空则第一次连上时记住服务器的证书（`data/server-trust.txt`），之后证书变了就拒绝连接；服务器确实换了证书时删掉这个文件 |
 | `AIRHAND_NAME` | `Airhand Web` | 被控端托盘里“谁在控制”显示的名称 |
 | `AIRHAND_WEB_IDENTITY` | `AIRHAND_WEB_CERT` 所在目录里的 `controller-key.txt`（镜像里是 `/data/controller-key.txt`） | 网页控制台的端到端加密身份（所有标签页共用的一把私钥，文件权限 600）。和网页控制台配对过的电脑靠它认出网页控制台；没有地方保存时只在内存里，每次重启都要重新配对。端到端加密的终点是网页控制台，它所在的机器看得到画面（见[安全](security.zh-CN.md#端到端加密)） |
+| `AIRHAND_WEB_DEVICES` | `AIRHAND_WEB_CERT` 所在目录里的 `devices.json`（镜像里是 `/data/devices.json`） | 网页控制台的“我的设备”（连接过的电脑、重连凭证、对方的公钥，文件权限 600）。存在控制台服务器上，浏览器里不存：换浏览器、清站点数据都还在，也只有一个列表。没有地方保存时只在内存里，刷新页面后清空。**里面是控制码和密钥明文，对外暴露端口时一定要设置访问密码** |
 | `AIRHAND_WEB_PASSWORD` | 空 | 访问密码：浏览器弹出登录框，用户名随意。留空则任何能访问这个端口的人都能使用控制台（连接每台电脑仍然需要它的控制码） |
 | `AIRHAND_WEB_PORT` | `8080` | 映射到宿主机的端口 |
 | `AIRHAND_WEB_CERT_NAMES` | `localhost` | 自动生成 HTTPS 证书时写入的域名 / IP（逗号分隔）。想把证书导入系统信任时，填上实际访问用的地址 |

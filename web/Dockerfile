@@ -34,6 +34,7 @@ ENV AIRHAND_WEB_LISTEN=0.0.0.0:8080 \
     AIRHAND_WEB_KEY=/data/key.pem \
     AIRHAND_SERVER_TRUST=/data/server-trust.txt \
     AIRHAND_WEB_IDENTITY=/data/controller-key.txt \
+    AIRHAND_WEB_DEVICES=/data/devices.json \
     RUST_LOG=info
 VOLUME ["/data"]
 # HTTP 和 HTTPS 共用这一个端口

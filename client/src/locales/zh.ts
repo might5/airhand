@@ -86,7 +86,7 @@ export default {
   // 我的设备（新建连接页）
   "devices.title": "我的设备",
   "devices.hint": "连接过的电脑自动保存在这里，点一下就连",
-  "devices.hintWeb": "网页版不保存，刷新页面后清空",
+  "devices.hintWeb": "存不到服务器上：只在本页面里，刷新后清空",
   "devices.empty": "连接过的电脑会自动保存在这里，下次点一下就能连上",
   "devices.search": "搜索名称或控制码",
   "devices.noMatch": "没有匹配的设备",

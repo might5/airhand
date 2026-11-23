@@ -81,7 +81,7 @@ const en: Record<MsgKey, Msg> = {
 
   "devices.title": "My devices",
   "devices.hint": "Computers you connect to are saved here. Click one to connect",
-  "devices.hintWeb": "Not saved in the web console: cleared when the page reloads",
+  "devices.hintWeb": "Can't save on the server: kept in this page only and cleared when it reloads",
   "devices.empty": "Computers you connect to are saved here, so next time it's just one click",
   "devices.search": "Search by name or code",
   "devices.noMatch": "No matching devices",

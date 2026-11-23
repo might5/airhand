@@ -47,7 +47,7 @@ interface State {
   recent: Recent[];
   /** 我的设备：连接过的电脑，最近连过的在前面 */
   devices: SavedDevice[];
-  /** 我的设备能不能保存（桌面版：config.toml）；网页版只在本页面的内存里 */
+  /** 我的设备能不能保存（桌面版：config.toml；网页版：控制台服务器上的 devices.json）；存不了时只在内存里，刷新后清空 */
   devicesSaved: boolean;
   confirm: Confirm;
   server: ServerState;

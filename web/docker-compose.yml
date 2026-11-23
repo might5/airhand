@@ -18,7 +18,8 @@ services:
       - "${AIRHAND_WEB_PORT:-8080}:8080" # HTTP 和 HTTPS 共用这一个端口（TCP）
     volumes:
       # 网页的自签名 HTTPS 证书（保持不变，浏览器就不会每次都提示）、第一次连上中转服务器时记下的证书指纹、
-      # 网页控制台的端到端加密身份（controller-key.txt：配对过的电脑靠它认出这个网页控制台，删掉了就要重新配对）
+      # 网页控制台的端到端加密身份（controller-key.txt：配对过的电脑靠它认出这个网页控制台，删掉了就要重新配对）、
+      # "我的设备"（devices.json：浏览器里不存，换浏览器、清站点数据都还在，权限 600）
       - ./data:/data
     environment:
       # 中转服务器地址（host:port，UDP）

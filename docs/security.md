@@ -36,4 +36,5 @@ TLS to the relay ends at the relay, so sessions get a second, end-to-end layer (
 
 ## Web console
 
+- The web console keeps My devices on the **console server** (`devices.json`, mode 600, on the `/data` volume in Docker), not in the browser: another browser or cleared site data doesn't lose it, and there's one list. That file is in the clear (like `config.toml` on the desktop), so whoever can read it (another account on the server, someone with the disk or a backup) gets the control codes and resume tokens; the access password is the only lock on that door, so **always set `AIRHAND_WEB_PASSWORD`** when the port is reachable from outside, and don't put the console on an address other people can reach
 - The WebSocket only accepts pages from the same site (so other websites can't connect through your browser); an access password can be set (HTTP Basic login, then an HttpOnly, SameSite=Strict cookie; wrong passwords are answered with a delay); use HTTPS from other computers. The web console sees the picture too, so run it on a machine you trust. Everyone using it reaches the relay from that machine's IP, so they share the brute-force allowance

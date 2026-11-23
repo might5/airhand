@@ -4,8 +4,8 @@ import vm from "node:vm";
 import { stripTypeScriptTypes } from "node:module";
 import { test } from "node:test";
 
-/** 网页版的剪贴板同步（会话部分在 console.ts，这里换成记录调用的假的） */
-function harness(writeText: (text: string) => Promise<void>) {
+/** 网页版的剪贴板同步和"我的设备"（会话部分在 console.ts，这里换成记录调用的假的） */
+function harness(writeText: (text: string) => Promise<void>, extra: Record<string, unknown> = {}) {
   const source = fs.readFileSync(new URL("../src/lib/backend/web.ts", import.meta.url), "utf8")
     .replace(/^import[\s\S]*?from "[^"]+";\r?\n/gm, "");
   const js = stripTypeScriptTypes(source).replace(/\bexport\s+/g, "") + "\nglobalThis.WebConsole = WebConsole;";
@@ -14,6 +14,9 @@ function harness(writeText: (text: string) => Promise<void>) {
   const sandbox: any = {
     document: { hasFocus: () => true },
     navigator: { clipboard: { writeText } },
+    location: { href: "https://console.example/" },
+    URL,
+    ...extra,
     ConsoleLink: class {
       command(c: any) { commands.push(c); return Promise.resolve(); }
       connect(_code: string, _opts: unknown, _view: unknown, events: (ev: any) => void) {
@@ -127,4 +130,42 @@ test("the remote clipboard goes to the browser, local changes go to sessions tha
   link.events!({ type: "closed", reason: { kind: "hostEnded" }, retry: false });
   assert.equal(events.at(-1).type, "closed");
   assert.equal(backend.clips.size, 0);
+});
+
+/** 假的服务器：记录请求，按预设回答 */
+function server(handler: (req: { url: string; method: string; body: string | null }) => { status: number; body?: unknown }) {
+  const requests: { url: string; method: string; body: string | null }[] = [];
+  const fetch = async (url: string, init: any = {}) => {
+    const req = { url: String(url), method: init.method ?? "GET", body: init.body ?? null };
+    requests.push(req);
+    const res = handler(req);
+    return { ok: res.status >= 200 && res.status < 300, status: res.status, json: async () => res.body };
+  };
+  return { fetch, requests };
+}
+
+const mac = { code: "123456", alias: null, name: "mac", os: "macos", resume: [1, 2], lastUsed: 7, hostKey: null };
+
+test("my devices are read from the console server, not from the browser", async () => {
+  const fake = server(() => ({ status: 200, body: [{ ...mac }, { code: "12" }] }));
+  const { backend } = harness(async () => {}, { fetch: fake.fetch });
+  // 坏记录（控制码不是 6 位）不要，免得一条坏数据让整个列表读不出来
+  assert.deepEqual(JSON.parse(JSON.stringify(await backend.loadDevices())), [mac]);
+  assert.deepEqual(fake.requests.map((r) => [r.method, r.url]), [["GET", "https://console.example/api/devices"]]);
+});
+
+test("my devices are saved on the console server", async () => {
+  const fake = server(() => ({ status: 204 }));
+  const { backend } = harness(async () => {}, { fetch: fake.fetch });
+  await backend.saveDevices([mac]);
+  assert.equal(fake.requests.length, 1);
+  assert.equal(fake.requests[0].method, "PUT");
+  assert.deepEqual(JSON.parse(fake.requests[0].body!), [mac]);
+});
+
+test("a server that can't keep the list makes the web console say so", async () => {
+  const fake = server(() => ({ status: 500, body: null }));
+  const { backend } = harness(async () => {}, { fetch: fake.fetch });
+  // 界面上会退回"只在本页面里"（actions.ts 把错误当成读不出来），不会把连接挡下来
+  await assert.rejects(() => backend.loadDevices());
 });

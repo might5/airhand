@@ -2,8 +2,8 @@
 //
 // 会话和桌面版一样走 WebSocket（console.ts），连的是同一个端口的 `/ws`。网页版自己的：
 // * 剪贴板在浏览器里同步（navigator.clipboard），规则与桌面版相同：只同步连接之后的变化，并抑制回声；
-// * 没有被控端模式、托盘和窗口；"我的设备"不保存。
-import type { AppInfo, Backend, Command, ConnectOptions, Problem, SessionEvent, SessionInfo } from "../api";
+// * 没有被控端模式、托盘和窗口；"我的设备"存在控制台服务器上（`web/src/devices.rs`），浏览器里不存。
+import type { AppInfo, Backend, Command, ConnectOptions, Problem, SavedDevice, SessionEvent, SessionInfo } from "../api";
 import { ConsoleLink, type MediaView } from "../console";
 import { getLang } from "../i18n";
 
@@ -20,6 +20,21 @@ interface Clip {
 /** 与 airhand_proto::session::MAX_CLIPBOARD_TEXT 相同（按字符数粗略限制，服务端还会按字节检查） */
 const MAX_CLIPBOARD = 1 << 20;
 const CLIPBOARD_POLL_MS = 1000;
+
+/** "我的设备"的接口：和页面同源（也可能在反向代理的子路径下），要过访问密码 */
+function devicesUrl(): string {
+  const url = new URL("api/devices", location.href);
+  url.search = "";
+  url.hash = "";
+  return url.href;
+}
+
+/** server 上的记录逐项检查：坏数据丢掉，免得一条坏记录让整个列表读不出来 */
+function isSavedDevice(v: unknown): v is SavedDevice {
+  if (!v || typeof v !== "object") return false;
+  const d = v as Partial<SavedDevice>;
+  return typeof d.code === "string" && /^\d{6}$/.test(d.code) && typeof d.lastUsed === "number";
+}
 
 /** 同一个地址（也可能在反向代理的子路径下）的 `ws` */
 function consoleUrl(): string {
@@ -209,11 +224,24 @@ class WebConsole extends ConsoleLink implements Backend {
   onWindowFullscreenExit() {
     return () => {};
   }
-  // 网页版不保存"我的设备"（不写浏览器的存储）：只在本页面的内存里，刷新后清空
+  // 网页版也保存"我的设备"，但存在控制台服务器上（不写浏览器的存储）：换浏览器、清站点数据都还在，
+  // 哪个浏览器连都一样。服务器存不了（例如旧版本、文件写不进去）时界面会说明只在本页面里
   async loadDevices() {
-    return null;
+    // 带了会话 Cookie（或者浏览器把访问密码一直带着），同源请求会自动带上
+    const res = await fetch(devicesUrl(), { headers: { accept: "application/json" } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const list: unknown = await res.json();
+    if (!Array.isArray(list)) throw new Error("the server didn't send a list of devices");
+    return list.filter(isSavedDevice);
   }
-  async saveDevices() {}
+  async saveDevices(devices: SavedDevice[]) {
+    const res = await fetch(devicesUrl(), {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(devices),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  }
 }
 
 export function webBackend(): Backend {
