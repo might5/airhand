@@ -1,6 +1,7 @@
 name: Build everything
 
-# 一键把三样东西都构建一遍：桌面客户端（macOS dmg + Windows exe）、网页控制台镜像、中转服务器镜像。
+# 一键把东西都构建一遍：桌面客户端（macOS dmg + Windows exe）、网页控制台镜像、中转服务器镜像、
+# 安卓 APK、iOS 安装包。
 # 只手动触发（Actions 页面点 "Run workflow"）：平时各条流水线只在自己相关的文件变了才跑，这里是不想等下个提交时用的。
 on:
   workflow_dispatch:
@@ -18,3 +19,8 @@ jobs:
 
   server:
     uses: ./.github/workflows/build-server.yml
+
+  # 移动端两条都慢（Rust 核心要按 ABI / SDK 各编一遍），只要桌面端时单独跑上面那三条就行
+  mobile:
+    uses: ./.github/workflows/build-mobile.yml
+    secrets: inherit

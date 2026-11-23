@@ -1,0 +1,238 @@
+name: Build mobile clients
+
+# 移动端两个包：安卓 APK（android/ 里的 Compose 应用）和 iOS 的 ipa。
+# 只手动触发（Actions 页面 Run workflow）或被 build-all.yml 调用，push 不会自动跑：
+# 这两条都要先按各自的 ABI / SDK 把 Rust 核心交叉编译一遍（LTO + codegen-units=1），
+# 每次提交都跑太费时间，需要时叫一声再构建。
+on:
+  workflow_dispatch:
+    inputs:
+      server:
+        description: "编译进去的默认中转服务器地址（如 relay.example.com:4433，留空则不写）"
+        type: string
+        required: false
+        default: ""
+      server_fp:
+        description: "服务器证书指纹（64 位十六进制，可带冒号；留空则不写）"
+        type: string
+        required: false
+        default: ""
+  workflow_call:
+    inputs:
+      server:
+        description: "编译进去的默认中转服务器地址（如 relay.example.com:4433，留空则不写）"
+        type: string
+        required: false
+        default: ""
+      server_fp:
+        description: "服务器证书指纹（64 位十六进制，可带冒号；留空则不写）"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      AIRHAND_SERVER: ${{ inputs.server }}
+      AIRHAND_SERVER_FP: ${{ inputs.server_fp }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境信息
+        run: |
+          uname -m
+          nproc
+          java -version || true
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Android SDK（Platform 35 + build-tools）和 NDK 27：Gradle 用 cargo-ndk 编 Rust 核心时要 NDK
+      - uses: android-actions/setup-android@v3
+
+      - name: Android SDK / NDK
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/ndk"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: android/native
+
+      # cargo-ndk 编译产物按 ABI 生成 libairhand_android.so，缓存一下省得每次 cargo install
+      - name: cargo-ndk
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          command -v cargo-ndk || cargo install cargo-ndk --locked
+          cargo ndk --version
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: 版本号
+        id: ver
+        run: |
+          VER=$(sed -n 's/^val appVersion *= *"\(.*\)".*/\1/p' android/app/build.gradle.kts | head -1)
+          echo "Android 版本号：$VER（versionCode 见 android/app/build.gradle.kts）"
+          [ -n "$VER" ] || { echo "没能从 android/app/build.gradle.kts 读到 appVersion"; exit 1; }
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+
+      # 没设置 AIRHAND_KEYSTORE 时 Gradle 用调试密钥签名（见 android/app/build.gradle.kts），
+      # 生成的 APK 能直接装到手机上看效果，只是不能拿来覆盖安装用别的密钥签过的旧版本。
+      - name: 构建 APK
+        working-directory: android
+        run: |
+          set -o pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace assembleRelease 2>&1 | tee android-build.log
+
+      - name: 收集产物
+        id: apk
+        run: |
+          APK=$(ls android/app/build/outputs/apk/release/*.apk | head -1)
+          OUT="Airhand-${{ steps.ver.outputs.ver }}-android.apk"
+          cp "$APK" "$OUT"
+          ls -lh "$OUT"
+          echo "apk=$OUT" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airhand-android-apk
+          path: ${{ steps.apk.outputs.apk }}
+          retention-days: 14
+
+      - name: 发 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.ver.outputs.ver }}-android-build-${{ github.run_number }}"
+          NOTES="安卓安装包（release 版，含 arm64-v8a / armeabi-v7a / x86_64，Android 7.0 及以上可以装）。"
+          NOTES="$NOTES 没配签名密钥，用的是调试密钥：可以直接传到手机上安装；要长期发版、能覆盖升级，请用固定的密钥重新签名。"
+          gh release create "$TAG" "${{ steps.apk.outputs.apk }}" \
+            --title "Airhand ${{ steps.ver.outputs.ver }} Android build ${{ github.run_number }}" \
+            --notes "$NOTES"
+
+      - name: 构建日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-log
+          path: |
+            android/android-build.log
+            android/app/build/outputs/logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  ios:
+    name: iOS ipa (unsigned)
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境信息
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ios/native
+
+      # ios/project.yml 用 XcodeGen 生成 Airhand.xcodeproj
+      - name: XcodeGen
+        run: |
+          brew install xcodegen
+          xcodegen --version
+
+      - name: 版本号
+        id: ver
+        run: |
+          VER=$(sed -n 's/^ *MARKETING_VERSION: *"\(.*\)".*/\1/p' ios/project.yml | head -1)
+          echo "iOS 版本号：$VER"
+          [ -n "$VER" ] || { echo "没能从 ios/project.yml 读到 MARKETING_VERSION"; exit 1; }
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+
+      # scripts/build-ipa.sh：先 xcodegen generate，再用 build-rust.sh 编真机静态库，最后打包成 ipa。
+      # 没有 TEAM_ID（仓库 secret IOS_TEAM_ID）时产出的是 ad-hoc 签名、未正式签名的 ipa，
+      # 要用 Sideloadly / AltStore 或自己重新签名才能装到手机上；配了 TEAM_ID 就自动签名并导出。
+      - name: 构建 ipa
+        working-directory: ios
+        env:
+          AIRHAND_SERVER: ${{ inputs.server }}
+          AIRHAND_SERVER_FP: ${{ inputs.server_fp }}
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+          EXPORT_METHOD: ${{ secrets.IOS_EXPORT_METHOD }}
+        run: |
+          set -o pipefail
+          chmod +x scripts/*.sh
+          scripts/build-ipa.sh 2>&1 | tee ios-build.log
+
+      - name: 收集产物
+        id: ipa
+        run: |
+          if [ -f ios/build/export/Airhand.ipa ]; then
+            SRC=ios/build/export/Airhand.ipa
+            SUFFIX=ios
+            SIGNED=1
+          else
+            SRC=ios/build/Airhand.ipa
+            SUFFIX=ios-unsigned
+            SIGNED=0
+          fi
+          [ -f "$SRC" ] || { echo "没找到 ipa：$SRC"; exit 1; }
+          OUT="Airhand-${{ steps.ver.outputs.ver }}-$SUFFIX.ipa"
+          cp "$SRC" "$OUT"
+          ls -lh "$OUT"
+          echo "ipa=$OUT" >> "$GITHUB_OUTPUT"
+          echo "signed=$SIGNED" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airhand-ios-ipa
+          path: ${{ steps.ipa.outputs.ipa }}
+          retention-days: 14
+
+      - name: 发 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.ver.outputs.ver }}-ios-build-${{ github.run_number }}"
+          if [ "${{ steps.ipa.outputs.signed }}" = "1" ]; then
+            NOTES="iOS 安装包（已用开发者证书自动签名，iOS 17.0 及以上）。用 Xcode 或 Apple Configurator 装到已注册的设备上。"
+          else
+            NOTES="iOS 安装包（未正式签名，做了 ad-hoc 签名并带上 App Group 权限，iOS 17.0 及以上）。用 Sideloadly / AltStore 装到手机，或者用自己的证书重新签名后再装。"
+          fi
+          gh release create "$TAG" "${{ steps.ipa.outputs.ipa }}" \
+            --title "Airhand ${{ steps.ver.outputs.ver }} iOS build ${{ github.run_number }}" \
+            --notes "$NOTES"
+
+      - name: 构建日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-log
+          path: ios/ios-build.log
+          if-no-files-found: ignore
+          retention-days: 14
