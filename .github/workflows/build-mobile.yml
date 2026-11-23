@@ -160,7 +160,9 @@ jobs:
 
   ios:
     name: iOS ipa (unsigned)
-    runs-on: macos-15
+    # 源码用到 iOS 26 才有的 AVFAudio API（allowBluetoothHFP），macOS 15 镜像里的 Xcode 16 没有这个成员，
+    # 编译会直接报错，所以固定跑 macOS 26（默认 Xcode 26.6 / iOS 26.6 SDK）。
+    runs-on: macos-26
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
