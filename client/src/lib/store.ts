@@ -28,6 +28,14 @@ export interface Draft {
  */
 export type Chrome = "full" | "compact";
 
+/**
+ * 触摸方式（网页版在平板、触摸屏上，见 touch.ts）。
+ * trackpad = 手指当触摸板用：滑一下指针跟着走，画面上画一个本机指针（位置准确，手指不用压在指针上）；
+ * touch = 触屏：手指按哪儿指针就到哪儿；
+ * auto = 按被控端的系统来：手机、平板用触屏（它们本来就没有指针），电脑用触摸板。
+ */
+export type TouchMode = "auto" | "trackpad" | "touch";
+
 /** 本次关闭的会话（Ctrl+Shift+T 重新打开最近关闭的一个） */
 export interface Recent {
   code: string;
@@ -63,6 +71,8 @@ interface State {
   chrome: Chrome;
   /** 画面增强（所有会话通用，见 enhance.ts） */
   enhance: EnhanceLevel;
+  /** 触摸方式：所有会话通用，记在本机（和手机端一样，见 store 的 setTouchMode） */
+  touchMode: TouchMode;
   /**
    * 对方把光标画进了画面里时（拖动、缩放窗口等）也显示本机的光标：跟手，只是和画面里的那个一起有两个。
    * 关掉时只看画面里的。所有会话通用，默认打开（见 session.ts 的 applyCursor）
@@ -74,6 +84,7 @@ const MAX_RECENT = 8;
 const ENHANCE_KEY = "airhand.enhance";
 const LOCAL_CURSOR_KEY = "airhand.localCursor";
 const CHROME_KEY = "airhand.chrome";
+const TOUCH_MODE_KEY = "airhand.touchMode";
 
 /** 上次选的界面密度（读不到就是完整界面） */
 export function loadChrome(): Chrome {
@@ -91,6 +102,16 @@ export function loadEnhance(): EnhanceLevel {
     return ENHANCE_LEVELS.find((l) => l === v) ?? "off";
   } catch {
     return "off";
+  }
+}
+
+/** 上次选的触摸方式（读不到就是自动：电脑用触摸板，手机、平板用触屏） */
+export function loadTouchMode(): TouchMode {
+  try {
+    const v = globalThis.localStorage?.getItem(TOUCH_MODE_KEY);
+    return v === "trackpad" || v === "touch" ? v : "auto";
+  } catch {
+    return "auto";
   }
 }
 
@@ -135,6 +156,7 @@ let state: State = {
   immersive: false,
   chrome: loadChrome(),
   enhance: loadEnhance(),
+  touchMode: loadTouchMode(),
   localCursor: loadLocalCursor(),
 };
 
@@ -206,6 +228,13 @@ export const store = {
     saveLocal(ENHANCE_KEY, enhance);
     set({ enhance });
     for (const s of state.sessions) s.refreshLayout();
+  },
+  /** 触摸方式：记下来，所有会话马上按它处理手指 */
+  setTouchMode: (touchMode: TouchMode) => {
+    if (touchMode === state.touchMode) return;
+    saveLocal(TOUCH_MODE_KEY, touchMode);
+    set({ touchMode });
+    for (const s of state.sessions) s.setTouchMode(touchMode);
   },
   /** 画面里有光标时显不显示本机的光标：记下来，所有会话马上换指针 */
   setLocalCursor: (localCursor: boolean) => {

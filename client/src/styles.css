@@ -1153,6 +1153,13 @@ kbd {
 .mouse-menu {
   width: 360px;
 }
+/* 触摸方式菜单（见 SessionView.tsx 的 TouchMenu）：自动 / 触摸板 / 触屏 */
+.touch-menu {
+  width: 360px;
+}
+.touch-menu .dd-title {
+  padding: 6px 11px 4px;
+}
 .mouse-menu .dd-title {
   padding: 6px 11px 4px;
 }
@@ -1818,6 +1825,20 @@ kbd {
   display: block;
   position: absolute;
   image-rendering: auto;
+}
+/* 触摸板模式下滑动时本机画的指针（见 input.ts 的 showTouchCursor）：挂在 body 上，
+   位置用 transform 挪（每一帧都在动，别让它改布局）。只是画给人看的，不接任何事件 */
+.touch-cursor {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 60;
+  pointer-events: none;
+  will-change: transform;
+}
+.touch-cursor svg {
+  display: block;
+  filter: drop-shadow(0 1px 2px rgb(0 0 0 / 45%));
 }
 /* 软键盘：一个看不见的输入框，只为叫出系统键盘（见 session.ts 的 openKeyboard）。
    不能 display:none 或完全透明——那样浏览器不肯弹键盘；也不能挡住手指，pointer-events 关掉 */

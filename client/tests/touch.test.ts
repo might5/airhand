@@ -2,16 +2,19 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { InputEvent } from "../src/lib/api.ts";
-import { LONG_PRESS_MS, SCROLL_SLOP, TAP_SLOP, TouchInput } from "../src/lib/touch.ts";
+import { LONG_PRESS_MS, SCROLL_SLOP, TAP_SLOP, TouchInput, resolveTouchStyle, trackpadGain } from "../src/lib/touch.ts";
 
-/** 记下发出去的事件；坐标按一个 1000×1000 的画面算（1 像素 = 0.001） */
+/** 记下发出去的事件；坐标按一个 1000×1000 的画面算（1 像素 = 0.001），画面贴在网页左上角 */
 function fakeHost() {
   const events: InputEvent[] = [];
+  let pointer: { x: number; y: number } | null = null;
   const host = {
     posAt: (clientX: number, clientY: number) => ({ x: clientX / 1000, y: clientY / 1000 }),
     send: (evs: InputEvent[]) => { events.push(...evs); },
+    rect: () => ({ left: 0, top: 0, width: 1000, height: 1000 }),
+    pointer: (pos: { x: number; y: number } | null) => { pointer = pos; },
   };
-  return { events, host, input: new TouchInput(host) };
+  return { events, host, pointer: () => pointer, input: new TouchInput(host) };
 }
 
 /** 事件的大致样子：m=移动 b=按键 r=松开 d=滚轮 */
@@ -141,4 +144,125 @@ test("reset：状态清空，长按的定时器不会在之后补一个右键", 
   input.reset();
   await sleep(LONG_PRESS_MS + 50);
   assert.deepEqual(shape(events), []);
+});
+
+// ───────────────────────── 触摸板 ─────────────────────────
+
+/** 触摸板模式：手指在画面上滑，指针跟着走（和手机端的 TRACKPAD 一样） */
+function trackpadHost() {
+  const h = fakeHost();
+  h.input.setStyle("trackpad");
+  return h;
+}
+
+test("自动：电脑用触摸板，手机平板用触屏", () => {
+  assert.equal(resolveTouchStyle("auto", "mac"), "trackpad");
+  assert.equal(resolveTouchStyle("auto", "windows"), "trackpad");
+  assert.equal(resolveTouchStyle("auto", "linux"), "trackpad");
+  assert.equal(resolveTouchStyle("auto", "android"), "touch");
+  assert.equal(resolveTouchStyle("auto", "ios"), "touch");
+  // 手动选的说了算
+  assert.equal(resolveTouchStyle("touch", "mac"), "touch");
+  assert.equal(resolveTouchStyle("trackpad", "android"), "trackpad");
+});
+
+test("触摸板：只有第一下有点慢，滑得快指针走得远", () => {
+  assert.ok(trackpadGain(0) < 1);
+  assert.ok(trackpadGain(0.1) < 1);
+  assert.ok(trackpadGain(1) > 1);
+  assert.equal(trackpadGain(100), 2.4);
+});
+
+test("触摸板：手指滑，指针跟着走（不再按手指的位置跳）", () => {
+  const { events, input, pointer } = trackpadHost();
+  input.down({ pointerId: 1, clientX: 500, clientY: 500 });
+  // 第一次摸：指针出现在画面中间
+  assert.deepEqual(pointer(), { x: 500, y: 500 });
+  input.move({ pointerId: 1, clientX: 600, clientY: 500 });
+  const moves = events.filter((e) => e.type === "mouseMove");
+  assert.equal(moves.length, 1);
+  assert.ok(pointer()!.x > 500, JSON.stringify(pointer()));
+  // 手指才滑了 100，指针走得比 100 远（加速），但不会跑到画面上看不见的地方
+  assert.equal(pointer()!.y, 500);
+  input.up({ pointerId: 1, clientX: 600, clientY: 500 });
+  // 滑过就不算点一下
+  assert.ok(!shape(events).some((x) => x.startsWith("left")), shape(events).join(","));
+});
+
+test("触摸板：手指抖动时指针不动，点一下落在指针上", () => {
+  const { events, input } = trackpadHost();
+  input.down({ pointerId: 1, clientX: 100, clientY: 900 });
+  input.move({ pointerId: 1, clientX: 100 + TAP_SLOP - 2, clientY: 900 });
+  input.up({ pointerId: 1, clientX: 100 + TAP_SLOP - 2, clientY: 900 });
+  // 指针在画面中间，不在手指按的地方
+  assert.deepEqual(shape(events), ["m0.500,0.500", "left+", "left-"]);
+});
+
+test("触摸板：长按是在指针处右键", async () => {
+  const { events, input } = trackpadHost();
+  input.down({ pointerId: 1, clientX: 100, clientY: 100 });
+  await sleep(LONG_PRESS_MS + 50);
+  input.up({ pointerId: 1, clientX: 100, clientY: 100 });
+  assert.deepEqual(shape(events), ["m0.500,0.500", "right+", "right-"]);
+});
+
+test("触摸板：双击之后按住滑 = 左键拖动（拖文件、选文字）", () => {
+  const { events, input } = trackpadHost();
+  // 第一下：点一下
+  input.down({ pointerId: 1, clientX: 500, clientY: 500 });
+  input.up({ pointerId: 1, clientX: 500, clientY: 500 });
+  assert.deepEqual(shape(events), ["m0.500,0.500", "left+", "left-"]);
+  events.length = 0;
+  // 第二下按住不放，再滑：按住左键拖
+  input.down({ pointerId: 1, clientX: 505, clientY: 505 });
+  input.move({ pointerId: 1, clientX: 605, clientY: 505 });
+  const s = shape(events);
+  assert.equal(s[0], "m0.500,0.500");
+  assert.equal(s[1], "left+");
+  input.up({ pointerId: 1, clientX: 605, clientY: 505 });
+  assert.equal(shape(events).at(-1), "left-");
+  // 双击的第二下不再单独点一次
+  assert.equal(shape(events).filter((x) => x === "left+").length, 1);
+});
+
+test("触摸板：快点两下 = 被控端收到双击（第二下没滑开就是又点了一下）", () => {
+  const { events, input } = trackpadHost();
+  input.down({ pointerId: 1, clientX: 500, clientY: 500 });
+  input.up({ pointerId: 1, clientX: 500, clientY: 500 });
+  input.down({ pointerId: 1, clientX: 502, clientY: 501 });
+  input.up({ pointerId: 1, clientX: 502, clientY: 501 });
+  const s = shape(events);
+  assert.equal(s.filter((x) => x === "left+").length, 2, s.join(","));
+  assert.equal(s.filter((x) => x === "left-").length, 2, s.join(","));
+});
+
+test("触摸板：双击之后按住不动，还是右键", async () => {
+  const { events, input } = trackpadHost();
+  input.down({ pointerId: 1, clientX: 500, clientY: 500 });
+  input.up({ pointerId: 1, clientX: 500, clientY: 500 });
+  events.length = 0;
+  input.down({ pointerId: 1, clientX: 501, clientY: 500 });
+  await sleep(LONG_PRESS_MS + 50);
+  input.up({ pointerId: 1, clientX: 501, clientY: 500 });
+  assert.deepEqual(shape(events), ["m0.500,0.500", "right+", "right-"]);
+});
+
+test("触摸板：指针跑不出画面", () => {
+  const { input, pointer } = trackpadHost();
+  input.down({ pointerId: 1, clientX: 500, clientY: 500 });
+  for (let i = 1; i <= 40; i++) input.move({ pointerId: 1, clientX: 500, clientY: 500 + i * 150 });
+  const p = pointer()!;
+  assert.ok(p.y <= 999 && p.y >= 1, JSON.stringify(p));
+  assert.ok(p.x >= 1 && p.x <= 999, JSON.stringify(p));
+});
+
+test("换触摸方式：按着的手势作废，本机画的指针收起来", () => {
+  const { events, input, pointer } = trackpadHost();
+  input.down({ pointerId: 1, clientX: 300, clientY: 300 });
+  assert.ok(pointer());
+  input.setStyle("touch");
+  assert.equal(pointer(), null);
+  const before = events.length;
+  input.up({ pointerId: 1, clientX: 300, clientY: 300 });
+  assert.equal(events.length, before, "作废的手势不该再补点击");
 });

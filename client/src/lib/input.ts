@@ -44,7 +44,7 @@
 // 指针锁定、设备像素比例都按画面所在的窗口算（element.ownerDocument），不是主窗口的。
 import type { InputEvent, MouseButton, MouseMode } from "./api";
 import { isPasteKey } from "./files.ts";
-import { TouchInput } from "./touch.ts";
+import { TouchInput, type TouchStyle } from "./touch.ts";
 
 const IS_MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.platform || navigator.userAgent);
 const CTRL_COMMAND_SWAP = new Map([
@@ -94,6 +94,12 @@ type Lockable = HTMLElement & { requestPointerLock(options?: { unadjustedMovemen
 /** 指针（屏幕坐标）在第几路画面上、在它上面的归一化坐标（0..1） */
 export type Locate = (clientX: number, clientY: number) => { x: number; y: number; stream: number };
 
+/** 触摸板模式下本机画的指针：箭头尖在 (0,0)，白色描边在黑底上看得见（被控端画面什么颜色都有） */
+const TOUCH_CURSOR_SVG =
+  '<svg width="18" height="24" viewBox="0 0 18 24" xmlns="http://www.w3.org/2000/svg">' +
+  '<path d="M1 1 L1 17.6 L5.4 13.5 L7.9 19.9 L10.9 18.7 L8.4 12.4 L14.6 12.4 Z" ' +
+  'fill="#ffffff" stroke="#12141a" stroke-width="1.2" stroke-linejoin="round"/></svg>';
+
 export class RemoteInput {
   /** 画面（几路画面拼在一起时是包着它们的元素）：事件挂在它上面，锁定指针也是它 */
   private canvas: HTMLElement;
@@ -102,8 +108,10 @@ export class RemoteInput {
   private locate: Locate | null;
   private send: (events: InputEvent[]) => void;
   private connected: () => boolean;
-  /** 触摸屏上的手指（见 touch.ts）：点、拖、长按右键、双指滚动 */
+  /** 触摸屏上的手指（见 touch.ts）：点、拖、长按右键、双指滚动；触摸板模式下滑动移动指针 */
   private touch: TouchInput;
+  /** 触摸板模式下本机画的指针（见 touch.ts 的 host.pointer）：被控端的光标挡不住、藏不了 */
+  private touchCursor: HTMLElement | null = null;
   private _interactive = false;
   private queue: InputEvent[] = [];
   private timer: ReturnType<typeof setTimeout> | undefined;
@@ -174,6 +182,11 @@ export class RemoteInput {
     this.touch = new TouchInput({
       posAt: (x, y) => this.posAt(x, y),
       send: (events, urgent) => this.enqueue(events, urgent),
+      rect: () => {
+        const r = this.canvas.getBoundingClientRect();
+        return { left: r.left, top: r.top, width: r.width, height: r.height };
+      },
+      pointer: (pos) => this.showTouchCursor(pos),
     });
     this.bind();
   }
@@ -185,9 +198,38 @@ export class RemoteInput {
       this.cancelEscHold();
       this.unlock();
       this.swallowing = false;
-      // 手指按着的时候画面不能操作了（断开、换了会话）：松开的也要发出去，不然被控端一直按着
-      this.touch.cancel();
+      // 手指按着的时候画面不能操作了（断开、换了会话）：松开的也要发出去，不然被控端一直按着；
+      // 本机画的指针也收起来（它挂在 body 上，不跟着画面走）
+      this.touch.reset();
     }
+  }
+
+  /** 触摸方式（见 touch.ts）：触屏（手指按哪儿到哪儿）还是触摸板（手指滑，指针跟着走） */
+  setTouchStyle(style: TouchStyle) {
+    this.touch.setStyle(style);
+  }
+
+  /**
+   * 触摸板模式下滑动时本机画的指针（见 touch.ts）：位置用 transform 挪，不和远程画面抢布局。
+   * 它只是画给人看的，事件早就发出去了
+   */
+  private showTouchCursor(pos: { x: number; y: number } | null) {
+    if (!pos) {
+      this.touchCursor?.remove();
+      this.touchCursor = null;
+      return;
+    }
+    let el = this.touchCursor;
+    if (!el) {
+      const body = this.doc?.body;
+      if (!body) return;
+      el = this.doc!.createElement("div");
+      el.className = "touch-cursor";
+      el.innerHTML = TOUCH_CURSOR_SVG;
+      body.appendChild(el);
+      this.touchCursor = el;
+    }
+    el.style.transform = `translate(${pos.x}px, ${pos.y}px)`;
   }
 
   /** 鼠标模式（见文件开头） */
@@ -265,6 +307,8 @@ export class RemoteInput {
     this.cancelEscHold();
     this.unlock();
     this.touch.cancel();
+    // 触摸板的本机指针挂在 body 上，断开 / 换会话时收起来，别留在画面上
+    this.showTouchCursor(null);
   }
   dispose() { this.reset(); this.abort.abort(); }
   releaseAll() {

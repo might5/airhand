@@ -44,6 +44,25 @@ export const IconGamepad = (p: P) =>
       <path d="M15.5 10.5h.01M17 12.5h.01" />
     </>,
   );
+/** 触摸板（触摸方式：手指滑，画面上画的指针跟着走） */
+export const IconTrackpad = (p: P) =>
+  base(
+    p,
+    <>
+      <rect x="3.5" y="4" width="17" height="16" rx="3.2" />
+      <path d="M9 9.2v7l2-2 1.4 3 1.5-.7-1.4-2.9h2.7z" />
+    </>,
+  );
+/** 手指点（触摸方式：手指按哪儿，指针就到哪儿） */
+export const IconTouch = (p: P) =>
+  base(
+    p,
+    <>
+      <path d="M9.2 11V5.6a1.6 1.6 0 0 1 3.2 0v5.6" />
+      <path d="M12.4 11.6v-1.5a1.5 1.5 0 0 1 3 0v2.4" />
+      <path d="M15.4 12.4a1.5 1.5 0 0 1 3 0v3.3A5.5 5.5 0 0 1 12.9 21h-1a5 5 0 0 1-3.6-1.5l-3.1-3.2a1.6 1.6 0 0 1 2.3-2.3L9.2 16" />
+    </>,
+  );
 export const IconGrid = (p: P) =>
   base(
     p,

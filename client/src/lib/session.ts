@@ -43,6 +43,7 @@ import { AudioOutput } from "./audio";
 import { MicCapture, type MicError } from "./mic";
 import { ConnectionAttempt } from "./connection-attempt";
 import { RemoteInput } from "./input";
+import { resolveTouchStyle } from "./touch";
 import type { AvSyncStats } from "./avsync";
 import { bestCodec, codecUsable } from "./codec";
 import type { MediaView } from "./console";
@@ -341,6 +342,7 @@ export class RemoteSession {
       },
       locate,
     );
+    input.setTouchStyle(this.touchStyle);
     // 鼠标切换了绝对 / 相对、锁定了 / 解除了：本机指针显示与否、工具栏的状态跟着变
     input.onModeChange = () => {
       this.applyCursor();
@@ -362,6 +364,17 @@ export class RemoteSession {
       };
     }
     return input;
+  }
+
+  /** 现在该用哪种触摸方式（见 store 的 touchMode） */
+  private get touchStyle() {
+    return resolveTouchStyle(store.get().touchMode, this.hostPlatform);
+  }
+
+  /** 触摸方式变了（工具栏里切的，见 store 的 setTouchMode）：所有画面上的手指马上按新的方式处理 */
+  setTouchMode(mode: Parameters<typeof resolveTouchStyle>[0]) {
+    const style = resolveTouchStyle(mode, this.hostPlatform);
+    for (const input of this.inputs) input.setTouchStyle(style);
   }
 
   /** 所有画面上的鼠标键盘：主窗口的和每个弹出窗口的 */
@@ -605,6 +618,9 @@ export class RemoteSession {
         this.hostName = ev.hostname;
         this.hostOs = ev.os;
         this.hostPlatform = ev.platform;
+        // 触摸方式：自动时电脑用触摸板、手机平板用触屏（见 touch.ts 的 resolveTouchStyle），
+        // 得等知道了被控端是什么系统才能定，所以在这里再来一次
+        this.setTouchMode(store.get().touchMode);
         // 手机点的是触屏，没有鼠标模式（工具栏也不显示）：一律按自动
         if ((ev.platform === "android" || ev.platform === "ios") && this.input.mode !== "auto") {
           for (const input of this.inputs) input.setMode("auto", false);

@@ -6,7 +6,7 @@ import { LocalFiles } from "../lib/files";
 import { errorText, noticeText, problemText, sessionStateText } from "../lib/messages";
 import { CODEC_LABEL } from "../lib/presets";
 import type { RemoteSession } from "../lib/session";
-import { store, useSession, useSessionTitle, useStore } from "../lib/store";
+import { store, useSession, useSessionTitle, useStore, type TouchMode } from "../lib/store";
 import {
   IconChevron,
   IconClipboard,
@@ -28,6 +28,8 @@ import {
   IconRestoreBar,
   IconShrink,
   IconSliders,
+  IconTouch,
+  IconTrackpad,
   IconType,
   IconVolume,
   IconVolumeOff,
@@ -103,10 +105,12 @@ const combosFor = (platform: Platform | null, os: string) => {
   return os === "" || /windows/i.test(os) ? WINDOWS_COMBOS : /^macos/i.test(os) ? MAC_COMBOS : LINUX_COMBOS;
 };
 
-type Menu = null | "quality" | "mouse" | "keys" | "display" | "clipboard" | "audio" | "mic" | "sessions";
+type Menu = null | "quality" | "mouse" | "touch" | "keys" | "display" | "clipboard" | "audio" | "mic" | "sessions";
 
 /** 鼠标模式的图标（工具栏的鼠标按钮显示现在的） */
 const MOUSE_ICONS: Record<MouseMode, typeof IconMouse> = { auto: IconMouse, desktop: IconPointer, game: IconGamepad };
+/** 触摸方式（见 store 的 touchMode）：自动 / 触摸板 / 触屏 */
+const TOUCH_MODES: TouchMode[] = ["auto", "trackpad", "touch"];
 
 /** 顶端热区的高度（和 .hot-edge 一致） */
 const HOT_EDGE = 6;
@@ -186,6 +190,8 @@ export function SessionView({ s }: { s: RemoteSession }) {
   const reveal = useToolbarReveal(immersive, toolbarRef);
   // 专注模式：工具栏默认收着，点悬浮球才出来；菜单开着的时候不收起（见下面的 CSS :has(.popover)）
   const compact = useStore((st) => st.chrome === "compact");
+  /** 触摸方式（见 store 的 touchMode）：只有触摸屏上才用得上 */
+  const touchMode = useStore((st) => st.touchMode);
   // 两种情况下工具栏都浮在画面上：全屏、专注模式
   const overlay = immersive || compact;
   const [barOpen, setBarOpen] = useState(false);
@@ -418,6 +424,19 @@ export function SessionView({ s }: { s: RemoteSession }) {
             </button>
             {menu === "quality" && <QualityPanel s={s} onClose={closeMenu} />}
           </div>
+
+          {TOUCHABLE && (
+            <div className="menu-anchor">
+              <button
+                className={`tb-btn icon ${menu === "touch" ? "on" : ""}`}
+                title={t("touch.title", { mode: t(`touch.${touchMode}`) })}
+                onClick={() => toggleMenu("touch")}
+              >
+                {touchMode === "touch" ? <IconTouch size={17} /> : <IconTrackpad size={17} />}
+              </button>
+              {menu === "touch" && <TouchMenu onClose={closeMenu} />}
+            </div>
+          )}
 
           {TOUCHABLE && (
             <div className="menu-anchor">
@@ -785,6 +804,33 @@ export function SessionView({ s }: { s: RemoteSession }) {
         />
       )}
     </div>
+  );
+}
+
+/** 触摸方式：触屏（手指按哪儿到哪儿）/ 触摸板（手指滑，画面上画一个本机指针跟着走）/ 自动 */
+function TouchMenu({ onClose }: { onClose: () => void }) {
+  const touchMode = useStore((st) => st.touchMode);
+  return (
+    <Dropdown onClose={onClose} className="touch-menu">
+      <div className="dd-title pop-title">{t("touch.menu")}</div>
+      {TOUCH_MODES.map((m) => (
+        <button
+          key={m}
+          className={`dd-item mode ${touchMode === m ? "active" : ""}`}
+          onClick={() => {
+            // 换方式：正在按着的手势作废，本机画的指针先收起来（见 touch.ts）
+            store.setTouchMode(m);
+            onClose();
+          }}
+        >
+          {m === "touch" ? <IconTouch size={18} /> : <IconTrackpad size={18} />}
+          <span>
+            {t(`touch.${m}`)}
+            <span className="muted small block">{t(`touch.${m}.hint`)}</span>
+          </span>
+        </button>
+      ))}
+    </Dropdown>
   );
 }
 
