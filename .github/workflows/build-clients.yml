@@ -1,5 +1,7 @@
 name: Build desktop clients
 
+# 注：macOS arm64 hosted runner 在高峰期常因容量不足排队失败（job 被 cancelled），
+# 遇此情况只需对本文件做任意改动再 push，即可重新触发整套客户端构建。
 permissions:
   contents: write
 
