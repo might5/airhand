@@ -12,7 +12,7 @@ use airhand_proto::session::{DisplayInfo, InputEvent, MouseButton};
 use objc2_core_foundation::{CFRetained, CGPoint};
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
-    CGEventType, CGMouseButton, CGScrollEventUnit,
+    CGEventType, CGMouseButton, CGMomentumScrollPhase, CGScrollEventUnit, CGScrollPhase,
 };
 use tracing::warn;
 
@@ -26,6 +26,8 @@ const PIXELS_PER_LINE: f64 = 100.0 / 3.0;
 /// 连续点击的判定：时间间隔和位置偏差（系统默认的双击间隔是 0.5 秒）
 const MULTI_CLICK_TIME: Duration = Duration::from_millis(500);
 const MULTI_CLICK_DISTANCE: f64 = 4.0;
+/// 两次滚动隔这么久就算另一轮：系统据此把上一轮的手势收尾（触控板停手也是这个量级）
+const SCROLL_IDLE: Duration = Duration::from_millis(120);
 /// 显示器排列缓存的有效期
 const DISPLAY_CACHE: Duration = Duration::from_secs(2);
 /// 一个事件最多带 20 个 UTF-16 字符（系统的限制）
@@ -79,6 +81,8 @@ pub struct MacInjector {
     clicks: Option<Clicks>,
     /// 还不够一像素的滚动量 (水平, 垂直)
     wheel: (f64, f64),
+    /// 上一次发滚轮的时刻：隔得够久就是另一轮滚动（见 `wheel`）
+    scroll_at: Option<Instant>,
     displays: Vec<Display>,
     displays_at: Option<Instant>,
     permission_checked: Option<Instant>,
@@ -89,6 +93,8 @@ pub struct MacInjector {
 impl MacInjector {
     pub fn handle(&mut self, events: &[InputEvent], display: &DisplayInfo) {
         self.check_permission();
+        // 手已经停了：把上一轮滚动收尾，别让系统以为还在滚（否则接着的点击会被吞）
+        self.flush_scroll();
         for ev in events {
             match ev {
                 InputEvent::MouseMove { x, y, .. } => {
@@ -146,6 +152,7 @@ impl MacInjector {
             self.mouse_button(b, false);
         }
         self.wheel = (0.0, 0.0);
+        self.scroll_at = None;
     }
 
     fn check_permission(&mut self) {
@@ -330,19 +337,61 @@ impl MacInjector {
         }
         self.wheel.0 -= px;
         self.wheel.1 -= py;
+        // 隔得久了：先把上一轮收尾，这一笔算新的一轮。系统靠相位区分"一段一段"的滚动，
+        // 每帧都是孤立刻度的话，触控板的跟手和惯性都不会出现。
+        let now = Instant::now();
+        let fresh = self.scroll_at.is_none_or(|t| now.duration_since(t) > SCROLL_IDLE);
+        if fresh && self.scroll_at.is_some() {
+            self.scroll(0, 0, CGScrollPhase::Ended.0 as i64);
+        }
+        let phase = if fresh {
+            CGScrollPhase::Began.0 as i64
+        } else {
+            CGScrollPhase::Changed.0 as i64
+        };
+        self.scroll_at = Some(now);
+        // wheel1：正数 = 向上；wheel2：正数 = 向左（我们的 dx 正数是向右）
+        self.scroll(py as i32, -px as i32, phase);
+    }
+
+    /// 手已经停了：补一个 `ended` 把上一轮滚动收尾。
+    fn flush_scroll(&mut self) {
+        if let Some(at) = self.scroll_at {
+            if at.elapsed() > SCROLL_IDLE {
+                self.scroll(0, 0, CGScrollPhase::Ended.0 as i64);
+                self.scroll_at = None;
+            }
+        }
+    }
+
+    /// 发一个滚动事件，`phase` 是手势阶段（began / changed / ended）。
+    ///
+    /// 标成"连续"事件，系统才按触控板处理（跟手滚动、带惯性），否则每次都被
+    /// 当成鼠标滚轮的一格一格。惯性相位留给系统自己算，我们只发手势本身。
+    fn scroll(&mut self, py: i32, px: i32, phase: i64) {
         let flags = self.flags();
         let src = self.source();
-        // wheel1：正数 = 向上；wheel2：正数 = 向左（我们的 dx 正数是向右）
         let Some(ev) = CGEvent::new_scroll_wheel_event2(
             src.as_deref(),
             CGScrollEventUnit::Pixel,
             2,
-            py as i32,
-            -px as i32,
+            py,
+            px,
             0,
         ) else {
             return;
         };
+        CGEvent::set_integer_value_field(Some(&ev), CGEventField::ScrollWheelEventIsContinuous, 1);
+        CGEvent::set_integer_value_field(
+            Some(&ev),
+            CGEventField::ScrollWheelEventScrollPhase,
+            phase,
+        );
+        CGEvent::set_integer_value_field(
+            Some(&ev),
+            CGEventField::ScrollWheelEventMomentumPhase,
+            CGMomentumScrollPhase::None.0 as i64,
+        );
         self.post(&ev, flags);
     }
 

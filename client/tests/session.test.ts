@@ -9,6 +9,7 @@ import { fitSize, stricter, viewMaxShort } from "../src/lib/fit.ts";
 import * as media from "../src/lib/media.ts";
 import { hitTest, layoutTiles, placeDisplays } from "../src/lib/screens.ts";
 import { RemoteInput } from "../src/lib/input.ts";
+import { resolveTouchStyle } from "../src/lib/touch.ts";
 
 /** 沙箱里建的对象原型不同，按 JSON 比较 */
 const plain = (v: unknown) => JSON.parse(JSON.stringify(v));
@@ -52,7 +53,7 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
   const timers: (() => void)[] = [];
   const storeState: any = { enhance: "off", decoders: ["h264"] };
   const sandbox: any = { console, performance, clearTimeout, setTimeout, queueMicrotask, ConnectionAttempt,
-    fitSize, stricter, viewMaxShort, renderPlan, media, hitTest, layoutTiles, placeDisplays, RemoteInput, devicePixelRatio: 1,
+    fitSize, stricter, viewMaxShort, renderPlan, media, hitTest, layoutTiles, placeDisplays, RemoteInput, resolveTouchStyle, devicePixelRatio: 1,
     codecUsable: () => true, bestCodec: () => "h264",
     store: { get: () => storeState },
     toProblem: (e: any) => e,
@@ -84,7 +85,7 @@ function sessionHarness(connect?: (code: string, resume: any, opts: any) => Prom
     newCanvas(home: any) { const c: any = fakeCanvas(); c.home = home; return c; },
     popouts: new Map(), opening: new Map(), cursorCss: new WeakMap(),
     view: { setSync() {}, setAudio() {}, setLayout() {}, dispose() {}, addCanvas() {} }, frames: [{ w: 16, h: 9 }],
-    input: { reset() {} },
+    input: { reset() {}, setTouchStyle() {} },
     cursorSlots: new Map(), resume: null, hostKey: null, safety: null, pairing: null,
     onlineAt: -1, attemptAt: 0, retries: 0,
     emit() {}, syncAudio() {}, syncMic() {}, applySyncState() {}, onConnected() { calls.push("connected"); },
@@ -209,7 +210,7 @@ test("弹出窗口：一个显示器放到单独的窗口里，主窗口拼剩�
   Object.assign(s, {
     sid: 7, scaleMode: "fit", interactive: true, viewport: { w: 2880, h: 1080 }, emit() {},
     hostEl: { getBoundingClientRect: () => ({ width: 2880, height: 1080 }) },
-    input: { mode: "auto", releaseAll() {}, reset() {}, setRemoteCursorHidden() {} },
+    input: { mode: "auto", releaseAll() {}, reset() {}, setRemoteCursorHidden() {}, setTouchStyle() {} },
     applyCursor() {}, cursorVisible: true,
   });
   s.view = { ...s.view, addCanvas: (i: number, c: any) => added.push([i, c.home ?? null]) };
@@ -378,7 +379,7 @@ test("对方是手机：没有鼠标模式，记着的游戏模式也改回自�
   const h = sessionHarness();
   const s = h.session;
   const modes: any[] = [];
-  const input: any = { mode: "game", reset() {}, setMode(m: string, notify: boolean) { modes.push([m, notify]); this.mode = m; } };
+  const input: any = { mode: "game", reset() {}, setMode(m: string, notify: boolean) { modes.push([m, notify]); this.mode = m; }, setTouchStyle() {} };
   Object.assign(s, { sid: 7, settings: { fps: 30, bitrateKbps: 4000, maxShort: 1080, adaptive: true, codec: "h264" }, input });
   h.session.onEvent({
     type: "hello", hostname: "phone", os: "Android 15", platform: "android", actions: [], version: "0.3.0",

@@ -21,6 +21,12 @@
 // * 长按不动：在指针的位置右键单击；
 // * 两根手指滑：滚动；两根手指轻点：在指针的位置右键。
 //
+// ── 多指（特斯拉车机支持 10 点）── 两种方式都一样：
+// * 两根手指捏合 / 张开：缩放（发 Cmd+= / Cmd+-：浏览器、预览、Figma 都认这一组）；
+// * 两根手指甩出去再松开：滚动带一点惯性，滑一段才停（和触控板一样）；
+// * 三根手指轻点：中键（关标签页、在新窗口打开链接）；
+// * 三根手指左右滑：切桌面（Ctrl+← / →）。
+//
 // 触摸时的绝对坐标和鼠标一样按画面算（多屏时落在第几路画面上，见 input.ts 的 locate）。
 // 手指没有 hover，所以不涉及相对移动、指针锁定、鼠标模式：两种方式都发绝对坐标。
 import type { InputEvent, MouseButton } from "./api";
@@ -33,8 +39,28 @@ export const LONG_PRESS_MS = 450;
 export const SCROLL_SLOP = 8;
 /** 两次点击之间不到这么久、又离得不远，就算双击（触摸板模式下双击之后可以按住拖） */
 export const DOUBLE_TAP_MS = 300;
-/** 手指滑动 1 CSS 像素滚动多少（和鼠标滚轮一样按 DOM 像素算，见 input.ts 的 wheel） */
-const WHEEL_PER_PX = 1.2;
+/** 手指滑动 1 CSS 像素滚动多少：一比一跟手（惯性由本机按相位算，见 startMomentum） */
+const WHEEL_PER_PX = 1;
+/** 松手之后滚动还滑多久（惯性：手指甩出去，画面再滑一段才停） */
+export const MOMENTUM_MS = 320;
+/** 甩得多快才有惯性（每毫秒多少 CSS 像素）：慢慢松开不该滑 */
+const MOMENTUM_MIN = 0.25;
+/** 松手之前最后一帧超过这么久（毫秒）：说明手指早就停住了，不该再滑 */
+const MOMENTUM_HOLD_MS = 100;
+/** 算滑动的速度要看这么长的一段（毫秒）：太短的一瞬不能当速度 */
+const MOMENTUM_WINDOW_MS = 40;
+/** 惯性每帧衰减多少（16ms 一帧，320ms 之后基本停下） */
+const MOMENTUM_DECAY = 0.92;
+/** 惯性按帧算：一帧多少毫秒 */
+const FRAME_MS = 16;
+/** 两指距离变化超过这么多 CSS 像素才算捏合（之前只是两指滑动的抖动） */
+export const PINCH_SLOP = 20;
+/** 两指距离差这么多倍算一格缩放（1.15 = 张开 15% 按一次 Cmd+=） */
+const PINCH_STEP = 1.15;
+/** 三根手指一起横移超过这么多 CSS 像素才算滑，不到就是三指轻点 */
+export const THREE_SLOP = 50;
+/** 手势起点落在画面最外这么多 CSS 像素内：多半是从屏幕边缘切进来的，不认（见 down） */
+export const EDGE_PX = 8;
 
 /** 触摸方式：触屏（手指按哪儿指针到哪儿）还是触摸板（手指滑，指针跟着走） */
 export type TouchStyle = "touch" | "trackpad";
@@ -76,7 +102,7 @@ export interface TouchHost {
 }
 
 /** 手指（一根或几根）正在做什么 */
-type Gesture = "none" | "tap" | "scroll";
+type Gesture = "none" | "tap" | "scroll" | "three";
 
 /** 一根手指按下去之后的状态 */
 interface Tap {
@@ -110,6 +136,16 @@ export class TouchInput {
   private rightDown = false;
   /** 两根手指的中心、累计移动了多少（判断是滚动还是双指点击） */
   private scroll: { x: number; y: number; moved: number } | null = null;
+  /** 两指捏合：上一帧的两指距离、确定缩放之后的基准距离、这次手势是不是已经进入缩放 */
+  private pinch: { base: number; ref: number; scaled: boolean } | null = null;
+  /** 三根手指：起点、当前中心、横滑发过没有 */
+  private three: { startX: number; startY: number; x: number; y: number; fired: boolean } | null = null;
+  /** 滚动的速度（CSS 像素 / 毫秒）和这一档速度的时刻：松手之后的惯性用它 */
+  private velocity = { x: 0, y: 0, t: 0 };
+  /** 算速度用的窗口：从什么时候、攒了多少位移（一帧的抖动不能当速度） */
+  private scrollWindow = { t: 0, dx: 0, dy: 0 };
+  /** 惯性的定时器 */
+  private momentum: ReturnType<typeof setInterval> | undefined;
   /** 还没发出去的滚轮量（不到 1 的攒着，见 input.ts 的 wheel） */
   private wheel = { x: 0, y: 0 };
 
@@ -181,11 +217,33 @@ export class TouchInput {
     this.releaseHeld();
     this.tap = null;
     this.lastTap = null;
+    // 从屏幕边缘切进来的多指滑动基本是系统的手势区在抢，不当成我们的手势
+    if (this.nearEdge()) {
+      this.scroll = null;
+      this.pinch = null;
+      this.three = null;
+      this.gesture = "none";
+      return;
+    }
     if (this.points.size === 2) {
       const c = this.center();
+      const [a, b] = [...this.points.values()];
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
       this.scroll = { x: c.x, y: c.y, moved: 0 };
+      this.pinch = { base: d, ref: d, scaled: false };
+      // 速度从这里开始攒（松手之后的惯性用它）
+      this.velocity = { x: 0, y: 0, t: 0 };
+      this.scrollWindow = { t: 0, dx: 0, dy: 0 };
+      this.three = null;
       this.gesture = "scroll";
+      return;
     }
+    // 第三根手指：三指手势（轻点是中键，左右滑是切桌面），不滚也不点
+    const c = this.center();
+    this.scroll = null;
+    this.pinch = null;
+    this.three = { startX: c.x, startY: c.y, x: c.x, y: c.y, fired: false };
+    this.gesture = "three";
   }
 
   move(p: TouchPointer) {
@@ -193,6 +251,22 @@ export class TouchInput {
     if (!pt) return;
     pt.x = p.clientX;
     pt.y = p.clientY;
+
+    if (this.gesture === "three") {
+      // 三根手指：左右滑一下切桌面（Ctrl+← / →），一次手势只发一次
+      const t = this.three;
+      if (!t || this.points.size < 3) return;
+      const c = this.center();
+      t.x = c.x;
+      t.y = c.y;
+      const dx = t.x - t.startX;
+      const dy = t.y - t.startY;
+      if (!t.fired && Math.abs(dx) > THREE_SLOP && Math.abs(dx) > Math.abs(dy)) {
+        t.fired = true;
+        this.combo(["ControlLeft", dx > 0 ? "ArrowRight" : "ArrowLeft"]);
+      }
+      return;
+    }
 
     if (this.gesture === "scroll") {
       // 只剩一根手指（另一根先抬起了）：继续按住不算滚动，等它抬起结束手势
@@ -203,6 +277,26 @@ export class TouchInput {
       this.scroll.x = c.x;
       this.scroll.y = c.y;
       this.scroll.moved += Math.hypot(dx, dy);
+      // 两指捏合 / 张开：两指的距离在变，而两指的中心几乎没动（中心动得更多就是滚动），
+      // 发 Cmd+= / Cmd+-，这期间不滚
+      const pinch = this.pinch;
+      if (pinch) {
+        const [a, b] = [...this.points.values()];
+        const d = Math.hypot(a.x - b.x, a.y - b.y);
+        const dd = Math.abs(d - pinch.base);
+        const dc = Math.hypot(dx, dy);
+        pinch.base = d;
+        if (pinch.scaled || (dd > PINCH_SLOP && dd > dc * 1.2)) {
+          pinch.scaled = true;
+          const ratio = d / Math.max(1, pinch.ref);
+          if (ratio >= PINCH_STEP || ratio <= 1 / PINCH_STEP) {
+            // 每差一格按一次（张开 = 放大）
+            pinch.ref = d;
+            this.combo(["MetaLeft", ratio >= PINCH_STEP ? "Equal" : "Minus"]);
+          }
+          return;
+        }
+      }
       if (this.scroll.moved > SCROLL_SLOP) this.scrollBy(dx, dy);
       return;
     }
@@ -251,13 +345,36 @@ export class TouchInput {
   up(p: TouchPointer) {
     this.points.delete(p.pointerId);
 
+    if (this.gesture === "three") {
+      // 三根手指都抬起来了：没横滑出去就是轻点（中键）
+      if (this.points.size > 0) return;
+      const t = this.three;
+      this.three = null;
+      this.gesture = "none";
+      if (t && !t.fired && Math.hypot(t.x - t.startX, t.y - t.startY) <= THREE_SLOP) {
+        this.click(this.clickPos({ clientX: t.startX, clientY: t.startY }), "middle");
+      }
+      return;
+    }
+
     if (this.gesture === "scroll") {
       // 两根手指都抬起来了才结束：期间滑过就是滚动，没滑过就是双指点击（右键）
       if (this.points.size > 0) return;
       const tapped = this.scroll !== null && this.scroll.moved <= SCROLL_SLOP;
+      const scaled = this.pinch?.scaled === true;
       this.scroll = null;
+      this.pinch = null;
       this.gesture = "none";
-      if (tapped) this.click(this.clickPos(p), "right");
+      if (scaled) {
+        // 缩放完松手：不补点击，也不带惯性
+        this.velocity = { x: 0, y: 0, t: 0 };
+        this.scrollWindow = { t: 0, dx: 0, dy: 0 };
+      } else if (tapped) {
+        this.click(this.clickPos(p), "right");
+      } else {
+        // 甩出去的：松手之后接着滑一段（见 startMomentum）
+        this.startMomentum();
+      }
       return;
     }
 
@@ -288,10 +405,13 @@ export class TouchInput {
   /** 浏览器把触摸收走了（滚动页面、切换应用……）：按着的都松开，不然被控端一直按着 */
   cancel() {
     this.cancelTimer();
+    this.stopMomentum();
     this.releaseHeld();
     this.points.clear();
     this.tap = null;
     this.scroll = null;
+    this.pinch = null;
+    this.three = null;
     this.gesture = "none";
     this.wheel = { x: 0, y: 0 };
   }
@@ -409,8 +529,84 @@ export class TouchInput {
     return n ? { x: x / n, y: y / n } : { x: 0, y: 0 };
   }
 
+  /** 发一组组合键：修饰键先按下，主键抬起之后再松开（和 session.ts 的 sendCombo 一样） */
+  private combo(codes: string[]) {
+    const events: InputEvent[] = [];
+    for (const code of codes) events.push({ type: "key", code, down: true });
+    for (const code of [...codes].reverse()) events.push({ type: "key", code, down: false });
+    this.send(events, true);
+  }
+
+  /** 松手之后的惯性：按最后一帧的速度接着滚，越滚越慢（MOMENTUM_MS 之后停下） */
+  private startMomentum() {
+    let vx = this.velocity.x;
+    let vy = this.velocity.y;
+    // 松手之前手指就已经停住了：不该再滑
+    if (now() - this.velocity.t > MOMENTUM_HOLD_MS) return;
+    // 慢慢松开的不该再滑：只有甩出去的才有惯性
+    if (Math.hypot(vx, vy) < MOMENTUM_MIN) return;
+    this.stopMomentum();
+    const t0 = now();
+    this.momentum = setInterval(() => {
+      if (now() - t0 > MOMENTUM_MS) {
+        this.stopMomentum();
+        return;
+      }
+      vx *= MOMENTUM_DECAY;
+      vy *= MOMENTUM_DECAY;
+      if (Math.hypot(vx, vy) < MOMENTUM_MIN * 0.4) {
+        this.stopMomentum();
+        return;
+      }
+      this.wheelBy(vx * FRAME_MS, vy * FRAME_MS);
+    }, FRAME_MS);
+    if (typeof this.momentum === "object" && this.momentum && "unref" in this.momentum) {
+      // 别让定时器吊着进程（node --test 里会一直不退出）
+      (this.momentum as unknown as { unref(): void }).unref();
+    }
+  }
+
+  private stopMomentum() {
+    if (this.momentum === undefined) return;
+    clearInterval(this.momentum);
+    this.momentum = undefined;
+  }
+
+  /** 按着的手指有落在画面最外一圈的（见 EDGE_PX） */
+  private nearEdge() {
+    const r = this.host.rect();
+    for (const p of this.points.values()) {
+      if (
+        p.x <= r.left + EDGE_PX ||
+        p.x >= r.left + r.width - EDGE_PX ||
+        p.y <= r.top + EDGE_PX ||
+        p.y >= r.top + r.height - EDGE_PX
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** 手指滑了多少就滚多少（和鼠标滚轮一样按 DOM 像素算，见 input.ts 的 wheel） */
   private scrollBy(dx: number, dy: number) {
+    // 顺手记下滑动的速度：松手之后靠它算惯性（见 startMomentum）。
+    // 一帧的位移不能当速度（同一时刻两根手指各报一次，除以 1 毫秒会算出"飞快"），
+    // 攒够一个窗口再看这段时间里滑了多远。
+    const t = now();
+    if (!this.scrollWindow.t) this.scrollWindow = { t, dx: 0, dy: 0 };
+    this.scrollWindow.dx += dx;
+    this.scrollWindow.dy += dy;
+    const win = t - this.scrollWindow.t;
+    if (win >= MOMENTUM_WINDOW_MS) {
+      this.velocity = { x: this.scrollWindow.dx / win, y: this.scrollWindow.dy / win, t };
+      this.scrollWindow = { t, dx: 0, dy: 0 };
+    }
+    this.wheelBy(dx, dy);
+  }
+
+  /** 真的把滚轮发出去（不到 1 像素的攒着，下次一起发） */
+  private wheelBy(dx: number, dy: number) {
     // 触摸是"抓着画面拖"：手指向右滑，看到的是左边的内容，等于滚轮向左（dx 为负）；
     // 手指向下滑，看到的是上面的内容，等于滚轮向上（dy 为正，见 proto 的 Wheel）
     this.wheel.x -= dx * WHEEL_PER_PX;

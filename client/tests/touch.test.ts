@@ -266,3 +266,151 @@ test("换触摸方式：按着的手势作废，本机画的指针收起来", ()
   input.up({ pointerId: 1, clientX: 300, clientY: 300 });
   assert.equal(events.length, before, "作废的手势不该再补点击");
 });
+
+test("三指轻点：中键", () => {
+  const { events, input } = fakeHost();
+  const fingers = [
+    { pointerId: 1, clientX: 500, clientY: 500 },
+    { pointerId: 2, clientX: 560, clientY: 500 },
+    { pointerId: 3, clientX: 530, clientY: 540 },
+  ];
+  for (const f of fingers) input.down(f);
+  for (const f of fingers) input.up(f);
+  assert.deepEqual(shape(events).slice(-2), ["middle+", "middle-"]);
+});
+
+test("三指右滑：切到右边的桌面（Ctrl+→），一次手势只发一次", () => {
+  const { events, input } = fakeHost();
+  input.down({ pointerId: 1, clientX: 400, clientY: 500 });
+  input.down({ pointerId: 2, clientX: 460, clientY: 500 });
+  input.down({ pointerId: 3, clientX: 430, clientY: 540 });
+  input.move({ pointerId: 1, clientX: 520, clientY: 500 });
+  input.move({ pointerId: 2, clientX: 580, clientY: 500 });
+  input.move({ pointerId: 3, clientX: 550, clientY: 540 });
+  input.move({ pointerId: 1, clientX: 620, clientY: 500 });
+  for (const id of [1, 2, 3]) input.up({ pointerId: id, clientX: 620, clientY: 500 });
+  const keys = events.filter((e) => e.type === "key") as Extract<InputEvent, { type: "key" }>[];
+  assert.deepEqual(
+    keys.map((k) => `${k.code}${k.down ? "+" : "-"}`),
+    ["ControlLeft+", "ArrowRight+", "ArrowRight-", "ControlLeft-"],
+  );
+  // 切桌面的时候不能顺手点一下 / 滚一下
+  assert.ok(!shape(events).some((x) => x.startsWith("left") || x.startsWith("right") || x.startsWith("middle") || x.startsWith("wheel")));
+});
+
+test("三指左滑：切到左边的桌面（Ctrl+←）", () => {
+  const { events, input } = fakeHost();
+  input.down({ pointerId: 1, clientX: 500, clientY: 500 });
+  input.down({ pointerId: 2, clientX: 560, clientY: 500 });
+  input.down({ pointerId: 3, clientX: 530, clientY: 540 });
+  input.move({ pointerId: 1, clientX: 380, clientY: 500 });
+  input.move({ pointerId: 2, clientX: 440, clientY: 500 });
+  input.move({ pointerId: 3, clientX: 410, clientY: 540 });
+  for (const id of [1, 2, 3]) input.up({ pointerId: id, clientX: 380, clientY: 500 });
+  const keys = events.filter((e) => e.type === "key") as Extract<InputEvent, { type: "key" }>[];
+  assert.deepEqual(
+    keys.map((k) => `${k.code}${k.down ? "+" : "-"}`),
+    ["ControlLeft+", "ArrowLeft+", "ArrowLeft-", "ControlLeft-"],
+  );
+});
+
+test("两指张开：放大（Cmd+=）", () => {
+  const { events, input } = fakeHost();
+  input.down({ pointerId: 1, clientX: 400, clientY: 500 });
+  input.down({ pointerId: 2, clientX: 600, clientY: 500 });
+  input.move({ pointerId: 1, clientX: 340, clientY: 500 });
+  input.move({ pointerId: 2, clientX: 660, clientY: 500 });
+  input.up({ pointerId: 1, clientX: 340, clientY: 500 });
+  input.up({ pointerId: 2, clientX: 660, clientY: 500 });
+  const keys = events.filter((e) => e.type === "key") as Extract<InputEvent, { type: "key" }>[];
+  assert.ok(keys.length >= 4, "没有发出缩放");
+  // Cmd 按着、松开，中间全是 Equal（张得越大按的次数越多，次数不固定）
+  assert.equal(`${keys[0].code}${keys[0].down ? "+" : "-"}`, "MetaLeft+");
+  assert.equal(`${keys[keys.length - 1].code}${keys[keys.length - 1].down ? "+" : "-"}`, "MetaLeft-");
+  const steps = keys.filter((k) => k.code !== "MetaLeft");
+  assert.ok(steps.length >= 2 && steps.length % 2 === 0, keys.map((x) => x.code).join(","));
+  for (const k of steps) assert.equal(k.code, "Equal", keys.map((x) => x.code).join(","));
+  // 缩放不是滚动，也不是点击
+  assert.ok(!shape(events).some((x) => x.startsWith("wheel") || x.startsWith("left") || x.startsWith("right")));
+});
+
+test("两指收拢：缩小（Cmd+-）", () => {
+  const { events, input } = fakeHost();
+  input.down({ pointerId: 1, clientX: 300, clientY: 500 });
+  input.down({ pointerId: 2, clientX: 700, clientY: 500 });
+  input.move({ pointerId: 1, clientX: 450, clientY: 500 });
+  input.move({ pointerId: 2, clientX: 550, clientY: 500 });
+  const keys = events.filter((e) => e.type === "key") as Extract<InputEvent, { type: "key" }>[];
+  assert.ok(keys.length >= 4, "没有发出缩放");
+  assert.equal(`${keys[0].code}${keys[0].down ? "+" : "-"}`, "MetaLeft+");
+  assert.equal(`${keys[keys.length - 1].code}${keys[keys.length - 1].down ? "+" : "-"}`, "MetaLeft-");
+  const steps = keys.filter((k) => k.code !== "MetaLeft");
+  assert.ok(steps.length >= 2 && steps.length % 2 === 0, keys.map((x) => x.code).join(","));
+  for (const k of steps) assert.equal(k.code, "Minus", keys.map((x) => x.code).join(","));
+  assert.ok(!shape(events).some((x) => x.startsWith("wheel")));
+});
+
+test("两根手指滑多远就滚多远：一比一跟手", () => {
+  const { events, input } = fakeHost();
+  const scrolled = () =>
+    (events.filter((e) => e.type === "wheel") as Extract<InputEvent, { type: "wheel" }>[])
+      .reduce((n, w) => n + w.dy, 0);
+  input.down({ pointerId: 1, clientX: 500, clientY: 500 });
+  input.down({ pointerId: 2, clientX: 600, clientY: 500 });
+  // 第一下先过滚动的门槛（见 SCROLL_SLOP），门槛里吃掉的那点位移不算
+  input.move({ pointerId: 1, clientX: 500, clientY: 490 });
+  input.move({ pointerId: 2, clientX: 600, clientY: 490 });
+  const before = scrolled();
+  // 再滑 90：滚轮正好跟着 90（手指向上 = 画面往下翻，dy 为负）
+  input.move({ pointerId: 1, clientX: 500, clientY: 400 });
+  input.move({ pointerId: 2, clientX: 600, clientY: 400 });
+  assert.equal(scrolled() - before, -90, "手指滑 90，滚轮也该是 90");
+});
+
+test("两根手指从画面边缘滑进来：不算手势（防误触）", () => {
+  const { events, input } = fakeHost();
+  input.down({ pointerId: 1, clientX: 500, clientY: 4 });
+  input.down({ pointerId: 2, clientX: 600, clientY: 4 });
+  input.move({ pointerId: 1, clientX: 500, clientY: 300 });
+  input.move({ pointerId: 2, clientX: 600, clientY: 300 });
+  input.up({ pointerId: 1, clientX: 500, clientY: 300 });
+  input.up({ pointerId: 2, clientX: 600, clientY: 300 });
+  assert.deepEqual(shape(events), []);
+});
+
+test("两根手指甩一下：松手之后还接着滚一段（惯性）", async () => {
+  const { events, input } = fakeHost();
+  input.down({ pointerId: 1, clientX: 500, clientY: 500 });
+  input.down({ pointerId: 2, clientX: 600, clientY: 500 });
+  // 连着几帧都在滑：有速度才有惯性
+  for (let i = 1; i <= 5; i++) {
+    input.move({ pointerId: 1, clientX: 500, clientY: 500 + i * 20 });
+    input.move({ pointerId: 2, clientX: 600, clientY: 500 + i * 20 });
+    await sleep(16);
+  }
+  input.up({ pointerId: 1, clientX: 500, clientY: 600 });
+  input.up({ pointerId: 2, clientX: 600, clientY: 600 });
+  const wheels = () => events.filter((e) => e.type === "wheel").length;
+  const afterUp = wheels();
+  await sleep(120);
+  assert.ok(wheels() > afterUp, "松手之后应当还在滚");
+  input.reset();
+});
+
+test("慢慢滑到停：松手之后不再滑（没速度就没有惯性）", async () => {
+  const { events, input } = fakeHost();
+  input.down({ pointerId: 1, clientX: 500, clientY: 500 });
+  input.down({ pointerId: 2, clientX: 600, clientY: 500 });
+  // 每帧只滑 2 像素，间隔一小会儿：速度很慢
+  for (let i = 1; i <= 6; i++) {
+    input.move({ pointerId: 1, clientX: 500, clientY: 500 + i * 2 });
+    input.move({ pointerId: 2, clientX: 600, clientY: 500 + i * 2 });
+    await sleep(16);
+  }
+  input.up({ pointerId: 1, clientX: 500, clientY: 512 });
+  input.up({ pointerId: 2, clientX: 600, clientY: 512 });
+  const wheels = () => events.filter((e) => e.type === "wheel").length;
+  const afterUp = wheels();
+  await sleep(120);
+  assert.equal(wheels(), afterUp, "慢速滑动松手之后不该再滚");
+});
