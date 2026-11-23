@@ -37,6 +37,26 @@ echo -e 'net.core.rmem_max=8388608\nnet.core.wmem_max=8388608' | sudo tee /etc/s
 
 The controller can also run in a container: start it with Docker Compose and open one port in a browser to get the console, with nothing to install or build on the computer you control from. It's the same console as the desktop one (several sessions, multi-screen overview, quality, sound, clipboard…); the computers being controlled still run the Airhand client.
 
+### Use a prebuilt image (linux/amd64, for NAS boxes and small servers)
+
+Every push builds an image and pushes it to GHCR, so the machine needs neither Rust nor Node:
+
+```bash
+docker pull ghcr.io/might5/airhand-web:latest
+
+docker run -d --name airhand-web --restart unless-stopped \
+  -p 8080:8080 \
+  -v "$PWD/airhand-web-data:/data" \
+  -e AIRHAND_SERVER=relay.example.com:4433 \
+  ghcr.io/might5/airhand-web:latest
+```
+
+The image is public, no login needed; it's amd64 (x86_64) only, so arm64 machines (Raspberry Pi, some NAS boxes) have to build from source as described below. If pulling is blocked or the machine is offline, grab `airhand-web_<version>_amd64.tar.gz` from the Release tagged `web-v<version>-build-N`, `docker load -i` it, then `docker run ghcr.io/might5/airhand-web:<version>`. To keep using `web/docker-compose.yml` without compiling on the machine, delete its two `build:` lines and point `image:` at `ghcr.io/might5/airhand-web:latest`.
+
+The environment variables, port, certificate and reverse proxy notes below apply to the prebuilt image as well.
+
+### Build from source
+
 ```bash
 cd web
 AIRHAND_SERVER=relay.example.com:4433 AIRHAND_SERVER_FP=<relay certificate fingerprint> docker compose up -d

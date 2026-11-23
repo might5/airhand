@@ -9,6 +9,8 @@ services:
     build:
       context: ..
       dockerfile: web/Dockerfile
+    # 从源码构建的镜像名。改用 CI 构建好的镜像（linux/amd64，见 docs/deploy.zh-CN.md）时，
+    # 删掉下面两行 build:，把这里换成 image: ghcr.io/might5/airhand-web:latest
     image: airhand-web:latest
     container_name: airhand-web
     restart: unless-stopped

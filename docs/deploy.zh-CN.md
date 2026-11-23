@@ -37,6 +37,26 @@ echo -e 'net.core.rmem_max=8388608\nnet.core.wmem_max=8388608' | sudo tee /etc/s
 
 控制端也可以跑在容器里：用 Docker Compose 启动，浏览器打开一个端口就是控制台，操作的电脑上不用安装或构建任何东西。界面和桌面版的控制台完全一样（多会话、多屏总览、画质、声音、剪贴板……）；被控的电脑仍然运行 Airhand 客户端。
 
+### 用现成的镜像（linux/amd64，适合 NAS 和小服务器）
+
+每次推送代码，CI 都会构建一份镜像推到 GHCR，机器上不用装 Rust 或 Node：
+
+```bash
+docker pull ghcr.io/might5/airhand-web:latest
+
+docker run -d --name airhand-web --restart unless-stopped \
+  -p 8080:8080 \
+  -v "$PWD/airhand-web-data:/data" \
+  -e AIRHAND_SERVER=relay.example.com:4433 \
+  ghcr.io/might5/airhand-web:latest
+```
+
+镜像是公开的，拉取不用登录；只有 amd64（x86_64），arm64 的机器（树莓派、部分 NAS）得照下面的办法在源码里构建。拉不动或者机器没外网时，从 Release（标签 `web-v<版本>-build-N`）下载 `airhand-web_<版本>_amd64.tar.gz`，`docker load -i` 进去，再 `docker run ghcr.io/might5/airhand-web:<版本>`。想继续用 `web/docker-compose.yml` 而不在机器上编译：把里面 `build:` 那两行删掉，`image:` 改成 `ghcr.io/might5/airhand-web:latest`。
+
+下面的环境变量、端口、证书、反向代理说明，用现成镜像时同样适用。
+
+### 从源码构建
+
 ```bash
 cd web
 AIRHAND_SERVER=relay.example.com:4433 AIRHAND_SERVER_FP=<服务器证书指纹> docker compose up -d
