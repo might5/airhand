@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
             "AIRHAND_WEB_PASSWORD is not set: anyone who can reach this port can read My devices (control codes, keys and resume tokens of the computers you connected to)"
         );
     }
-    let devices = Arc::new(devices::load(devices_file.as_deref()));
+    let devices = Arc::new(devices::Devices::load(devices_file.as_deref()));
     let app = Arc::new(http::App {
         link: Arc::new(link),
         auth: password.map(auth::Auth::new),
