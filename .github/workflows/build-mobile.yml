@@ -117,16 +117,11 @@ jobs:
           path: ${{ steps.apk.outputs.apk }}
           retention-days: 14
 
-      - name: 发 Release
+      - name: 挂到统一 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="v${{ steps.ver.outputs.ver }}-android-build-${{ github.run_number }}"
-          NOTES="安卓安装包（release 版，含 arm64-v8a / armeabi-v7a / x86_64，Android 7.0 及以上可以装）。"
-          NOTES="$NOTES 没配签名密钥，用的是调试密钥：可以直接传到手机上安装；要长期发版、能覆盖升级，请用固定的密钥重新签名。"
-          gh release create "$TAG" "${{ steps.apk.outputs.apk }}" \
-            --title "Airhand ${{ steps.ver.outputs.ver }} Android build ${{ github.run_number }}" \
-            --notes "$NOTES"
+          bash .github/scripts/release-upload.sh "${{ steps.ver.outputs.ver }}" "${{ steps.apk.outputs.apk }}"
 
       - name: 构建日志（失败时）
         if: failure()
@@ -214,19 +209,11 @@ jobs:
           path: ${{ steps.ipa.outputs.ipa }}
           retention-days: 14
 
-      - name: 发 Release
+      - name: 挂到统一 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="v${{ steps.ver.outputs.ver }}-ios-build-${{ github.run_number }}"
-          if [ "${{ steps.ipa.outputs.signed }}" = "1" ]; then
-            NOTES="iOS 安装包（已用开发者证书自动签名，iOS 17.0 及以上）。用 Xcode 或 Apple Configurator 装到已注册的设备上。"
-          else
-            NOTES="iOS 安装包（未正式签名，做了 ad-hoc 签名并带上 App Group 权限，iOS 17.0 及以上）。用 Sideloadly / AltStore 装到手机，或者用自己的证书重新签名后再装。"
-          fi
-          gh release create "$TAG" "${{ steps.ipa.outputs.ipa }}" \
-            --title "Airhand ${{ steps.ver.outputs.ver }} iOS build ${{ github.run_number }}" \
-            --notes "$NOTES"
+          bash .github/scripts/release-upload.sh "${{ steps.ver.outputs.ver }}" "${{ steps.ipa.outputs.ipa }}"
 
       - name: 构建日志（失败时）
         if: failure()

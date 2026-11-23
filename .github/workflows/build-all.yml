@@ -3,6 +3,9 @@ name: Build everything
 # 一键把东西都构建一遍：桌面客户端（macOS dmg + Windows exe）、网页控制台镜像、中转服务器镜像、
 # 安卓 APK、iOS 安装包。
 # 只手动触发（Actions 页面点 "Run workflow"）：平时各条流水线只在自己相关的文件变了才跑，这里是不想等下个提交时用的。
+#
+# 五条流水线的产物全部挂到同一个 Release（tag = v<版本号>，如 v0.3.1，见 .github/scripts/release-upload.sh），
+# 所以先校验各处版本号是否一致，再并行构建：版本号不一致就会分裂成两个 Release。
 on:
   workflow_dispatch:
 
@@ -11,16 +14,47 @@ permissions:
   packages: write
 
 jobs:
+  version:
+    name: 版本号一致性检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      ver: ${{ steps.ver.outputs.ver }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 比对客户端 / 网页 / 服务端 / 安卓 / iOS 的版本号
+        id: ver
+        run: |
+          CLIENT=$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' client/src-tauri/tauri.conf.json | head -1)
+          SERVER=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+          WEB=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' web/Cargo.toml | head -1)
+          ANDROID=$(sed -n 's/^val appVersion *= *"\([^"]*\)".*/\1/p' android/app/build.gradle.kts | head -1)
+          IOS=$(sed -n 's/^ *MARKETING_VERSION: *"\([^"]*\)".*/\1/p' ios/project.yml | head -1)
+          echo "client=$CLIENT server=$SERVER web=$WEB android=$ANDROID ios=$IOS"
+          [ -n "$CLIENT" ] || { echo "没从 client/src-tauri/tauri.conf.json 读到版本号"; exit 1; }
+          for v in "$SERVER" "$WEB" "$ANDROID" "$IOS"; do
+            [ "$v" = "$CLIENT" ] || {
+              echo "版本号不一致（client=$CLIENT server=$SERVER web=$WEB android=$ANDROID ios=$IOS），会分裂成多个 Release，先对齐再构建"
+              exit 1
+            }
+          done
+          echo "ver=$CLIENT" >> "$GITHUB_OUTPUT"
+
   desktop:
+    needs: version
     uses: ./.github/workflows/build-clients.yml
 
   web:
+    needs: version
     uses: ./.github/workflows/build-web.yml
 
   server:
+    needs: version
     uses: ./.github/workflows/build-server.yml
 
   # 移动端两条都慢（Rust 核心要按 ABI / SDK 各编一遍），只要桌面端时单独跑上面那三条就行
   mobile:
+    needs: version
     uses: ./.github/workflows/build-mobile.yml
     secrets: inherit

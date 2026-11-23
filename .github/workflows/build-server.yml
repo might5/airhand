@@ -92,15 +92,12 @@ jobs:
           docker save "ghcr.io/${{ github.repository_owner }}/airhand-server:${VER}" | gzip -1 > "$FILE"
           ls -lh "$FILE"
 
-      - name: 发布到 Release
+      - name: 挂到统一 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER="${{ steps.ver.outputs.ver }}"
-          TAG="server-v${VER}-build-${{ github.run_number }}"
-          FILE="airhand-server_${VER}_amd64.tar.gz"
-          NOTES="中转服务器的容器镜像（linux/amd64，版本 ${VER}，监听 UDP 4433）：docker load -i ${FILE} 之后 docker run -p 4433:4433/udp -v <数据目录>:/data ghcr.io/${{ github.repository_owner }}/airhand-server:${VER}"
-          gh release create "$TAG" "$FILE" --title "Airhand Server ${VER} (server image, build ${{ github.run_number }})" --notes "$NOTES"
+          bash .github/scripts/release-upload.sh "$VER" "airhand-server_${VER}_amd64.tar.gz"
 
       # 构建成功后把以前失败时留下的调试 Release 清掉
       - name: 清理调试 Release
