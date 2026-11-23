@@ -1,10 +1,18 @@
 name: Build mobile clients
 
-# 移动端两个包：安卓 APK（android/ 里的 Compose 应用）和 iOS 的 ipa。
-# 只手动触发（Actions 页面 Run workflow）或被 build-all.yml 调用，push 不会自动跑：
-# 这两条都要先按各自的 ABI / SDK 把 Rust 核心交叉编译一遍（LTO + codegen-units=1），
-# 每次提交都跑太费时间，需要时叫一声再构建。
+# 移动端两个包：安卓 APK（android/ 里的 Compose 应用）和 iOS 的 ipa，跟桌面端一起构建、产物进同一个 Release。
+# 触发条件比桌面端窄：只有移动端目录或核心 crates 变了、以及手动/一键全量时跑，
+# 因为两条都要按各自 ABI / SDK 把 Rust 核心交叉编译一遍（LTO + codegen-units=1），很慢。
 on:
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - "ios/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/build-mobile.yml"
   workflow_dispatch:
     inputs:
       server:

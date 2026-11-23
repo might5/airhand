@@ -1,0 +1,76 @@
+name: Cleanup scattered releases
+
+# 一次性收拾历史遗留：早期各条流水线各发各的 Release（build-N、v0.3.1-build-N、web-v…-build-N、
+# server-v…-build-N、v…-android-build-N / v…-ios-build-N），现在产物统一并进 v<版本号> 的 Release，
+# 这些分散的就没用了。
+#
+# 只删白名单里的旧形态；纯版本号（v0.3.1 这种，即真正在用的 Release）无论 dry_run 怎么设都不会被删。
+# 手动触发时默认 dry_run=true 只打印清单，要真删得把 dry_run 填成 false。
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只列出要删的 tag、不真删；填 false 才真删"
+        type: string
+        required: false
+        default: "true"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/cleanup-releases.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    name: 删除分散的旧 Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 按白名单清理
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # 手动触发时听 dry_run 输入；由本文件的 push 触发时输入为空，按真删处理
+          DRY_RUN="${DRY_RUN_INPUT:-false}"
+          echo "dry_run=${DRY_RUN}"
+
+          # 旧的分散 tag 形态
+          OLD='^(build-[0-9]+|v[0-9]+\.[0-9]+\.[0-9]+-build-[0-9]+|web-v[0-9]+\.[0-9]+\.[0-9]+-build-[0-9]+|server-v[0-9]+\.[0-9]+\.[0-9]+-build-[0-9]+|v[0-9]+\.[0-9]+\.[0-9]+-(android|ios)-build-[0-9]+|debug-(web|server)-[0-9]+)$'
+          # 正在用的统一 Release：纯版本号，绝不删
+          KEEP='^v[0-9]+\.[0-9]+\.[0-9]+$'
+
+          gh release list --repo "${{ github.repository }}" --limit 200 --json tagName -q '.[].tagName' > tags.txt
+          echo "=== 现有 Release tag ==="
+          cat tags.txt
+
+          grep -E "$OLD" tags.txt > targets.txt || true
+          # 双保险：即使上面正则写错，纯版本号也进不了删除清单
+          grep -vE "$KEEP" targets.txt > final.txt || true
+
+          echo "=== 要删的 tag ==="
+          cat final.txt
+          echo "=== 保留的 tag ==="
+          grep -E "$KEEP" tags.txt || echo "（无）"
+
+          if [ ! -s final.txt ]; then
+            echo "没有需要清理的 Release"
+            exit 0
+          fi
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "dry run：不删，仅列出"
+            exit 0
+          fi
+
+          while IFS= read -r tag; do
+            [ -n "${tag}" ] || continue
+            echo "删除 ${tag}"
+            gh release delete "${tag}" --repo "${{ github.repository }}" --yes --cleanup-tag \
+              || echo "删除 ${tag} 失败，跳过"
+          done < final.txt
+
+          echo "=== 清理后剩余 ==="
+          gh release list --repo "${{ github.repository }}" --limit 200 --json tagName -q '.[].tagName'
