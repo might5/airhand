@@ -1,0 +1,20 @@
+name: Build everything
+
+# 一键把三样东西都构建一遍：桌面客户端（macOS dmg + Windows exe）、网页控制台镜像、中转服务器镜像。
+# 只手动触发（Actions 页面点 "Run workflow"）：平时各条流水线只在自己相关的文件变了才跑，这里是不想等下个提交时用的。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  desktop:
+    uses: ./.github/workflows/build-clients.yml
+
+  web:
+    uses: ./.github/workflows/build-web.yml
+
+  server:
+    uses: ./.github/workflows/build-server.yml

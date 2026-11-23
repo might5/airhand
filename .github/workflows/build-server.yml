@@ -1,0 +1,113 @@
+name: Build server image
+
+# 中转服务器（UDP 4433）的镜像：推到 ghcr.io/<owner>/airhand-server，同时把镜像存成 tar.gz
+# 挂在 Release 上（没外网 / 不想登录 GHCR 时 docker load 进去就能用）。
+# 只构建 linux/amd64：服务器基本都跑在 x86_64 上；arm64 在 platforms 里加 linux/arm64（走 QEMU，慢很多）。
+permissions:
+  contents: write
+  packages: write
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "server/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/build-server.yml"
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 版本号
+        id: ver
+        run: |
+          VER=$(sed -n 's/^version *= *"\(.*\)".*/\1/p' Cargo.toml | head -1)
+          echo "server 版本号：$VER"
+          [ -n "$VER" ] || { echo "没能从 Cargo.toml 的 [workspace.package] 读到版本号"; exit 1; }
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/airhand-server
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.ver.outputs.ver }}
+            type=raw,value=${{ steps.ver.outputs.ver }}-build-${{ github.run_number }}
+            type=sha,format=short
+
+      - name: 构建镜像
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -o pipefail
+          ARGS=()
+          while IFS= read -r t; do [ -n "$t" ] && ARGS+=(--tag "$t"); done <<< "$TAGS"
+          docker buildx build --platform linux/amd64 "${ARGS[@]}" \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --cache-from type=gha --cache-to type=gha,mode=max \
+            --load -f server/Dockerfile . 2>&1 | tee build.log
+
+      # 失败时把完整构建日志放进一个临时 Release（本机拿不到 Actions 日志时靠它定位）
+      - name: 失败时贴出构建日志
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tail -c 300000 build.log > build-log.txt 2>/dev/null || true
+          gh release create "debug-server-${{ github.run_number }}" build-log.txt \
+            --title "debug server build ${{ github.run_number }}" --notes "构建失败时的 docker build 日志" || true
+
+      - name: 推到 GHCR
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "推送 $tag"
+            docker push "$tag"
+          done <<< "$TAGS"
+
+      - name: 存成 tar.gz（离线 load 用）
+        run: |
+          VER="${{ steps.ver.outputs.ver }}"
+          FILE="airhand-server_${VER}_amd64.tar.gz"
+          docker save "ghcr.io/${{ github.repository_owner }}/airhand-server:${VER}" | gzip -1 > "$FILE"
+          ls -lh "$FILE"
+
+      - name: 发布到 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER="${{ steps.ver.outputs.ver }}"
+          TAG="server-v${VER}-build-${{ github.run_number }}"
+          FILE="airhand-server_${VER}_amd64.tar.gz"
+          NOTES="中转服务器的容器镜像（linux/amd64，版本 ${VER}，监听 UDP 4433）：docker load -i ${FILE} 之后 docker run -p 4433:4433/udp -v <数据目录>:/data ghcr.io/${{ github.repository_owner }}/airhand-server:${VER}"
+          gh release create "$TAG" "$FILE" --title "Airhand Server ${VER} (server image, build ${{ github.run_number }})" --notes "$NOTES"
+
+      # 构建成功后把以前失败时留下的调试 Release 清掉
+      - name: 清理调试 Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release list --limit 100 --json tagName --jq '.[].tagName' \
+            | grep '^debug-server-' \
+            | xargs -r -n1 gh release delete --yes --cleanup-tag || true

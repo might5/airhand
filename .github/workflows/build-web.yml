@@ -19,6 +19,7 @@ on:
       - "Cargo.lock"
       - ".github/workflows/build-web.yml"
   workflow_dispatch:
+  workflow_call:
 
 jobs:
   image:
