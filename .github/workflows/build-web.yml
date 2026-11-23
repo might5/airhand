@@ -1,0 +1,89 @@
+name: Build web image
+
+# 网页控制台（控制端跑在容器里）的镜像：推到 ghcr.io/<owner>/airhand-web，同时把镜像存成 tar.gz
+# 挂在 Release 上（没网 / 不想登录 GHCR 时 docker load 进去就能用）。
+# 只构建 linux/amd64：NAS、家里的小服务器基本都是 x86_64；要 arm64 的话在 platforms 里加 linux/arm64
+# （走 QEMU，Rust 编译会慢很多）。
+permissions:
+  contents: write
+  packages: write
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "client/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/build-web.yml"
+  workflow_dispatch:
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 版本号
+        id: ver
+        run: echo "ver=$(grep -m1 '^version' web/Cargo.toml | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/airhand-web
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.ver.outputs.ver }}
+            type=raw,value=${{ steps.ver.outputs.ver }}-build-${{ github.run_number }}
+            type=sha,format=short
+
+      # 构建一次、留在本地：既能 docker save 成 tar.gz，也省得为推镜像再编一遍 Rust
+      - name: 构建镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: web/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 推到 GHCR
+        run: |
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "推送 $tag"
+            docker push "$tag"
+          done <<< "${{ steps.meta.outputs.tags }}"
+
+      - name: 存成 tar.gz（离线 load 用）
+        run: |
+          VER="${{ steps.ver.outputs.ver }}"
+          FILE="airhand-web_${VER}_amd64.tar.gz"
+          docker save "ghcr.io/${{ github.repository_owner }}/airhand-web:${VER}" | gzip -1 > "$FILE"
+          ls -lh "$FILE"
+
+      - name: 发布到 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER="${{ steps.ver.outputs.ver }}"
+          TAG="web-v${VER}-build-${{ github.run_number }}"
+          FILE="airhand-web_${VER}_amd64.tar.gz"
+          NOTES="网页控制台的容器镜像（linux/amd64，版本 ${VER}）：docker load -i ${FILE} 之后 docker run ghcr.io/${{ github.repository_owner }}/airhand-web:${VER}"
+          gh release create "$TAG" "$FILE" --title "Airhand Web ${VER} (web image, build ${{ github.run_number }})" --notes "$NOTES"
