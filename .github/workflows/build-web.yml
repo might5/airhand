@@ -52,24 +52,36 @@ jobs:
 
       # 构建一次、留在本地：既能 docker save 成 tar.gz，也省得为推镜像再编一遍 Rust
       - name: 构建镜像
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: web/Dockerfile
-          platforms: linux/amd64
-          load: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -o pipefail
+          ARGS=()
+          while IFS= read -r t; do [ -n "$t" ] && ARGS+=(--tag "$t"); done <<< "$TAGS"
+          docker buildx build --platform linux/amd64 "${ARGS[@]}" \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --cache-from type=gha --cache-to type=gha,mode=max \
+            --load -f web/Dockerfile . 2>&1 | tee build.log
+
+      # 失败时把完整构建日志放进一个临时 Release（本机拿不到 Actions 日志时靠它定位）
+      - name: 失败时贴出构建日志
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tail -c 300000 build.log > build-log.txt 2>/dev/null || true
+          gh release create "debug-web-${{ github.run_number }}" build-log.txt \
+            --title "debug web build ${{ github.run_number }}" --notes "构建失败时的 docker build 日志" || true
 
       - name: 推到 GHCR
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          while read -r tag; do
+          while IFS= read -r tag; do
             [ -n "$tag" ] || continue
             echo "推送 $tag"
             docker push "$tag"
-          done <<< "${{ steps.meta.outputs.tags }}"
+          done <<< "$TAGS"
 
       - name: 存成 tar.gz（离线 load 用）
         run: |
