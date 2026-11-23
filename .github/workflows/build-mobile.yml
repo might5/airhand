@@ -66,15 +66,27 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # Android SDK（Platform 35 + build-tools）和 NDK 27：Gradle 用 cargo-ndk 编 Rust 核心时要 NDK
-      - uses: android-actions/setup-android@v3
-
+      # Android SDK（Platform 35 + build-tools）和 NDK 27：Gradle 用 cargo-ndk 编 Rust 核心时要 NDK。
+      # ubuntu 镜像本来就预装了 SDK + cmdline-tools，直接用自带的那份，不再走 setup-android
+      # （那个 action 在预装 SDK 的 runner 上会因为目录属主/已存在的问题失败）。
       - name: Android SDK / NDK
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          ls "$ANDROID_HOME/ndk"
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SM" ] || SM="$(command -v sdkmanager || true)"
+          if [ ! -x "$SM" ]; then
+            echo "::error::找不到 sdkmanager（ANDROID_HOME=$SDK）"
+            ls -la "$SDK" 2>/dev/null || true
+            exit 1
+          fi
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "$(dirname "$SM")" >> "$GITHUB_PATH"
+          echo "sdkmanager: $SM"
+          yes | "$SM" --licenses > /dev/null 2>&1 || true
+          "$SM" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+          echo "ANDROID_HOME=$SDK"
+          ls "$SDK/ndk"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -108,7 +120,11 @@ jobs:
         run: |
           set -o pipefail
           chmod +x gradlew
-          ./gradlew --no-daemon --stacktrace assembleRelease 2>&1 | tee android-build.log
+          if ! ./gradlew --no-daemon --stacktrace assembleRelease 2>&1 | tee android-build.log; then
+            echo "::error::Android 构建失败，关键错误如下（完整日志见 artifact android-build-log）"
+            grep -nE "^e: |error:|FAILURE:|What went wrong|Caused by|> Task .* FAILED" android-build.log | head -15 | while IFS= read -r l; do echo "::error::${l}"; done
+            exit 1
+          fi
 
       - name: 收集产物
         id: apk
@@ -190,7 +206,11 @@ jobs:
         run: |
           set -o pipefail
           chmod +x scripts/*.sh
-          scripts/build-ipa.sh 2>&1 | tee ios-build.log
+          if ! scripts/build-ipa.sh 2>&1 | tee ios-build.log; then
+            echo "::error::iOS 构建失败，关键错误如下（完整日志见 artifact ios-build-log）"
+            grep -nE "error:|Error Domain|Failed to|FAILED|Command .* failed|warning: .*deployment target" ios-build.log | head -15 | while IFS= read -r l; do echo "::error::${l}"; done
+            exit 1
+          fi
 
       - name: 收集产物
         id: ipa
