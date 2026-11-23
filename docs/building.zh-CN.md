@@ -67,6 +67,7 @@ npm run tauri build
 ### Windows 说明
 
 - 安装程序可以为所有用户安装并注册系统服务，也可以仅为当前用户安装（见 [Windows 安装版](usage.zh-CN.md#windows-安装版)），附加步骤在 `client/src-tauri/windows/hooks.nsh`
+- 虚拟显示器驱动（MttVDD，见[虚拟显示器](usage.zh-CN.md#虚拟显示器)）在 `client/src-tauri/windows/vdd/` 里，打包时放进安装目录的 `vdd\`（`tauri.windows.conf.json` 的 `resources`）。这几个文件原样取自它的发布包、带着签名，不要改；更新方法见那里的 `README.md`
 - `npm run tauri build -- --no-bundle` 只生成 `airhand.exe`，但发布版没有安装时不能运行
 - C 运行时是静态链接的，不需要装 VC++ 运行库
 - Media Foundation 是延迟加载的，Windows N 版（没装媒体功能包）也能运行，会改用软件编码

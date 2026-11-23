@@ -26,6 +26,8 @@ import {
   IconPower,
   IconRefresh,
   IconRestoreBar,
+  IconShield,
+  IconShieldOff,
   IconShrink,
   IconSliders,
   IconTouch,
@@ -105,7 +107,18 @@ const combosFor = (platform: Platform | null, os: string) => {
   return os === "" || /windows/i.test(os) ? WINDOWS_COMBOS : /^macos/i.test(os) ? MAC_COMBOS : LINUX_COMBOS;
 };
 
-type Menu = null | "quality" | "mouse" | "touch" | "keys" | "display" | "clipboard" | "audio" | "mic" | "sessions";
+type Menu =
+  | null
+  | "quality"
+  | "mouse"
+  | "touch"
+  | "keys"
+  | "display"
+  | "clipboard"
+  | "audio"
+  | "mic"
+  | "privacy"
+  | "sessions";
 
 /** 鼠标模式的图标（工具栏的鼠标按钮显示现在的） */
 const MOUSE_ICONS: Record<MouseMode, typeof IconMouse> = { auto: IconMouse, desktop: IconPointer, game: IconGamepad };
@@ -622,6 +635,46 @@ export function SessionView({ s }: { s: RemoteSession }) {
               )}
             </div>
           )}
+          {s.privacyState !== null && (
+            // 防窥模式：对方说了它的状态才显示（Windows 被控端）；开不了的也显示，在菜单里说明为什么
+            <div className="menu-anchor">
+              <button
+                className={`tb-btn icon ${menu === "privacy" || privacyActive(s) ? "on" : ""}`}
+                title={s.privacyState === "on" ? t("session.privacyOn") : t("session.privacy")}
+                onClick={() => toggleMenu("privacy")}
+              >
+                {privacyActive(s) ? <IconShield size={17} /> : <IconShieldOff size={17} />}
+                {s.privacyState === "failed" ? (
+                  <span className="tb-dot warn" />
+                ) : (
+                  s.privacyState === "on" && <span className="tb-dot" />
+                )}
+              </button>
+              {menu === "privacy" && (
+                <Dropdown onClose={closeMenu} className="audio-menu">
+                  <label className={`dd-item toggle ${privacyUsable(s) ? "" : "disabled"}`}>
+                    <span>
+                      {t("privacy.toggle")}
+                      <span className="muted small block">{privacyHint(s)}</span>
+                    </span>
+                    <input
+                      type="checkbox"
+                      className="switch"
+                      checked={privacyActive(s)}
+                      disabled={!privacyUsable(s)}
+                      onChange={(e) => s.setPrivacy(e.target.checked)}
+                    />
+                  </label>
+                  {privacyUsable(s) && (
+                    <>
+                      <div className="dd-sep" />
+                      <div className="dd-foot muted small">{t("privacy.note")}</div>
+                    </>
+                  )}
+                </Dropdown>
+              )}
+            </div>
+          )}
           {s.hostPlatform !== "android" && s.hostPlatform !== "ios" && (
             // 鼠标：自动 / 桌面 / 游戏（见 input.ts），还有画面里有光标时显不显示本机光标。手机是点触屏的，没有这些
             <div className="menu-anchor">
@@ -913,6 +966,33 @@ function micHint(s: RemoteSession): string {
       const hint = t(s.micLive ? "mic.live" : "mic.ready", { device });
       return s.hostPlatform === "mac" ? `${hint} ${t("mic.macPermission")}` : hint;
     }
+  }
+}
+
+/** 防窥模式开着或者正在打开 */
+function privacyActive(s: RemoteSession): boolean {
+  return s.privacyState === "on" || s.privacyState === "starting";
+}
+
+/** 对方能开防窥模式（装了虚拟显示器驱动、设置允许） */
+function privacyUsable(s: RemoteSession): boolean {
+  return s.privacyState !== "unavailable" && s.privacyState !== "notAllowed";
+}
+
+function privacyHint(s: RemoteSession): string {
+  switch (s.privacyState) {
+    case "unavailable":
+      return t("privacy.unavailable");
+    case "notAllowed":
+      return t("privacy.notAllowed");
+    case "starting":
+      return t("privacy.starting");
+    case "on":
+      return t("privacy.on");
+    case "failed":
+      return t("privacy.failed", { detail: s.privacyDetail ?? "—" });
+    default:
+      return t("privacy.off");
   }
 }
 

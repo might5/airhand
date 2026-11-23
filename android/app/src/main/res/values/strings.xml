@@ -187,6 +187,10 @@
     <string name="nav_keys_desc">Back, Home and Recents below the screen when controlling a phone</string>
     <string name="local_cursor">Local cursor while dragging windows</string>
     <string name="local_cursor_desc">The other computer draws its cursor into the picture while a window is dragged or resized. On: still draw this device\'s cursor, which follows your finger with no delay. Off: show only the one in the picture</string>
+    <string name="reverse_wheel">Reverse mouse wheel</string>
+    <string name="reverse_wheel_desc">A connected mouse\'s wheel scrolls the other way. Two-finger scrolling on the screen doesn\'t change</string>
+    <string name="wheel_speed">Mouse wheel speed</string>
+    <string name="percent" translatable="false">%1$d%%</string>
     <string name="settings_data">Data</string>
     <string name="clear_devices">Clear saved devices</string>
     <string name="clear_devices_desc">%1$d saved</string>
@@ -228,6 +232,8 @@
     <string name="audio_playback_failed">Can\'t play the sound: %1$s</string>
     <string name="menu_keyboard">Keyboard</string>
     <string name="menu_shortcuts">Shortcuts</string>
+    <string name="swap_ctrl_command">Swap Ctrl and ⌘ Command</string>
+    <string name="swap_ctrl_command_desc">On a connected keyboard Ctrl works as ⌘ and the Win key as Control. The extra keys row and the shortcuts below don\'t change. Remembered for this computer</string>
     <string name="menu_sound_on">Sound on</string>
     <string name="menu_sound_off">Sound off</string>
     <string name="menu_mouse_lock_on">Mouse lock on</string>

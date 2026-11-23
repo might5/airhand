@@ -31,6 +31,8 @@ cargo test --lib loopback_captures_tone -- --ignored --nocapture
 cargo test --lib mic_reaches_steam_streaming_microphone -- --ignored --nocapture
 # macOS 14.2+ / Linux with PipeWire and pactl: crash recovery, disconnect and uninstall during forwarding
 cargo test --lib native_mic_cleanup -- --ignored --nocapture
+# Windows: list the current displays, which ones are virtual, and the main monitor's mode (read-only, changes nothing)
+cargo test --lib list_displays -- --ignored --nocapture
 
 # The phone core shared by Android and iOS (crates/airhand-mobile: in-flight control, keyframes, audio fan-out, command format) runs in the root cargo test
 # ios/: Swift unit tests (protocol fixture, Annex-B, AV1, Opus, jitter buffer, gestures); end-to-end tests in the simulator are in docs/ios.md#testing

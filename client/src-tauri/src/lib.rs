@@ -49,7 +49,7 @@ use tauri::webview::{PermissionKind, PermissionResponse};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tracing::{info, warn};
 
-use host::{HostCmd, HostService};
+use host::{HostCmd, HostCode, HostService};
 use i18n::Lang;
 use status::{HostStatus, Mode, StatusHub};
 
@@ -61,6 +61,8 @@ static EXITING: AtomicBool = AtomicBool::new(false);
 pub struct AppState {
     hub: StatusHub,
     services: Mutex<Services>,
+    /// 本机的控制码：本进程里的被控端停下再启动（macOS / Linux 打开、关掉控制台）时接着用它
+    host_code: HostCode,
     console_opening: AtomicBool,
     webview_dirs: Mutex<Vec<PathBuf>>,
     /// Windows 安装版：被控端在系统服务里运行（托盘只负责显示和操作），切换模式不影响它
@@ -103,6 +105,33 @@ impl Hosting {
                 HostCmd::KickAll => winsvc::ipc::ToAgent::KickAll,
                 HostCmd::NewCode => winsvc::ipc::ToAgent::NewCode,
             }),
+        }
+    }
+
+    /// 托盘菜单里切换"结束远程后锁屏"（见 `host::ending`）。`hub`：本进程里的被控端用的状态（就是托盘的）
+    fn set_lock_on_end(&self, hub: &StatusHub, on: bool) {
+        match self {
+            Hosting::InProcess(_) => {
+                let hub = hub.clone();
+                // 要写配置文件，不在主线程上做
+                std::thread::spawn(move || host::set_lock_on_end(&hub, on));
+            }
+            #[cfg(windows)]
+            Hosting::Service(link) => link.send(winsvc::ipc::ToAgent::SetLockOnEnd { on }),
+        }
+    }
+
+    /// 菜单里切换"不自动睡眠"（macOS，见 `host::power`）。`hub`：本进程里的被控端用的状态（就是托盘的）
+    fn set_prevent_sleep(&self, hub: &StatusHub, on: bool) {
+        match self {
+            Hosting::InProcess(_) => {
+                let hub = hub.clone();
+                // 要写配置文件，不在主线程上做
+                std::thread::spawn(move || host::set_prevent_sleep(&hub, on));
+            }
+            // 服务里的被控端没有这一项（`HostStatus::prevent_sleep` 是 `None`，菜单里不显示）
+            #[cfg(windows)]
+            Hosting::Service(_) => {}
         }
     }
 
@@ -151,7 +180,10 @@ fn switch_services(app: &AppHandle, mode: Mode) {
         });
         match mode {
             Mode::Host if host_follows => {
-                sv.host = Some(Hosting::InProcess(HostService::start(state.hub.clone())));
+                sv.host = Some(Hosting::InProcess(HostService::start(
+                    state.hub.clone(),
+                    state.host_code.clone(),
+                )));
                 #[cfg(target_os = "macos")]
                 host::macos::request_permissions();
             }
@@ -353,6 +385,24 @@ pub(crate) fn on_menu(app: &AppHandle, id: &str) {
             if let Some(h) = &app.state::<AppState>().services.lock().unwrap().host {
                 h.send(cmd);
             }
+        }
+        "lock_on_end" => {
+            let state = app.state::<AppState>();
+            let current = state.hub.borrow().host.lock_on_end;
+            if let (Some(current), Some(h)) = (current, &state.services.lock().unwrap().host) {
+                h.set_lock_on_end(&state.hub, !current);
+            }
+            // 勾选项被点击时系统会自动翻转勾选状态：先按原来的设置重建菜单，改好了（被控端确认后）再刷新
+            state.hub.send_modify(|_| {});
+        }
+        "prevent_sleep" => {
+            let state = app.state::<AppState>();
+            let current = state.hub.borrow().host.prevent_sleep;
+            if let (Some(current), Some(h)) = (current, &state.services.lock().unwrap().host) {
+                h.set_prevent_sleep(&state.hub, !current);
+            }
+            // 同上：先按原来的设置重建菜单，改好了再刷新
+            state.hub.send_modify(|_| {});
         }
         "new_pairing" | "forget_paired" => {
             let cmd = if id == "new_pairing" {
@@ -703,6 +753,7 @@ pub fn run() {
         .manage(AppState {
             hub: hub.clone(),
             services: Mutex::default(),
+            host_code: HostCode::default(),
             console_opening: AtomicBool::new(false),
             webview_dirs: Mutex::default(),
             service_mode,
@@ -745,7 +796,8 @@ pub fn run() {
             let hosting = if service_mode {
                 start_service_link(&handle, &hub)
             } else {
-                Hosting::InProcess(HostService::start(hub.clone()))
+                let code = app.state::<AppState>().host_code.clone();
+                Hosting::InProcess(HostService::start(hub.clone(), code))
             };
             app.state::<AppState>().services.lock().unwrap().host = Some(hosting);
             // 仅调试构建：方便开发时直接进入控制端
@@ -824,6 +876,10 @@ pub fn run() {
                 sv.host = None;
                 sv.controller = None;
             }
+            // 还有远程控制就当它结束了：先锁屏（见 host::ending），
+            // 再让虚拟显示器恢复原样（被控端在本进程里运行时；没用过它就什么也不做）
+            host::ending::shutdown();
+            host::virtual_display::shutdown();
             popout::close_all(app);
             if let Some(w) = app.get_webview_window(CONSOLE) {
                 let _ = w.destroy();

@@ -4,7 +4,12 @@
 //! * 系统在 GPU 上缩放到编码尺寸，输出 NV12（sRGB、BT.709 有限范围）；`CVPixelBuffer`（IOSurface）
 //!   原样交给 VideoToolbox（[`GpuFrame`]），CPU 不碰像素；
 //! * 通常由控制端绘制光标（通过 `NSCursor` 读取形状）；需要带光标的画面时由系统画进去；
-//! * 显示器分辨率或排列变化、流被系统停止时报错，由采集线程重建采集器。
+//! * 显示器分辨率或排列变化、流被系统停止时报错，由采集线程重建采集器；
+//! * 睡着的显示器采集不到画面（流打不开，或者只给几个空样本）：锁屏之后显示器常常跟着熄了。打开时显示器睡着
+//!   （或者列不出来）就叫醒它（[`power::wake_display`]）、报错，采集线程过一会儿再来打开；采集期间显示器睡着了
+//!   也报错重来。亮着的锁屏界面照常采集。合着笔记本的盖子时不叫（只会在盖子后面亮 10 秒，画面每 10 秒断一次）：
+//!   补屏的虚拟显示器顶上，采集它（见 `virtual_display`）；
+//! * 锁屏、解锁时重建采集器：一直开着的流在这前后可能停在上一个画面上，等不来新的画面。
 
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Condvar, Mutex};
@@ -17,8 +22,8 @@ use objc2_core_foundation::CFRetained;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::kCGDisplayStreamYCbCrMatrix_ITU_R_709_2;
 use objc2_core_graphics::{
-    CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGImageByteOrderInfo,
-    kCGColorSpaceSRGB,
+    CGBitmapContextCreate, CGColorSpace, CGContext, CGDisplayIsAsleep, CGImageAlphaInfo,
+    CGImageByteOrderInfo, kCGColorSpaceSRGB,
 };
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_core_video::{
@@ -32,10 +37,13 @@ use objc2_screen_capture_kit::{SCFrameStatus, SCStreamConfiguration, SCStreamOut
 
 use super::{CaptureUpdate, Capturer, Frame, FramePool};
 use crate::host::macos::{self, Display};
+use crate::host::power;
 use crate::host::sck::{self, Sample};
 
 /// 定期检查显示器分辨率 / 排列的间隔
 const LAYOUT_CHECK: Duration = Duration::from_secs(2);
+/// 定期检查显示器睡着没有、屏幕锁着没有的间隔
+const STATE_CHECK: Duration = Duration::from_millis(500);
 /// 读取光标形状的间隔
 const CURSOR_POLL: Duration = Duration::from_millis(50);
 /// 编码线程会拿着几帧（上一帧要留着补画质、重发关键帧，几个会话各拿各的），
@@ -124,6 +132,9 @@ pub struct SckCapturer {
     first: bool,
     cursor: CursorReader,
     layout_checked: Instant,
+    /// 打开时屏幕锁着没有（见 [`macos::screen_locked`]）：变了就重建采集器
+    locked: Option<bool>,
+    state_checked: Instant,
     /// 系统把光标画进了采集到的画面里（要带光标的画面的订阅者单独一路，见 `super` 的"带光标的画面"）
     shows_cursor: bool,
 }
@@ -136,7 +147,19 @@ impl SckCapturer {
     /// `shows_cursor`：让系统把光标画进画面里（给要带光标的画面的订阅者）
     pub fn open(index: u8, fps: u8, max_short: u16, shows_cursor: bool) -> Result<Self> {
         macos::check_screen_permission()?;
-        let display = macos::display(index)?;
+        // 显示器睡着了（锁屏之后常见）采集不到：叫醒它，过一会儿再来（见模块说明）。睡着的显示器可能根本列不出来
+        let display = match macos::display(index) {
+            Ok(d) if !CGDisplayIsAsleep(d.id) => d,
+            Ok(_) => {
+                power::wake_display();
+                bail!("the display is asleep");
+            }
+            Err(e) => {
+                power::wake_display();
+                return Err(e);
+            }
+        };
+        let locked = macos::screen_locked();
         let target = sck::shareable_display(display.id)?;
         let (w, h) = crate::host::encoder::target_size(display.width, display.height, max_short);
         let config = unsafe {
@@ -189,6 +212,7 @@ impl SckCapturer {
             scale = d.scale(),
             output_w = w,
             output_h = h,
+            ?locked,
             "ScreenCaptureKit capture opened"
         );
         Ok(Self {
@@ -202,6 +226,8 @@ impl SckCapturer {
             first: true,
             cursor: CursorReader::default(),
             layout_checked: Instant::now(),
+            locked,
+            state_checked: Instant::now(),
             shows_cursor,
         })
     }
@@ -237,6 +263,23 @@ impl Capturer for SckCapturer {
             self.layout_checked = Instant::now();
             if macos::display(self.index).ok().as_ref() != Some(&self.display) {
                 bail!("the display layout or resolution changed");
+            }
+        }
+        if self.state_checked.elapsed() > STATE_CHECK {
+            self.state_checked = Instant::now();
+            if CGDisplayIsAsleep(self.display.id) {
+                bail!("the display went to sleep");
+            }
+            let locked = macos::screen_locked();
+            if locked != self.locked {
+                bail!(
+                    "the screen was {}",
+                    if locked == Some(true) {
+                        "locked"
+                    } else {
+                        "unlocked"
+                    }
+                );
             }
         }
         let mut update = CaptureUpdate::default();

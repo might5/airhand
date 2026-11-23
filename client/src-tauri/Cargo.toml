@@ -76,6 +76,10 @@ windows = { version = "0.62", features = [
   "Win32_Security_Authorization",
   "Win32_Security_Cryptography",
   "Win32_System_Performance",
+  # 有会话时不熄屏、不睡眠（PowerSetRequest，见 src/host/power.rs）
+  "Win32_System_Power",
+  # 远程控制结束后锁屏（LockWorkStation，见 src/host/ending.rs）
+  "Win32_System_Shutdown",
   "Win32_System_Registry",
   "Win32_System_DataExchange",
   "Win32_System_LibraryLoader",
@@ -140,6 +144,8 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 objc2-core-graphics = { version = "0.3", default-features = false, features = [
   "std", "CGBitmapContext", "CGColorSpace", "CGContext", "CGDirectDisplay", "CGDisplayConfiguration",
   "CGDisplayStream", "CGError", "CGEvent", "CGEventSource", "CGEventTypes", "CGGeometry", "CGImage", "CGRemoteOperation",
+  # 屏幕锁着没有（CGSessionCopyCurrentDictionary，见 src/host/macos.rs）
+  "CGSession",
   "libc",
 ] }
 objc2-core-media = { version = "0.3", default-features = false, features = [

@@ -20,6 +20,8 @@ mod x11;
 use airhand_proto::session::{DisplayInfo, InputEvent};
 
 pub use thread::InjectorThread;
+#[cfg(windows)]
+pub(crate) use windows::INJECTED;
 
 pub struct Injector {
     #[cfg(windows)]

@@ -17,7 +17,16 @@ fn main() {
                 .flag("-fblocks")
                 .file(format!("{mic}/tap.m"))
                 .compile("airhand_mic");
-            for framework in ["AVFAudio", "CoreAudio", "Foundation"] {
+            // 补屏的虚拟显示器（见 src/host/virtual_display/mac.rs）
+            let vd = "src/host/virtual_display/mac.m";
+            println!("cargo:rerun-if-changed={vd}");
+            cc::Build::new()
+                .std("gnu11")
+                .flag("-fobjc-arc")
+                .flag("-fblocks")
+                .file(vd)
+                .compile("airhand_vd");
+            for framework in ["AVFAudio", "CoreAudio", "CoreGraphics", "Foundation"] {
                 println!("cargo:rustc-link-lib=framework={framework}");
             }
         }

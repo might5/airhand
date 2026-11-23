@@ -68,7 +68,7 @@ Settings, saved devices, the end-to-end identity, control code, pairing state an
 
 ## Building
 
-On a Mac with Xcode 16+, Rust with `rustup target add aarch64-apple-ios aarch64-apple-ios-sim`, and [XcodeGen](https://github.com/yonaskolb/XcodeGen):
+On a Mac with Xcode 27+ (which needs Apple silicon and macOS 26.6 or later; the app still runs on iOS 17+), Rust with `rustup target add aarch64-apple-ios aarch64-apple-ios-sim`, and [XcodeGen](https://github.com/yonaskolb/XcodeGen):
 
 ```bash
 cd ios

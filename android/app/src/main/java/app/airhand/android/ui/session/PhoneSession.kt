@@ -64,10 +64,13 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.ListItem
+import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -196,6 +199,7 @@ fun PhoneSession(
     LaunchedEffect(cursor) { view.setCursor(cursor) }
     LaunchedEffect(mouseLock) { view.mouseLock = mouseLock }
     LaunchedEffect(settings.localCursor) { view.localCursor = settings.localCursor }
+    LaunchedEffect(settings.reverseWheel, settings.wheelSpeed) { view.setWheel(settings.reverseWheel, settings.wheelSpeed) }
     // 相对移动按对方屏幕的像素换算
     LaunchedEffect(displays, currentDisplay) {
         displays.firstOrNull { it.index == currentDisplay }?.let { view.setRemoteSize(it.width, it.height) }
@@ -360,6 +364,7 @@ fun PhoneSession(
                                 menu = false
                             }
                         } else {
+                            if (os == OsKind.MAC) SwapCtrlCommand(session)
                             Shortcuts(os) { codes ->
                                 kb.chord(codes)
                                 menu = false
@@ -688,6 +693,23 @@ private fun combos(os: OsKind): List<Combo> = when (os) {
         Combo(R.string.combo_undo, listOf("ControlLeft", "KeyZ")),
         Combo(R.string.combo_print_screen, listOf("PrintScreen")),
     )
+}
+
+/** 控制 Mac 时互换外接键盘的 Ctrl 和 ⌘：只换键盘上的键，下面的快捷键和键盘上方的特殊键不变。按设备记住 */
+@Composable
+private fun SwapCtrlCommand(session: RemoteSession) {
+    val on by session.swapCtrlCommand.collectAsState()
+    ListItem(
+        headlineContent = { Text(stringResource(R.string.swap_ctrl_command)) },
+        supportingContent = { Text(stringResource(R.string.swap_ctrl_command_desc)) },
+        trailingContent = { Switch(checked = on, onCheckedChange = session::setSwapCtrlCommand) },
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { session.setSwapCtrlCommand(!on) }
+            .padding(horizontal = 8.dp),
+    )
+    HorizontalDivider(Modifier.padding(vertical = 8.dp, horizontal = 16.dp))
 }
 
 @Composable

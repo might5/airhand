@@ -85,6 +85,10 @@ data class Settings(
      * 关掉时只看画面里的（见 [app.airhand.android.ui.session.RemoteView]）
      */
     val localCursor: Boolean = true,
+    /** 外接鼠标的滚轮反过来滚（屏幕上的双指滑动不变） */
+    val reverseWheel: Boolean = false,
+    /** 外接鼠标滚轮的速度：百分比，[WHEEL_SPEEDS] 里的一个 */
+    val wheelSpeed: Int = 100,
     /** 已经看过的手势说明（trackpad / touch / tv） */
     val tipsSeen: Set<String> = emptySet(),
     /**
@@ -114,10 +118,14 @@ data class Settings(
         .put("tvScale", tvScale.id)
         .put("navKeys", navKeys)
         .put("localCursor", localCursor)
+        .put("reverseWheel", reverseWheel)
+        .put("wheelSpeed", wheelSpeed)
         .put("tipsSeen", JSONArray(tipsSeen.toList()))
         .put("identity", identity)
 
     companion object {
+        val WHEEL_SPEEDS = listOf(50, 75, 100, 150, 200)
+
         fun parse(o: JSONObject): Settings {
             val d = Settings()
             val tips = o.optJSONArray("tipsSeen")
@@ -135,6 +143,8 @@ data class Settings(
                 tvScale = ScaleMode.of(o.optStringOrNull("tvScale")),
                 navKeys = o.optBoolean("navKeys", d.navKeys),
                 localCursor = o.optBoolean("localCursor", d.localCursor),
+                reverseWheel = o.optBoolean("reverseWheel", d.reverseWheel),
+                wheelSpeed = o.optInt("wheelSpeed", d.wheelSpeed).takeIf { it in WHEEL_SPEEDS } ?: d.wheelSpeed,
                 tipsSeen = if (tips == null) emptySet() else (0 until tips.length()).map { tips.getString(it) }.toSet(),
                 identity = o.optString("identity", ""),
             )
@@ -214,6 +224,8 @@ data class SavedDevice(
     val lastUsed: Long = 0,
     /** 对方的端到端加密公钥（64 位十六进制，第一次连上时记下）：之后只认它 */
     val hostKey: String? = null,
+    /** 控制这台 Mac 时互换外接键盘的 Ctrl 和 ⌘（会话菜单的快捷键页里开关，和桌面控制台一样按设备记住） */
+    val swapCtrlCommand: Boolean = false,
 ) {
     fun title(): String = alias?.takeIf { it.isNotBlank() } ?: hostName.takeIf { it.isNotBlank() } ?: ""
 
@@ -225,6 +237,7 @@ data class SavedDevice(
         .put("resume", resume ?: JSONObject.NULL)
         .put("lastUsed", lastUsed)
         .put("hostKey", hostKey ?: JSONObject.NULL)
+        .put("swapCtrlCommand", swapCtrlCommand)
 
     companion object {
         fun parse(o: JSONObject) = SavedDevice(
@@ -235,6 +248,7 @@ data class SavedDevice(
             resume = o.optStringOrNull("resume"),
             lastUsed = o.optLong("lastUsed"),
             hostKey = o.optStringOrNull("hostKey"),
+            swapCtrlCommand = o.optBoolean("swapCtrlCommand"),
         )
     }
 }
@@ -278,6 +292,11 @@ class DeviceStore(context: Context) {
     @Synchronized
     fun rename(code: String, alias: String?) {
         set(_flow.value.map { if (it.code == code) it.copy(alias = alias?.trim()?.ifEmpty { null }) else it })
+    }
+
+    @Synchronized
+    fun setSwapCtrlCommand(code: String, on: Boolean) {
+        set(_flow.value.map { if (it.code == code) it.copy(swapCtrlCommand = on) else it })
     }
 
     @Synchronized

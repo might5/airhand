@@ -124,6 +124,11 @@ fn commands() -> Vec<(Value, Command)> {
                 enabled: true,
             },
         ),
+        // 防窥模式（只有装了虚拟显示器驱动的 Windows 被控端支持）
+        (
+            json!({ "cmd": "privacy", "sid": 3, "on": true }),
+            Command::Privacy { sid: 3, on: true },
+        ),
         (
             json!({ "cmd": "clipboard", "sid": 3, "text": "hi" }),
             Command::Clipboard {
@@ -174,6 +179,7 @@ fn connect_options() -> (Value, ConnectOptions) {
             settings: settings(),
             audio: true,
             view: Vec::new(),
+            privacy: false,
         },
     )
 }

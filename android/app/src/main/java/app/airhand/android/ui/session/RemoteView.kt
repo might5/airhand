@@ -19,6 +19,7 @@ import android.view.HapticFeedbackConstants
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.PointerIcon
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
@@ -440,6 +441,17 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         }
     }
 
+    /**
+     * 外接鼠标在画面上时不显示系统指针：对方的光标本机已经画了（[Overlay]，或者画在画面里），再叠一个系统的就有两个。
+     * 直通（控制手机）不画光标，系统指针照常显示；抓住鼠标时系统自己会隐藏
+     */
+    override fun onResolvePointerIcon(event: MotionEvent, pointerIndex: Int): PointerIcon? {
+        if (interactive && showCursor && editor == null && content.contains(event.getX(pointerIndex), event.getY(pointerIndex))) {
+            return PointerIcon.getSystemIcon(context, PointerIcon.TYPE_NULL)
+        }
+        return super.onResolvePointerIcon(event, pointerIndex)
+    }
+
     override fun onCapturedPointerEvent(e: MotionEvent): Boolean {
         if (!interactive) return false
         if (e.actionMasked == MotionEvent.ACTION_SCROLL) {
@@ -688,10 +700,17 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         return super.onGenericMotionEvent(e)
     }
 
+    /** 外接鼠标的滚轮（方向和速度看设置，[setWheel]） */
+    private val wheel = MouseWheel()
+
+    fun setWheel(reverse: Boolean, percent: Int) {
+        wheel.reverse = reverse
+        wheel.percent = percent
+    }
+
     private fun scroll(e: MotionEvent) {
-        val dy = (e.getAxisValue(MotionEvent.AXIS_VSCROLL) * 120).toInt()
-        val dx = (e.getAxisValue(MotionEvent.AXIS_HSCROLL) * 120).toInt()
-        if (dx != 0 || dy != 0) host.onInput(listOf(Input.wheel(dx, dy)), true)
+        val (dx, dy) = wheel.steps(e.getAxisValue(MotionEvent.AXIS_HSCROLL), e.getAxisValue(MotionEvent.AXIS_VSCROLL)) ?: return
+        host.onInput(listOf(Input.wheel(dx, dy)), true)
     }
 
     private fun moveMouse(e: MotionEvent) {
@@ -772,8 +791,12 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         // 拿到焦点才能抓住鼠标（失去焦点时系统自己会放开）
         updateCapture()
         // 菜单、通知栏、切到后台：游戏按键按着的都松开（手指的抬起不一定会送到这里），切换着的也松开，
-        // 不然角色会一直走下去
-        if (!hasWindowFocus) game.releaseAll()
+        // 不然角色会一直走下去；外接键盘按着的键也一样
+        if (!hasWindowFocus) {
+            game.releaseAll()
+            host.keyboard.releaseKeys()
+            imeBypass.clear()
+        }
     }
 
     fun hideKeyboard() {
@@ -783,7 +806,32 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         keyboardWanted = false
     }
 
-    /** 外接键盘：按键原样发过去（返回、音量键留给本机） */
+    /**
+     * 外接键盘的按键（[SessionActivity.dispatchKeyEvent] 把窗口收到的都先交给这里）：焦点不在画面上也发给对方。
+     * 返回、音量键等留给本机；电视上、编辑游戏按键时不发。返回是否发了
+     */
+    fun hardwareKey(e: KeyEvent): Boolean {
+        if (!interactive || editor != null || !hasWindowFocus() || e.keyCode in LOCAL_KEYS) return false
+        if (e.device?.isVirtual != false) return false
+        return host.keyboard.key(e)
+    }
+
+    /** 外接键盘在输入法之前发的按键 */
+    private val imeBypass = ImeBypass()
+
+    /** 输入法之前：Ctrl / ⌘ 的组合键先发，抬起跟着按下走（见 [ImeBypass]） */
+    override fun onKeyPreIme(keyCode: Int, event: KeyEvent): Boolean {
+        val down = event.action == KeyEvent.ACTION_DOWN
+        if (!down && event.action != KeyEvent.ACTION_UP) return super.onKeyPreIme(keyCode, event)
+        val shortcut = event.isCtrlPressed || event.isMetaPressed || keyCode in SHORTCUT_MODIFIERS
+        if (imeBypass.early(keyCode, down, shortcut) && hardwareKey(event)) {
+            if (down) imeBypass.sent(keyCode, event.repeatCount)
+            return true
+        }
+        return super.onKeyPreIme(keyCode, event)
+    }
+
+    /** 外接键盘（连上之前、断线时）和软键盘发来的按键：原样发过去（返回、音量键留给本机） */
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean =
         if (interactive && passKey(event)) host.keyboard.key(event) else super.onKeyDown(keyCode, event)
 
@@ -808,5 +856,36 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
             KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.KEYCODE_VOLUME_DOWN, KeyEvent.KEYCODE_VOLUME_MUTE,
             KeyEvent.KEYCODE_POWER, KeyEvent.KEYCODE_HOME, KeyEvent.KEYCODE_APP_SWITCH,
         )
+
+        /** 在输入法之前发的修饰键（见 [onKeyPreIme]） */
+        private val SHORTCUT_MODIFIERS = setOf(
+            KeyEvent.KEYCODE_CTRL_LEFT, KeyEvent.KEYCODE_CTRL_RIGHT, KeyEvent.KEYCODE_META_LEFT, KeyEvent.KEYCODE_META_RIGHT,
+        )
     }
+}
+
+/**
+ * 外接鼠标的滚轮 → 发给对方的滚轮量（120 = 一格，向右 / 向上为正）。高精度滚轮、触控板一次只滚零点几格，
+ * 不够 1 的余量留到下一次，换方向时丢掉（和 macOS 被控端一样）。[reverse]、[percent]：设置里的方向和速度
+ */
+internal class MouseWheel {
+    var reverse = false
+    var percent = 100
+    private var restX = 0f
+    private var restY = 0f
+
+    /** `h` / `v`：AXIS_HSCROLL / AXIS_VSCROLL（一格是 1，向右 / 向上为正）。两个方向都不够 1 时是 null */
+    fun steps(h: Float, v: Float): Pair<Int, Int>? {
+        val k = 120f * percent / 100f * (if (reverse) -1 else 1)
+        restX = add(restX, h * k)
+        restY = add(restY, v * k)
+        val dx = restX.toInt()
+        val dy = restY.toInt()
+        if (dx == 0 && dy == 0) return null
+        restX -= dx
+        restY -= dy
+        return dx to dy
+    }
+
+    private fun add(rest: Float, d: Float) = if (rest * d < 0f) d else rest + d
 }

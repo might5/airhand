@@ -127,6 +127,8 @@ Android 被控端只有一个编码器，但每个观看者分别计在途字节
 
 被控端的密钥由服务器签发（随机数加上用服务器自己的密钥算的 HMAC，服务器的密钥存在 `airhand.db` 里）：取回空闲的控制码要出示为这个控制码签发的密钥，所以不能用注册来探测哪些控制码有人在用。被控端的用户断开所有控制端时，被控端请服务器换一个密钥（`Rekey`），之前发出的重连凭证全部作废。发了 `Rekey` 却没等到回答（断线了）的被控端，下次注册时带上 `rekey`，服务器还回控制码的同时换密钥：服务器可能根本没收到 `Rekey`，或者收到之后还没记下来就重启了，手里的旧密钥又成了有效的，旧凭证也就跟着恢复。
 
+更换控制码（`Release`）时旧码不是删掉，而是作废，记在 `retired_codes` 表里：空闲的控制码出示为它签发过的密钥就能取回，删掉的话，还拿着旧密钥的被控端（例如老版本的客户端）又能把它取回去。作废的控制码谁的密钥都不认，7 天之内不分给别人（`RETIRED_HOLD`），之后可以分配；没分出去的 180 天后清理。放弃了、还没断开的被控端也不能被别人拿着旧密钥顶替。
+
 `Rekey` 带着被控端已收到并交给本机保存的密钥（`secret`），同一把旧密钥的重复请求返回同一个结果，连续丢了回答也不会丢掉归属。被控端同时只发一次换钥；期间再次断开所有控制端的操作合并为收到回答后的下一次换钥。
 
 重连凭证有两半：前一半是服务器用自己的密钥给**控制码**签的名，证明拿着它的控制端连上过这个控制码（被控端不在线、服务器重启过也能验证）；后一半由控制码和被控端现在的密钥算出，换了密钥就对不上。所以服务器对带凭证的请求能分清“对方不在线”（`Offline`，等它上线）和“凭证作废了”（`Revoked`：对方在线但换过密钥，或者凭证根本不是为这个控制码发的），从我的设备打开一台不在线的设备时控制端只需要等，不用为了排除“凭证作废了”再拿控制码试一次（那样会算一次猜错）。`Revoked` 之后：用户自己要连的（从我的设备打开）不带凭证再连一次；断线后自动重连的就此停下。
@@ -139,7 +141,7 @@ Android 被控端只有一个编码器，但每个观看者分别计在途字节
 | `crates/airhand-link` | 客户端到中转服务器的链路：QUIC 连接、证书固定、断线重连，端到端加密（`secure`：身份、Noise 握手、每条通道的加密），从流里读写帧（`wire`），会话的通道和数据报从哪里来（`lanes`）、往哪条路发（`paths`：中转、直连），两端之间的直连（`direct`：打洞、只认对方证书指纹的 TLS、画面走哪条路）和几条路上的帧按计数合并（`merge`，画面只交出解得了的帧），被控端的在途控制和码率（`flow`）、每一帧参考哪一帧和丢帧后从哪里恢复（`refs`），剪贴板里的文件（`files`：公告、列目录、按额度取文件，两端共用），与界面无关的控制端会话和界面命令（`Command`），被控端的服务器连接和会话（`host`），`Problem`。桌面客户端、网页控制台和 Android 共用（除了 `wire` 和 `udp`（收发缓冲区调大了的 UDP socket）都在默认的 `client` feature 里，中转服务器只用这两个）；`tests/protocol.json` 是三边共用的协议样例 |
 | `server/` | 中转服务器（quinn + rustls）及其 `Dockerfile`。`src/broker/`：`registry`（控制码登记、连接请求）、`relay`（会话通道的配对和转发、数据报）、`limits`（限速）、`tokens`（密钥和重连凭证）；锁的先后在调试构建里有检查（`lock.rs`） |
 | `web/` | 网页控制台服务（axum：静态网页 + WebSocket，HTTP / HTTPS 同一端口）及其 `Dockerfile`、`docker-compose.yml`。和 `client/src-tauri/` 一样是独立的 Cargo 工作区 |
-| `client/src-tauri/` | 桌面客户端 Rust 部分：被控端 `host/`、托盘、控制台窗口和命令，对方复制的文件放进系统剪贴板（`clipfiles/`） |
+| `client/src-tauri/` | 桌面客户端 Rust 部分：被控端 `host/`（Windows 的虚拟显示器和防窥模式在 `host/virtual_display/`，随包带的驱动在 `windows/vdd/`）、托盘、控制台窗口和命令，对方复制的文件放进系统剪贴板（`clipfiles/`） |
 | `crates/airhand-mobile` | Android 和 iOS 共用的手机核心：控制端用 `airhand-link`（命令和事件是 JSON，会话数据由界面的线程阻塞地取）；被控端的网络部分（服务器连接、会话和它的各条通道用 `airhand_link::host`，手机只实现 `host::Platform`；画面分发、在途控制和码率控制与桌面版相同）。和协议、链路库一样属于根目录的工作区 |
 | `android/native/` | Android 的 Rust 核心：`airhand-mobile` 的 JNI 包装。和 `client/src-tauri/`、`web/` 一样是独立的 Cargo 工作区 |
 | `ios/native/` | iOS 的 Rust 核心：`airhand-mobile` 的 C 接口包装（`include/airhand.h`），编译成静态库给 App 和屏幕广播扩展链接；`examples/fake_host.rs` 是测 iOS 控制端用的模拟被控端。独立的 Cargo 工作区 |
@@ -184,6 +186,17 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 - 托盘和被控端之间是每个会话一个的命名管道（`\\.\pipe\airhand-host-<会话>`），每行一条 JSON 消息。只有交互登录的用户能连接，不能再开一个同名管道实例冒充被控端，托盘还会核对管道属于 SYSTEM
 - 剪贴板里的文件交给托盘（`client/src-tauri/src/winsvc/clip.rs`，管道 `\\.\pipe\airhand-clip-<会话>`，安全设置同上）：SYSTEM 进程放进剪贴板的数据对象资源管理器调不了，所以对方复制的文件由托盘放、托盘粘贴时经管道向被控端取；本机复制的文件由托盘以登录的用户的身份读，不然控制端能借 SYSTEM 读到这个用户读不了的文件。没有托盘时只同步文本
 - 服务和被控端没有控制台：日志用 `OutputDebugString` 输出（见开发文档的[调试 Windows 服务](development.zh-CN.md#调试-windows-服务)）
+
+### 虚拟显示器、防窥模式、不熄屏
+
+- **不熄屏**（`client/src-tauri/src/host/power.rs`）：有会话时被控端要两个电源请求（`PowerRequestDisplayRequired` + `PowerRequestSystemRequired`），最后一个会话结束时放开；会话开始时屏幕熄着就叫醒它（防窥模式不叫）。熄屏后桌面不刷新，现代待机的电脑熄屏就待机、断网。合盖、按电源键这些用户自己让电脑睡眠的，电源请求挡不住
+- **macOS 的不熄屏、锁屏、不自动睡眠**（同在 `power.rs`，采集在 `client/src-tauri/src/host/capture/sck.rs`）：有会话时要三个 IOKit 电源断言（`PreventUserIdleDisplaySleep` + `PreventUserIdleSystemSleep` + `PreventSystemSleep`，最后一个头文件说过时了，WindowServer、`caffeinate -s` 还在用：接着电源时合上盖子也不睡眠。它要在合盖之前就要着，合上的那一刻系统就开始睡了），最后一个会话结束时放开。ScreenCaptureKit 采集不了睡着的显示器（锁屏之后显示器常常跟着熄了）：会话开始时、采集线程打开时发现显示器睡着了（`CGDisplayIsAsleep`，或者列不出来）都用 `IOPMAssertionDeclareUserActivity` 叫醒它（最多 2 秒一次），会话开始时列不出显示器就等它亮起来（最多 3 秒）再发 Hello。亮着的锁屏界面照常采集，`CGEvent` 注入照常到得了密码框。采集线程每 0.5 秒看一眼会话信息里的 `CGSSessionScreenIsLocked`（没有公开文档），锁屏、解锁时重建采集（一直开着的流在这前后可能停在上一个画面上）。**不自动睡眠**（菜单栏图标的菜单里切换，默认关，切换时马上生效、写进 `config.toml` 的 `prevent_sleep`，现在的设置在 `HostStatus::prevent_sleep` 里）：被控端运行期间（`HostService` 拿着 `power::Hosting`）、接着外接电源（`IOPSGetProvidingPowerSourceType`，每 30 秒看一次）时一直要着 `PreventUserIdleSystemSleep` 和 `PreventSystemSleep`，电脑一直在线等着被连接，合上笔记本的盖子也不睡，显示器照常熄灭；还让虚拟显示器一直预备着（`virtual_display::set_ready`，见下面），合盖之后才连上来也有画面。苹果菜单里选“睡眠”、用电池时合盖、电量低，断言都挡不住。合着盖子（`IOPMrootDomain` 的 `AppleClamshellState`）、接着的显示器只有内建的时候不叫醒显示器：它只会在盖子后面亮一下，WindowServer 给它 10 秒（`DMGrace`）就又关掉，画面每 10 秒断一次
+- **macOS 的补屏**（`client/src-tauri/src/host/virtual_display/mac.rs`、`mac.m`）：管理线程（每 0.5 秒看一眼）用私有的 `CGVirtualDisplay*` 类管一块虚拟显示器，类和方法都在运行时找、用之前先检查。照着最近看到的本机主显示器（HiDPI 的点数，`CGDisplayScreenSize` 的物理尺寸），厂商、型号、序列号一直不变（macOS 记得窗口在它上面的位置）。**要在合盖之前就建好**：合上的那一刻 WindowServer 收到 `clamshell state:2`，这时还有别的显示器，就是系统自己的合盖模式（内建的下去，那块当主显示器，屏幕不睡）；一块也没有，屏幕马上睡（`Did Sleep`），之后再建的虚拟显示器即使叫醒了屏幕（`DesktopMode grace`、`Did Wake`）也不往上画东西，控制端一直黑屏。所以**预备**：有会话、或者被控端运行期间开着**不自动睡眠**（这时合盖后系统换上去的那块也留着，但合盖之后不新建，管理线程每 2 秒看一眼），开着盖子的笔记本（`IOPMrootDomain` 的 `AppleClamshellState`）、接着电源、没接别的显示器时，马上建好，放进内建显示器的镜像里（`CGConfigureDisplayMirrorOfDisplay`，只对这次登录有效）：本机除了闪一下看不出变化，显示器列表里也没有它（镜像的不算）。合上盖子时系统把它拿出镜像、当主显示器；打开盖子又放回去（2 秒之后还没放回去，例如是合着盖子时才建的，管理线程自己放）。**补屏**：一个能用的显示器都没有（`CGGetOnlineDisplayList` 里接着的，睡着的也算；合着盖子时内建的不算），例如没接显示器的 Mac mini，建一块独立的（合着盖子之后才建的照上面说的不往上画东西，至少声音采集有显示器可挂）。盖子、主显示器变了，会话马上重新列出显示器。有它的时候也要着 `PreventSystemSleep`，管最后一个会话结束后的那 30 秒。不再需要（用着电池、接上了别的显示器）、能用的显示器在了 2 秒之后，以及最后一个会话结束 30 秒之后撤掉。建它的进程读不到它的显示模式（本进程里 `CGDisplayCopyDisplayMode` 返回空，别的进程读得到），显示器列表里的像素大小由管理线程给。声音采集找不到显示器可挂（`audio::NoDisplay`）不当作失败告诉控制端，重试到有显示器
+- **虚拟显示器**（`client/src-tauri/src/host/virtual_display/`）：随安装包带的 MttVDD（`client/src-tauri/windows/vdd/`），为所有用户安装时问用户要不要装（`airhand.exe --install-vdd`）。设备是 Airhand 建的根设备 `ROOT\AIRHANDVIRTUALDISPLAY\0000`，平时停用（MttVDD 启用着就至少有一个显示器），要用时启用、用完停用；启用前重写它的设置文件，本机主显示器的分辨率排第一（驱动的首选）。一个管理线程每轮看一眼 CCD（`QueryDisplayConfig`）和想要什么，只走一步（`plan.rs`：启用、等它出来、只留它、停用、恢复），改完了通知会话马上重新列出显示器
+- **补屏**：有会话、本机却没有显示器在桌面上（显示器关了电源，热插拔信号断了，Windows 把它移走了）时启用虚拟显示器，本机的显示器回到桌面上 2 秒后停用；补着屏时接上了新的显示器就停用一下让它试试，放不回桌面（例如合着盖子）就过 8 秒再补。会话开始时没有显示器的话，会话先等虚拟显示器出来（最多 15 秒）再发 Hello，不先说“没有显示器”。最后一个会话结束后再留 30 秒
+- **防窥**：只留虚拟显示器在桌面上（`SetDisplayConfig` 提供的配置只含虚拟显示器的路径），本机的显示器没有信号；低级键盘、鼠标钩子丢掉本机的输入，只放过带着 Airhand 记号（`dwExtraInfo`）的注入（`block.rs`，跟着输入桌面走，安全桌面上也装）。状态整台被控端一份（`HostMsg::Privacy`）；打开它的会话都结束后接着开着，远程控制结束了才关（见下面的“结束远程后锁屏”），控制端重连时在握手的介绍里带着 `privacy`，确认了握手才打开（重放的握手消息不能让本机黑屏）
+- **不存进显示设置数据库**：改显示设置从不带 `SDC_SAVE_TO_DATABASE`，恢复用的正是 Windows 记着的设置（`SDC_USE_DATABASE_CURRENT`）；存进去的话下次接着同样的显示器时 Windows 会自己套用“本机的显示器不在桌面上”。撤下本机显示器之前在注册表记一笔（`HKLM\SOFTWARE\Airhand\VirtualDisplay` 的 `Isolated`），被控端启动、卸载、升级前停服务时看到它（或者虚拟显示器还启用着）就先恢复；正常退出时管理线程恢复原样再结束
+- **结束远程后锁屏**（`client/src-tauri/src/host/ending.rs`，三个桌面平台都有）：确认了握手的会话才算数。会话正常结束（控制端断开、本机断开所有控制端）时远程控制马上算结束；断线（失联、连接出错、任务被中止）时等 30 秒，没人重连上才算。一个会话都不剩时**先锁屏**（托盘菜单的“结束远程后锁屏”，默认开，切换时马上生效、写进 `config.toml` 的 `lock_on_end`；Windows 安装版经命名管道交给服务里的被控端（`ToAgent::SetLockOnEnd`），现在的设置在 `HostStatus::lock_on_end` 里回到托盘；Windows `LockWorkStation`，等输入桌面换成 `Winlogon` 最多 2 秒；macOS `SACLockScreenImmediate`；Linux `loginctl lock-session`，不行再 `xdg-screensaver lock`），**再退出防窥**：反过来的话本机的显示器恢复之后、锁屏之前桌面会露出来。还有别的会话时不锁屏，打开防窥的走了就只退出防窥。被控端停下来（退出、升级、关机）时还有远程控制也先锁屏，再恢复显示器。防窥最多在打开它的会话都结束后保持 90 秒（兜底）
 
 ## 画面
 

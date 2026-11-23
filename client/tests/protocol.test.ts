@@ -80,6 +80,7 @@ test("输入事件、命令和连接选项的 JSON 形状与 Rust 一致", () =>
     "input",
     "keyframe",
     "mic",
+    "privacy",
     "settings",
     "view",
   ]);
