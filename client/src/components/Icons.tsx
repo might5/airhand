@@ -87,6 +87,8 @@ export const IconKeyboard = (p: P) =>
       <path d="M6.5 9.5h.01M10 9.5h.01M13.5 9.5h.01M17 9.5h.01M6.5 12.5h.01M17 12.5h.01M8 15.5h8M10 12.5h4" />
     </>,
   );
+/** 打字：触摸屏上叫出软键盘 */
+export const IconType = (p: P) => base(p, <path d="M5.5 7V5.5h13V7M12 5.5V19M8.5 19h7" />);
 export const IconClipboard = (p: P) =>
   base(
     p,

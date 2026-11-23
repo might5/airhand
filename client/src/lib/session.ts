@@ -101,6 +101,16 @@ const GIVE_UP = new Set<Problem["kind"]>([
 /** 与服务器（网页版还有控制端服务）的连接断了：等重新连上再试，不计入重试次数 */
 const NO_SERVER = new Set<Problem["kind"]>(["notConnected", "serverLost", "serverUnreachable", "consoleLost"]);
 
+/**
+ * 软键盘上不发文字的那几个键：KeyboardEvent.key → 发给被控端的 code（W3C KeyboardEvent.code）。
+ * 手指没有物理键位，code 只能按 key 推。
+ */
+const KEYPAD_CODES = new Map([
+  ["Enter", "Enter"], ["Backspace", "Backspace"], ["Delete", "Delete"], ["Tab", "Tab"], ["Escape", "Escape"],
+  ["ArrowUp", "ArrowUp"], ["ArrowDown", "ArrowDown"], ["ArrowLeft", "ArrowLeft"], ["ArrowRight", "ArrowRight"],
+  ["Home", "Home"], ["End", "End"], ["PageUp", "PageUp"], ["PageDown", "PageDown"],
+]);
+
 let nextId = 1;
 
 export class RemoteSession {
@@ -245,6 +255,14 @@ export class RemoteSession {
   private interactive = false;
   private visible = true;
   private readonly input: RemoteInput;
+  /** 触摸屏用的软键盘（一个藏着的输入框，见 openKeyboard）：没有它，手指点不开系统的键盘 */
+  private keypad: HTMLTextAreaElement | null = null;
+  /** 软键盘上次的值：靠前后对比知道新打了什么字、删了几个 */
+  private keypadPrev = "";
+  /** 输入法正在组字（拼音还没选字）：这时候不发，等组完 */
+  private keypadComposing = false;
+  /** 软键盘开着没有（界面上的按钮据此变状态） */
+  keypadOpen = false;
 
   // 光标
   private cursorRaw: CursorImage | null = null;
@@ -1514,6 +1532,105 @@ export class RemoteSession {
       }
     }
     if (piece) this.enqueue([{ type: "text", text: piece }], true);
+  }
+
+  // ───────────────────────── 触摸屏：软键盘 ─────────────────────────
+
+  /**
+   * 打开软键盘（要在点击里调用，浏览器才肯弹）：之后打的字按 Unicode 发给对方。
+   * 网页版在平板、触摸屏上没有实体键盘，不这么做只能看不能操作。
+   */
+  openKeyboard() {
+    const el = this.ensureKeypad();
+    el.value = "";
+    this.keypadPrev = "";
+    this.keypadOpen = true;
+    el.focus({ preventScroll: true });
+    this.emit();
+  }
+
+  /** 收起软键盘 */
+  closeKeyboard() {
+    const el = this.keypad;
+    this.keypadOpen = false;
+    if (el) {
+      el.blur();
+      el.value = "";
+    }
+    this.keypadPrev = "";
+    this.emit();
+    this.focus();
+  }
+
+  toggleKeyboard() {
+    if (this.keypadOpen) this.closeKeyboard();
+    else this.openKeyboard();
+  }
+
+  /** 软键盘：一个藏起来的输入框，靠它的输入事件知道打了什么 */
+  private ensureKeypad(): HTMLTextAreaElement {
+    if (this.keypad) return this.keypad;
+    const el = document.createElement("textarea");
+    el.className = "soft-keypad";
+    el.rows = 1;
+    el.autocomplete = "off";
+    el.autocapitalize = "off";
+    el.spellcheck = false;
+    el.setAttribute("autocorrect", "off");
+    el.setAttribute("aria-label", "keyboard");
+    // 手指按在输入框上不算点画面（不然会发一次点击过去，还可能把焦点抢回去）
+    for (const name of ["pointerdown", "pointermove", "pointerup", "pointercancel", "wheel", "contextmenu", "auxclick"]) {
+      el.addEventListener(name, (e) => e.stopPropagation());
+    }
+    el.addEventListener("keydown", (e) => this.onKeypadKey(e));
+    el.addEventListener("keyup", (e) => {
+      const code = KEYPAD_CODES.get(e.key);
+      if (code) { e.preventDefault(); e.stopPropagation(); }
+    });
+    el.addEventListener("input", () => { if (!this.keypadComposing) this.syncKeypad(); });
+    el.addEventListener("compositionstart", () => { this.keypadComposing = true; });
+    el.addEventListener("compositionend", () => { this.keypadComposing = false; this.syncKeypad(); });
+    el.addEventListener("blur", () => {
+      if (!this.keypadOpen) return;
+      this.keypadOpen = false;
+      this.emit();
+    });
+    this.screen.appendChild(el);
+    this.keypad = el;
+    return el;
+  }
+
+  /** 软键盘上的控制键（回车、退格、Tab、方向键……）：按键发过去，别的字让它进输入框 */
+  private onKeypadKey(e: KeyboardEvent) {
+    const code = KEYPAD_CODES.get(e.key);
+    if (!code) return; // 打字：留给输入框，input 事件里对比出来
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.repeat && code !== "Backspace" && !code.startsWith("Arrow")) return;
+    this.enqueue([{ type: "key", code, down: true }, { type: "key", code, down: false }], true);
+  }
+
+  /** 输入框的值变了：删掉的发退格，新打出来的发文字（输入法一次上屏一整个词也行） */
+  private syncKeypad() {
+    const el = this.keypad;
+    if (!el) return;
+    const next = el.value;
+    const prev = this.keypadPrev;
+    let same = 0;
+    while (same < next.length && same < prev.length && next[same] === prev[same]) same++;
+    const removed = prev.length - same;
+    const added = next.slice(same);
+    if (removed > 0) {
+      const events: InputEvent[] = [];
+      for (let i = 0; i < Math.min(removed, 64); i++) {
+        events.push({ type: "key", code: "Backspace", down: true }, { type: "key", code: "Backspace", down: false });
+      }
+      this.enqueue(events, true);
+    }
+    if (added) this.sendText(added);
+    this.keypadPrev = next;
+    // 攒太长了（对方没吃掉、输入法一直改）：清掉，别让值无限长
+    if (next.length > 512) { el.value = ""; this.keypadPrev = ""; }
   }
 
   setSwapCtrlCommand(enabled: boolean) {

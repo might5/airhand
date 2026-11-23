@@ -158,6 +158,7 @@ const en: Record<MsgKey, Msg> = {
   "session.popoutClosedHint": "You can reconnect from the main window",
   "session.quality": "Quality",
   "session.shortcuts": "Send shortcut",
+  "session.typing": "Type text (touch)",
   "session.swapCtrlCommand": "Swap Ctrl and ⌘ Command",
   "session.clipboard": "Clipboard",
   "session.clipSync": "Two-way clipboard sync",

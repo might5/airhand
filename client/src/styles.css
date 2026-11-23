@@ -70,6 +70,8 @@ body,
   height: 100%;
   overflow: hidden;
   user-select: none;
+  /* 触摸屏：手指按住画面（等于按住鼠标键）时别弹出"选中/复制"菜单和放大镜 */
+  -webkit-touch-callout: none;
 }
 button {
   font: inherit;
@@ -1816,6 +1818,29 @@ kbd {
   display: block;
   position: absolute;
   image-rendering: auto;
+}
+/* 软键盘：一个看不见的输入框，只为叫出系统键盘（见 session.ts 的 openKeyboard）。
+   不能 display:none 或完全透明——那样浏览器不肯弹键盘；也不能挡住手指，pointer-events 关掉 */
+.soft-keypad {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  outline: none;
+  resize: none;
+  overflow: hidden;
+  background: transparent;
+  color: transparent;
+  caret-color: transparent;
+  opacity: 0.01;
+  /* iOS 上字号小于 16px 聚焦时会自动放大页面 */
+  font-size: 16px;
+  pointer-events: none;
+  z-index: 0;
 }
 .stage-overlay {
   position: absolute;

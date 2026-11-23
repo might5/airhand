@@ -44,6 +44,7 @@
 // 指针锁定、设备像素比例都按画面所在的窗口算（element.ownerDocument），不是主窗口的。
 import type { InputEvent, MouseButton, MouseMode } from "./api";
 import { isPasteKey } from "./files.ts";
+import { TouchInput } from "./touch.ts";
 
 const IS_MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.platform || navigator.userAgent);
 const CTRL_COMMAND_SWAP = new Map([
@@ -101,6 +102,8 @@ export class RemoteInput {
   private locate: Locate | null;
   private send: (events: InputEvent[]) => void;
   private connected: () => boolean;
+  /** 触摸屏上的手指（见 touch.ts）：点、拖、长按右键、双指滚动 */
+  private touch: TouchInput;
   private _interactive = false;
   private queue: InputEvent[] = [];
   private timer: ReturnType<typeof setTimeout> | undefined;
@@ -167,6 +170,11 @@ export class RemoteInput {
     this.canvas = canvas; this.connected = connected; this.send = send;
     this.locate = locate ?? null;
     this.doc = canvas.ownerDocument ?? (typeof document !== "undefined" ? document : null);
+    // 触摸屏：手指按这里的手势发成鼠标事件（见 touch.ts）
+    this.touch = new TouchInput({
+      posAt: (x, y) => this.posAt(x, y),
+      send: (events, urgent) => this.enqueue(events, urgent),
+    });
     this.bind();
   }
 
@@ -177,6 +185,8 @@ export class RemoteInput {
       this.cancelEscHold();
       this.unlock();
       this.swallowing = false;
+      // 手指按着的时候画面不能操作了（断开、换了会话）：松开的也要发出去，不然被控端一直按着
+      this.touch.cancel();
     }
   }
 
@@ -254,6 +264,7 @@ export class RemoteInput {
     this.swallowing = false;
     this.cancelEscHold();
     this.unlock();
+    this.touch.cancel();
   }
   dispose() { this.reset(); this.abort.abort(); }
   releaseAll() {
@@ -412,14 +423,18 @@ export class RemoteInput {
   // ───────────────────────── 事件 ─────────────────────────
 
   /** 绝对坐标：在第几路画面上的哪里（第 0 路不写 stream） */
-  private pos(e: MouseEvent): { x: number; y: number; stream?: number } {
+  private posAt(clientX: number, clientY: number): { x: number; y: number; stream?: number } {
     if (this.locate) {
-      const { x, y, stream } = this.locate(e.clientX, e.clientY);
+      const { x, y, stream } = this.locate(clientX, clientY);
       return stream ? { x, y, stream } : { x, y };
     }
     const r = this.canvas.getBoundingClientRect();
-    return { x: Math.min(1, Math.max(0, (e.clientX - r.left) / Math.max(1, r.width))),
-      y: Math.min(1, Math.max(0, (e.clientY - r.top) / Math.max(1, r.height))) };
+    return { x: Math.min(1, Math.max(0, (clientX - r.left) / Math.max(1, r.width))),
+      y: Math.min(1, Math.max(0, (clientY - r.top) / Math.max(1, r.height))) };
+  }
+
+  private pos(e: MouseEvent): { x: number; y: number; stream?: number } {
+    return this.posAt(e.clientX, e.clientY);
   }
 
   /** 按着的鼠标键变了：发按下 / 松开（同时按几个键时，后按的键也只在 pointermove 里出现） */
@@ -485,10 +500,21 @@ export class RemoteInput {
         this.onModeChange?.();
       }, { signal });
     }
-    on("pointermove", e => { if (this._interactive) this.pointer(e, false, true); });
+    // 触摸屏（平板、触摸显示器）：手指不点鼠标那一套——不发相对移动、不锁定指针，点 / 拖 / 长按右键 / 双指滚动
+    // 由 touch.ts 翻译成鼠标事件。这里只把事件分过去，preventDefault 仍然要做（网页别缩放、别弹菜单）
+    on("pointermove", e => {
+      if (!this._interactive) return;
+      if (e.pointerType === "touch") { e.preventDefault(); this.touch.move(e); return; }
+      this.pointer(e, false, true);
+    });
     on("pointerdown", e => {
       if (!this._interactive) return;
       e.preventDefault(); this.focus();
+      if (e.pointerType === "touch") {
+        try { c.setPointerCapture(e.pointerId); } catch { /* 已经捕获 */ }
+        this.touch.down(e);
+        return;
+      }
       // 游戏模式没锁定：这一下只是锁定，从按下到松开都不发给对方（游戏里点一下可能就是开枪、选中东西）
       if (this.gamePaused) {
         this.swallowing = true;
@@ -505,6 +531,7 @@ export class RemoteInput {
     on("pointerup", e => {
       if (!this._interactive) return;
       e.preventDefault();
+      if (e.pointerType === "touch") { this.touch.up(e); return; }
       // 重新锁定的那一下松开了（按下时一起按着的键都松开）：之后的照常发
       if (this.swallowing) {
         if (e.buttons === 0) this.swallowing = false;
@@ -512,7 +539,11 @@ export class RemoteInput {
       }
       this.pointer(e, true);
     });
-    on("pointercancel", () => this.releaseAll());
+    on("pointercancel", e => {
+      // 手指被浏览器收走了（切到别的应用、多指手势）：按着的松开，别让被控端一直按着
+      if (e.pointerType === "touch") this.touch.cancel();
+      this.releaseAll();
+    });
     on("contextmenu", e => e.preventDefault());
     on("auxclick", e => e.preventDefault());
     on("wheel", e => {

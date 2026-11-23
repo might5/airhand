@@ -507,3 +507,53 @@ test("长按 Esc 也能放开自动锁定（被控端光标隐藏着），点一
   assert.equal(input.locked, true);
   input.dispose();
 });
+
+/** 发出去的事件压成一行，方便比对 */
+const brief = (events: any[]) =>
+  events.map((e) => (e.type === "mouseMove" ? `m${e.x.toFixed(3)},${e.y.toFixed(3)}` :
+    e.type === "mouseButton" ? `${e.button}${e.down ? "+" : "-"}` :
+    e.type === "mouseDelta" ? `d${e.dx},${e.dy}` : e.type));
+
+test("触摸屏：手指点一下就是左键点一下，按画面的绝对坐标走，不锁指针也不发相对移动", async () => {
+  const { canvas, fire, locks } = fakeCanvas();
+  const sent: any[] = [];
+  const input = new RemoteInput(canvas, () => true, (events) => sent.push(...events));
+  input.interactive = true;
+  const touch = (name: string, clientX: number, clientY: number, buttons: number) =>
+    fire(name, { pointerType: "touch", pointerId: 7, clientX, clientY, button: 0, buttons });
+  touch("pointerdown", 20, 30, 1);
+  touch("pointerup", 20, 30, 0);
+  await Promise.resolve();
+  assert.deepEqual(brief(sent), ["m0.200,0.300", "left+", "left-"]);
+  // 手指没有 hover：不能锁指针（锁了光标就不见了，也没法用相对移动）
+  assert.equal(locks.length, 0);
+  assert.equal(input.locked, false);
+  input.dispose();
+});
+
+test("触摸屏：手指拖动发绝对移动，不发相对移动", async () => {
+  const { canvas, fire } = fakeCanvas();
+  const sent: any[] = [];
+  const input = new RemoteInput(canvas, () => true, (events) => sent.push(...events));
+  input.interactive = true;
+  const touch = (name: string, clientX: number, clientY: number, buttons: number) =>
+    fire(name, { pointerType: "touch", pointerId: 7, clientX, clientY, button: 0, buttons });
+  touch("pointerdown", 10, 10, 1);
+  touch("pointermove", 60, 40, 1);
+  touch("pointerup", 60, 40, 0);
+  await Promise.resolve();
+  assert.deepEqual(brief(sent), ["m0.100,0.100", "left+", "m0.600,0.400", "left-"]);
+  assert.ok(!sent.some((e) => e.type === "mouseDelta"), brief(sent).join(","));
+  input.dispose();
+});
+
+test("触摸屏：用手指时鼠标那套不受影响，鼠标照样锁指针、发相对移动", async () => {
+  const { canvas, fire, locks } = fakeCanvas();
+  const sent: any[] = [];
+  const input = new RemoteInput(canvas, () => true, (events) => sent.push(...events));
+  input.interactive = true;
+  input.setMode("game", false);
+  fire("pointerdown", { pointerType: "mouse", pointerId: 1, button: 0, buttons: 1, clientX: 10, clientY: 10 });
+  assert.equal(locks.length, 1);
+  input.dispose();
+});

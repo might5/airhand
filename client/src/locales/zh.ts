@@ -167,6 +167,7 @@ export default {
   "session.popoutClosedHint": "可以在主窗口里重新连接",
   "session.quality": "画质",
   "session.shortcuts": "发送快捷键",
+  "session.typing": "打字（触摸屏）",
   "session.swapCtrlCommand": "互换 Ctrl 和 ⌘ Command",
   "session.clipboard": "剪贴板",
   "session.clipSync": "双向同步剪贴板",

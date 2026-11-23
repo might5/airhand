@@ -2,7 +2,12 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- 触摸屏（平板、触摸显示器）：页面自己不许缩放（双指是滚动远程画面，见 src/lib/touch.ts），
+         软键盘弹出时把视口让出来，别把画面整个挡住 -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+    />
     <meta name="color-scheme" content="dark" />
     <link rel="icon" type="image/svg+xml" href="/icon.svg" />
     <!-- 语言与标题在加载时按当前界面语言设置，见 src/lib/i18n.ts -->

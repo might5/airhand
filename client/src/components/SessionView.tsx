@@ -28,6 +28,7 @@ import {
   IconRestoreBar,
   IconShrink,
   IconSliders,
+  IconType,
   IconVolume,
   IconVolumeOff,
   IconWarn,
@@ -35,6 +36,12 @@ import {
 import { FloatingBall } from "./FloatingBall";
 import { Popover } from "./Popover";
 import { QualityPanel, fmtKbps } from "./QualityPanel";
+
+/**
+ * 这台设备有触摸屏（平板、触摸显示器）：才显示软键盘按钮。没有实体键盘的时候只能靠它打字。
+ * 触摸系统的键盘不会自己弹出来（画面不是输入框），所以得有个按钮明确叫它。
+ */
+const TOUCHABLE = typeof navigator !== "undefined" && (navigator.maxTouchPoints ?? 0) > 0;
 
 /** 把会话的 canvas 挂到当前位置（同一时刻只会挂在一个地方） */
 export function CanvasHost({ s, interactive }: { s: RemoteSession; interactive: boolean }) {
@@ -411,6 +418,18 @@ export function SessionView({ s }: { s: RemoteSession }) {
             </button>
             {menu === "quality" && <QualityPanel s={s} onClose={closeMenu} />}
           </div>
+
+          {TOUCHABLE && (
+            <div className="menu-anchor">
+              <button
+                className={`tb-btn icon ${s.keypadOpen ? "on" : ""}`}
+                title={t("session.typing")}
+                onClick={() => s.toggleKeyboard()}
+              >
+                <IconType size={17} />
+              </button>
+            </div>
+          )}
 
           <div className="menu-anchor">
             <button className={`tb-btn icon ${menu === "keys" ? "on" : ""}`} title={t("session.shortcuts")} onClick={() => toggleMenu("keys")}>
