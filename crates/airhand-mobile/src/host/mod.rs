@@ -26,7 +26,9 @@ use airhand_link::host::{
 };
 use airhand_link::secure::{Identity, PairingAttempt};
 use airhand_proto::handshake::PublicKey;
-use airhand_proto::session::{Codec, DisplayInfo, EncoderInfo, HostMsg, Notice, SystemAction};
+use airhand_proto::session::{
+    Codec, DisplayInfo, EncoderInfo, HostMsg, Notice, Platform, SystemAction,
+};
 use airhand_proto::signal::Reclaim;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -64,6 +66,13 @@ pub struct HostConfig {
     /// 没有时生成一个配对码，用 `pairing` 事件交给 Kotlin 保存
     #[serde(default)]
     pub pairing: Option<PairingState>,
+    /// 告诉控制端的平台（默认 Android）。iOS 只能被看：不能操作是这个平台本来就这样，不提示"缺少权限"
+    #[serde(default = "default_platform")]
+    pub platform: Platform,
+}
+
+fn default_platform() -> Platform {
+    Platform::Android
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -112,6 +121,7 @@ pub(crate) struct Info {
     pub touch: bool,
     pub actions: Vec<SystemAction>,
     pub capture_failure: Option<String>,
+    pub platform: Platform,
 }
 
 /// 会话之间共享的东西
@@ -246,6 +256,7 @@ impl Host {
                 touch: cfg.touch,
                 actions: cfg.actions,
                 capture_failure: None,
+                platform: cfg.platform,
             }),
             video: video::VideoHub::new(events.clone()),
             audio: audio::AudioHub::new(events.clone()),
@@ -321,7 +332,7 @@ impl Host {
             }
             Op::Permissions { input } => {
                 let mut info = sh.info.lock().unwrap();
-                if info.input != input {
+                if info.input != input && info.platform != Platform::Ios {
                     info.input = input;
                     drop(info);
                     sh.notice(Notice::MissingPermissions {

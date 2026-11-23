@@ -1,4 +1,4 @@
-//! 控制端：在 [`airhand_link::controller::ControllerService`] 外面包一层给 Kotlin 用的接口。
+//! 控制端：在 [`airhand_link::controller::ControllerService`] 外面包一层给手机界面（Kotlin / Swift）用的接口。
 //!
 //! * 服务事件（与服务器的连接状态、等待的被控端上线了）：JSON 字符串，[`Ctl::poll_event`] 取：
 //!   `{"type":"server","state":ServerState}`、`{"type":"hostOnline","code":123456}`（和网页控制台一样）；
@@ -168,6 +168,11 @@ impl Ctl {
         self.events.pop(timeout)
     }
 
+    /// 这个会话的信箱还在（会话结束、断开之后就不在了）
+    pub fn has_session(&self, sid: u32) -> bool {
+        self.sessions.lock().unwrap().contains_key(&sid)
+    }
+
     pub fn poll_session(&self, sid: u32, timeout: Duration) -> Option<Vec<u8>> {
         let q = self.sessions.lock().unwrap().get(&sid).cloned()?;
         q.pop(timeout)
@@ -176,6 +181,12 @@ impl Ctl {
     /// 界面收到了这一帧。Android 只看一个显示器：都是第 0 路画面
     pub fn ack(&self, sid: u32, seq: u32) {
         let _ = self.svc.ack(sid, 0, seq);
+    }
+
+    /// 界面采集、编码好的一个麦克风声音包（`airhand_proto::media` 的声音包：头 + Opus）。
+    /// 先用 `mic` 命令打开；没打开、包不对、网络跟不上时丢掉
+    pub fn mic(&self, sid: u32, packet: &[u8]) {
+        let _ = self.svc.mic(sid, bytes::Bytes::copy_from_slice(packet));
     }
 
     /// 执行命令，返回 JSON：`{"ok": ...}` 或 `{"err": Problem}`
@@ -252,7 +263,7 @@ mod tests {
     fn commands_parse() {
         // 和桌面版、网页版共用的命令样例（crates/airhand-link/tests/protocol.json）
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../crates/airhand-link/tests/protocol.json"
+            "../../airhand-link/tests/protocol.json"
         ))
         .unwrap();
         for c in fixture["commands"].as_array().unwrap() {

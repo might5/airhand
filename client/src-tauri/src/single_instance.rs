@@ -6,8 +6,9 @@
 //!   进程退出时端口失效、名字自动注销。
 
 pub struct Guard {
+    /// Windows：命名互斥量的句柄。存成整数，好交给别的线程提前放开（见 [`Guard::release`]）
     #[cfg(windows)]
-    _handle: windows::Win32::Foundation::HANDLE,
+    handle: usize,
     #[cfg(target_os = "linux")]
     _socket: Option<std::os::unix::net::UnixListener>,
     #[cfg(target_os = "macos")]
@@ -25,7 +26,19 @@ pub fn acquire() -> Option<Guard> {
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return None;
         }
-        Some(Guard { _handle: handle })
+        Some(Guard {
+            handle: handle.0 as usize,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Guard {
+    /// 提前放开（关掉互斥量的句柄），不等进程退出。仅为当前用户安装的那一份给为所有用户安装的那份让开时用：
+    /// 它还在问用户要不要卸载自己，这时为所有用户安装的那份托盘就得能打开了（见 `crate::watch_service_installed`）
+    pub fn release(self) {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        let _ = unsafe { CloseHandle(HANDLE(self.handle as _)) };
     }
 }
 

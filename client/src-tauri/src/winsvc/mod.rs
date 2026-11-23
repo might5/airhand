@@ -1,6 +1,7 @@
 //! Windows 安装版：被控端作为系统服务运行。
 //!
-//! 安装包（NSIS，钩子见 `windows/hooks.nsh`）把 airhand.exe 装进 Program Files，然后运行 `airhand.exe --install`
+//! 安装包（NSIS，钩子见 `windows/hooks.nsh`）可以为所有用户安装，或者仅为当前用户安装（见 [`user`]：没有系统服务，
+//! 被控端在托盘进程里运行）。为所有用户安装时把 airhand.exe 装进 Program Files，然后运行 `airhand.exe --install`
 //! 注册系统服务 `Airhand`。同一个 airhand.exe 按命令行参数扮演不同的角色：
 //!
 //! | 参数 | 角色 | 身份 / 会话 |
@@ -8,15 +9,24 @@
 //! | （无） | 托盘和控制台 | 登录的用户，用户自己的会话 |
 //! | `--service` | 系统服务：在控制台会话里启动被控端并看护它（[`service`]） | SYSTEM，会话 0 |
 //! | `--agent` | 被控端：连接服务器、采集画面和声音、注入键鼠、同步剪贴板（[`agent`]） | SYSTEM，控制台会话 |
-//! | `--install` / `--uninstall` / `--stop-service` | 安装、卸载、升级时由安装包调用 | 管理员 |
+//! | `--install` | 为所有用户安装：复制完文件后注册并启动服务 | 管理员 |
+//! | `--install-user` | 仅为当前用户安装：复制完文件后记下安装位置（见 [`user`]） | 用户自己 |
+//! | `--stop` | 升级：覆盖文件之前停下这一份 Airhand（服务、托盘），运行的是旧版本 | 安装时的身份 |
+//! | `--uninstall` | 卸载：删除这一份注册的东西，停下它；文件由卸载程序删除 | 安装时的身份 |
+//!
+//! `--stop` 和 `--uninstall` 两种安装方式通用，只动属于这个 airhand.exe 的东西（服务运行的是它、记下的安装位置是它）：
+//! 另一份安装的服务和托盘不受影响。托盘在一个命名事件上等着被叫退出（[`watch_quit`]），安装包也靠它判断
+//! 升级前托盘开着没有、装好后要不要重新打开。
 //!
 //! * 被控端以 SYSTEM 身份运行在用户的会话里，才能采集和操作 UAC 确认框、锁屏和登录界面（它们在安全桌面上，
 //!   见 `host::desktop`）。服务跟着"控制台会话"走：切换用户、注销时把被控端挪到新的控制台会话里；
 //! * 托盘经命名管道（[`ipc`]）显示被控端的状态、发送命令（断开控制端、更换控制码、开机自动启动）；
 //! * 托盘和服务同进同退：打开 Airhand 时启动服务，托盘"退出"时停止服务；服务停止（或者被卸载）时托盘也退出；
 //! * 开机自动启动（`config.toml` 的 `autostart`，托盘里可以切换）= 服务的启动类型为"自动" + 登录时启动托盘
-//!   （`HKLM\...\Run` 里的 `Airhand`）；
-//! * 卸载（`--uninstall`）删除服务和这个启动项，安装目录里的文件（包括 config.toml）由卸载程序删除。
+//!   （`HKLM\...\Run` 里的 `Airhand`）。在任务管理器的"启动应用"里禁用过它的话，托盘里打开时一并恢复
+//!   （见 [`STARTUP_APPROVED_KEY`]）；
+//! * 卸载（`--uninstall`）删除服务和这个启动项，安装目录里的文件（包括 config.toml）由卸载程序删除；
+//! * 服务以 SYSTEM 身份运行安装目录里的程序，所以为所有用户安装时安装包只允许装在 Program Files 里（普通用户改不了）。
 //!
 //! 服务和被控端没有控制台，日志写到 Windows 调试输出（`OutputDebugString`），用 Sysinternals 的 DebugView
 //! （勾选 Capture Global Win32）查看；日志级别同样由 `AIRHAND_LOG` 控制。
@@ -25,6 +35,7 @@ mod agent;
 pub mod clip;
 pub mod ipc;
 mod service;
+pub mod user;
 
 /// 本进程是服务里的被控端（`--agent`，SYSTEM）
 static AGENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -42,7 +53,7 @@ use tracing::{info, warn};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SERVICE_ALREADY_RUNNING,
     ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOT_ACTIVE,
-    HLOCAL, LocalFree,
+    HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -52,8 +63,9 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Registry::{
-    HKEY_LOCAL_MACHINE, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW,
+    HKEY, HKEY_LOCAL_MACHINE, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW,
 };
+use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::Services::{
     ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
     CreateServiceW, DeleteService, ENUM_SERVICE_TYPE, OpenSCManagerW, OpenServiceW,
@@ -67,20 +79,45 @@ use windows::Win32::System::Services::{
     SERVICE_WIN32_OWN_PROCESS, SetServiceObjectSecurity, StartServiceW,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW,
+    CreateEventW, EVENT_MODIFY_STATE, GetCurrentProcessId, INFINITE, OpenEventW, OpenProcess,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, ResetEvent,
+    SetEvent, WaitForSingleObject,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR, w};
 
 /// 系统服务的名称
 pub const SERVICE_NAME: &str = "Airhand";
-/// 开机启动托盘的注册表位置（所有用户）
+/// 开机启动托盘的注册表位置（为所有用户安装时在 HKLM 下，仅为当前用户安装时在 HKCU 下）
 const RUN_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+/// 任务管理器的"启动应用"（还有"设置 → 应用 → 启动"）里启用 / 禁用过的启动项记在这里：一项一个值，值名和 [`RUN_KEY`]
+/// 里的一样（`Airhand`），没有这个值就是启用。HKLM 的 Run 项记在 HKLM 下，HKCU 的记在 HKCU 下。
+/// 删掉 Run 项时系统不会删它：卸载后重新安装，Run 项还被"已禁用"挡着，托盘里勾着自动启动，其实不启动。
+/// 所以用户在托盘里打开自动启动时删掉它（[`choose_autostart`]、[`user::choose_autostart`]），安装包在卸载、
+/// 第一次安装时也删掉它（`windows/hooks.nsh`）；按 config.toml 同步时、升级时不动：那是用户在任务管理器里的选择
+const STARTUP_APPROVED_KEY: &str =
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+/// 让托盘退出的命名事件（见 [`watch_quit`]）。每个会话一个，和单实例的互斥体一样（见 `crate::single_instance`）。
+/// 安装包（`windows/hooks.nsh`）看它在不在，判断升级前托盘开着没有
+const QUIT_EVENT: &str = r"Local\Airhand.Quit";
 /// 服务的访问权限：在系统默认的基础上，允许交互登录的用户（IU）启动（RP）和停止（WP）服务——
 /// 打开 Airhand 时启动被控端、在托盘里"退出"时停止它，都不需要管理员权限
 const SERVICE_SDDL: &str = "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPWPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)";
 /// `DELETE` 访问权限（删除服务）
 const DELETE: u32 = 0x0001_0000;
+
+/// 安装程序传给旧版本卸载程序的环境变量（见 `windows/hooks.nsh` 开头的说明）
+const INSTALLER_ENV: [&str; 2] = ["AIRHAND_UPGRADE", "AIRHAND_INSTALLER_VERSION"];
+
+/// 去掉从安装程序继承来的 [`INSTALLER_ENV`]，不再传给本进程启动的程序。没有提升权限的安装程序（仅为当前用户安装）
+/// 直接 ShellExecute 打开托盘，托盘继承了它的环境变量；托盘再启动卸载程序的话（[`user::step_aside`]），
+/// 卸载就被当成升级：config.toml 留下，安装目录、注册表项、防火墙规则也不清理。
+/// 安装包开始复制文件时已经清掉了它们，这里是第二道保险。在 `run()` 的最开头调用
+pub fn forget_installer_env() {
+    for name in INSTALLER_ENV {
+        // SAFETY: 在 run() 的最开头调用，此时只有主线程
+        unsafe { std::env::remove_var(name) };
+    }
+}
 
 /// 处理安装包和服务管理器使用的命令行参数。返回 `Some(退出码)` 表示已经处理完，进程应该退出；
 /// `None` 表示普通启动（托盘）。
@@ -97,13 +134,17 @@ pub fn cli() -> Option<i32> {
             init_console_logging();
             install()
         }
+        "--install-user" => {
+            init_console_logging();
+            user::install()
+        }
+        "--stop" => {
+            init_console_logging();
+            stop_for_upgrade()
+        }
         "--uninstall" => {
             init_console_logging();
             uninstall()
-        }
-        "--stop-service" => {
-            init_console_logging();
-            stop_for_upgrade()
         }
         _ => return None,
     };
@@ -258,8 +299,8 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// 这个 airhand.exe 是不是已经安装好了（Airhand 服务运行的就是它）。
-/// 是的话被控端在服务里运行；不是的话（例如开发时直接运行的调试构建）被控端在本进程里运行。
+/// 这个 airhand.exe 是不是为所有用户安装好了（Airhand 服务运行的就是它）。
+/// 是的话被控端在服务里运行；不是的话（仅为当前用户安装、开发时直接运行的调试构建）被控端在本进程里运行。
 pub fn installed_here() -> bool {
     let check = || -> Result<bool> {
         let Some(svc) = open_service(SERVICE_QUERY_CONFIG)? else {
@@ -271,6 +312,31 @@ pub fn installed_here() -> bool {
         warn!("can't check the Airhand service: {e:#}");
         false
     })
+}
+
+/// 这台电脑为所有用户安装了 Airhand：服务在，而且它登记的程序还在（不是卸载失败留下的服务）。
+/// 仅为当前用户安装的那一份看到它就不再运行（见 [`user::step_aside`]）
+pub fn service_present() -> bool {
+    let check = || -> Result<bool> {
+        let Some(svc) = open_service(SERVICE_QUERY_CONFIG)? else {
+            return Ok(false);
+        };
+        Ok(service_exe(&svc)?.exists())
+    };
+    check().unwrap_or_else(|e| {
+        warn!("can't check the Airhand service: {e:#}");
+        false
+    })
+}
+
+/// Airhand 服务属于这个 airhand.exe：服务运行的就是它，或者服务登记的程序已经不在了（残留的服务，顺手清掉）。
+/// `--stop`、`--uninstall` 只动这样的服务：仅为当前用户安装的那一份不会停掉、删掉为所有用户安装的服务
+fn service_is_mine() -> Result<bool> {
+    let Some(svc) = open_service(SERVICE_QUERY_CONFIG)? else {
+        return Ok(false);
+    };
+    let exe = service_exe(&svc)?;
+    Ok(!exe.exists() || same_file(&exe, &std::env::current_exe()?))
 }
 
 /// 启动服务（已经在运行时什么也不做）
@@ -338,6 +404,34 @@ pub fn apply_autostart(on: bool) -> Result<()> {
     }
     .context("ChangeServiceConfig")?;
     set_run_key(on)
+}
+
+/// 用户在托盘菜单里切换开机自动启动（经命名管道交给服务里的被控端）：同 [`apply_autostart`]，打开时还删掉任务管理器里
+/// "已禁用"的记录（见 [`STARTUP_APPROVED_KEY`]）：用户明确要打开，登录时启动托盘的 Run 项不能还被它挡着
+pub fn choose_autostart(on: bool) -> Result<()> {
+    apply_autostart(on)?;
+    if on && let Err(e) = forget_startup_disabled(HKEY_LOCAL_MACHINE) {
+        // 服务照样开机启动，只是登录后不打开托盘：不算切换失败
+        warn!("{e:#}");
+    }
+    Ok(())
+}
+
+/// 删掉 `root`（HKLM / HKCU）下任务管理器对 Airhand 启动项的记录（见 [`STARTUP_APPROVED_KEY`]），启动项又算启用了。
+/// 没有这条记录时什么也不做
+fn forget_startup_disabled(root: HKEY) -> Result<()> {
+    let r = unsafe {
+        RegDeleteKeyValueW(
+            root,
+            &HSTRING::from(STARTUP_APPROVED_KEY),
+            &HSTRING::from(SERVICE_NAME),
+        )
+    };
+    if r.is_err() && r != windows::Win32::Foundation::ERROR_FILE_NOT_FOUND {
+        r.ok()
+            .context("can't delete the Task Manager startup record")?;
+    }
+    Ok(())
 }
 
 /// 登录时启动托盘（所有用户）
@@ -485,37 +579,96 @@ fn install() -> Result<()> {
     Ok(())
 }
 
-/// `--uninstall`：停止并删除服务、删除开机启动项，等托盘全部退出。安装目录里的文件由卸载程序删除
+/// `--uninstall`：删除这一份 Airhand 注册的东西——服务运行的是它的话删除服务和开机启动项（需要管理员权限），
+/// 记下的仅为当前用户安装的位置是它的话删除记录和登录时启动项——然后让它的托盘退出、等它的进程都退出。
+/// 别的安装的东西不动。安装目录里的文件由卸载程序删除
 fn uninstall() -> Result<()> {
-    if let Some(svc) = open_service(SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE)? {
-        if let Err(e) = stop_and_wait(&svc, Duration::from_secs(20)) {
-            warn!("{e:#}");
+    let service = service_is_mine()?;
+    if service {
+        if let Some(svc) = open_service(SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE)? {
+            if let Err(e) = stop_and_wait(&svc, Duration::from_secs(20)) {
+                warn!("{e:#}");
+            }
+            match unsafe { DeleteService(svc.0) } {
+                Err(e) if e.code() == ERROR_SERVICE_MARKED_FOR_DELETE.to_hresult() => {}
+                r => r.context("DeleteService")?,
+            }
+            info!("the Airhand service is removed");
         }
-        match unsafe { DeleteService(svc.0) } {
-            Err(e) if e.code() == ERROR_SERVICE_MARKED_FOR_DELETE.to_hresult() => {}
-            r => r.context("DeleteService")?,
-        }
-        info!("the Airhand service is removed");
+        set_run_key(false)?;
     }
-    set_run_key(false)?;
-    wait_for_other_instances(Duration::from_secs(8));
+    user::unregister()?;
+    ask_tray_to_quit();
+    wait_for_other_instances(Duration::from_secs(8), service);
     Ok(())
 }
 
-/// `--stop-service`：升级前停止服务（并等托盘退出），否则 airhand.exe 正在使用，无法覆盖
+/// `--stop`：升级时覆盖文件之前停下这一份 Airhand——服务运行的是它的话停止服务（各个会话里的托盘随之退出），
+/// 本会话里它的托盘退出——等它的进程都退出，否则 airhand.exe 正在使用，无法覆盖。别的安装不受影响。
+/// 安装包运行的是旧版本的 airhand.exe；升级完了再由安装包重新打开托盘（见 `windows/hooks.nsh`）
 fn stop_for_upgrade() -> Result<()> {
-    if let Some(svc) = open_service(SERVICE_STOP | SERVICE_QUERY_STATUS)? {
+    let service = service_is_mine()?;
+    if service && let Some(svc) = open_service(SERVICE_STOP | SERVICE_QUERY_STATUS)? {
         stop_and_wait(&svc, Duration::from_secs(20))?;
     }
-    wait_for_other_instances(Duration::from_secs(8));
+    ask_tray_to_quit();
+    wait_for_other_instances(Duration::from_secs(8), service);
     Ok(())
 }
 
-/// 等同一个 airhand.exe 的其它进程（各个会话里的托盘、被控端）退出：服务停止后它们会自己退出
-fn wait_for_other_instances(timeout: Duration) {
+/// 托盘：安装包升级、卸载这一份 Airhand 时（`--stop`、`--uninstall`）退出，否则 airhand.exe 正在使用。
+/// 两种安装方式都等着：仅为当前用户安装时没有服务，托盘不会跟着服务一起退出。
+/// 安装包看这个事件在不在，判断升级前托盘开着没有（开着的话装好后重新打开）
+pub fn watch_quit(on_quit: impl FnOnce() + Send + 'static) {
+    let event = match unsafe { CreateEventW(None, false, false, &HSTRING::from(QUIT_EVENT)) } {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("can't create the quit event: {e}");
+            return;
+        }
+    };
+    // 不算之前留下的信号（自动复位的事件没人等时信号一直留着）
+    let _ = unsafe { ResetEvent(event) };
+    // HANDLE 不能跨线程传递，传它的值
+    let raw = event.0 as usize;
+    std::thread::spawn(move || {
+        if unsafe { WaitForSingleObject(HANDLE(raw as _), INFINITE) } == WAIT_OBJECT_0 {
+            info!("the installer asked Airhand to quit");
+            on_quit();
+        }
+    });
+}
+
+/// 让本会话里这个 airhand.exe 的托盘退出（见 [`watch_quit`]）。事件是整个会话共用的：
+/// 本会话里开着的是另一份安装的托盘时不通知它
+fn ask_tray_to_quit() {
+    let Some(session) = session_of(unsafe { GetCurrentProcessId() }) else {
+        return;
+    };
+    if other_instances(|pid, mine| mine == Some(true) && session_of(pid) == Some(session)) == 0 {
+        return;
+    }
+    unsafe {
+        if let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(QUIT_EVENT)) {
+            let _ = SetEvent(event);
+            let _ = CloseHandle(event);
+        }
+    }
+}
+
+fn session_of(pid: u32) -> Option<u32> {
+    let mut session = 0;
+    unsafe { ProcessIdToSessionId(pid, &mut session) }.ok()?;
+    Some(session)
+}
+
+/// 等这个 airhand.exe 的其它进程（各个会话里的托盘、服务里的被控端）退出。
+/// `unknown_too`：看不到路径的 airhand.exe（别的用户、SYSTEM 的进程）也算上，宁可多等一会儿——服务是这一份的时候。
+/// 不是的话（仅为当前用户安装）不算：要等的只是用户自己的托盘，看不到的是另一份安装的服务
+fn wait_for_other_instances(timeout: Duration, unknown_too: bool) {
     let deadline = Instant::now() + timeout;
     loop {
-        let n = other_instances();
+        let n = other_instances(|_, mine| mine.unwrap_or(unknown_too));
         if n == 0 {
             return;
         }
@@ -527,7 +680,9 @@ fn wait_for_other_instances(timeout: Duration) {
     }
 }
 
-fn other_instances() -> usize {
+/// 同名（airhand.exe）的其它进程里，`count(进程号, 是不是这个 airhand.exe)` 为真的有几个。
+/// 第二个参数为 `None`：看不到它的路径（别的用户、SYSTEM 的进程）
+fn other_instances(count: impl Fn(u32, Option<bool>) -> bool) -> usize {
     let Ok(me) = std::env::current_exe() else {
         return 0;
     };
@@ -549,12 +704,11 @@ fn other_instances() -> usize {
         while ok {
             let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(0);
             let name = String::from_utf16_lossy(&e.szExeFile[..len]).to_lowercase();
-            if e.th32ProcessID != my_pid
-                && name == file_name
-                // 看不到路径（别的用户的进程）时也算上，宁可多等一会儿
-                && process_path(e.th32ProcessID).is_none_or(|p| same_file(&p, &me))
-            {
-                n += 1;
+            if e.th32ProcessID != my_pid && name == file_name {
+                let mine = process_path(e.th32ProcessID).map(|p| same_file(&p, &me));
+                if count(e.th32ProcessID, mine) {
+                    n += 1;
+                }
             }
             ok = Process32NextW(snap, &mut e).is_ok();
         }
@@ -583,8 +737,8 @@ fn process_path(pid: u32) -> Option<PathBuf> {
 pub fn show_not_installed() {
     use windows::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW};
     let text = HSTRING::from(tr!(
-        "Airhand 需要安装后才能使用：请运行 Airhand 安装程序。\n\n安装后 Airhand 作为系统服务运行，锁屏、登录界面和 UAC 确认框也能被远程控制。",
-        "Airhand needs to be installed: please run the Airhand installer.\n\nOnce installed, Airhand runs as a system service, so the lock screen, the sign-in screen and UAC prompts can be controlled remotely too."
+        "Airhand 需要安装后才能使用：请运行 Airhand 安装程序。\n\n为所有用户安装时，Airhand 作为系统服务运行，锁屏、登录界面和 UAC 确认框也能被远程控制（需要管理员权限）。没有管理员权限也可以仅为自己安装，只是这些不能控制。",
+        "Airhand needs to be installed: please run the Airhand installer.\n\nInstalled for all users, Airhand runs as a system service, so the lock screen, the sign-in screen and UAC prompts can be controlled remotely too (needs administrator rights). Without administrator rights you can install it just for yourself, only those can't be controlled."
     ));
     unsafe {
         MessageBoxW(None, &text, w!("Airhand"), MB_OK | MB_ICONINFORMATION);

@@ -588,11 +588,13 @@ export class RemoteSession {
         this.hostOs = ev.os;
         this.hostPlatform = ev.platform;
         // 手机点的是触屏，没有鼠标模式（工具栏也不显示）：一律按自动
-        if (ev.platform === "android" && this.input.mode !== "auto") {
+        if ((ev.platform === "android" || ev.platform === "ios") && this.input.mode !== "auto") {
           for (const input of this.inputs) input.setMode("auto", false);
           this.pushSettings();
         }
         this.hostActions = ev.actions;
+        // iPhone / iPad 只能看（iOS 不允许别的应用注入触摸）：说一声，免得以为是出了问题
+        if (ev.platform === "ios") this.notice = { kind: "iosViewOnly" };
         this.hostVersion = ev.version;
         this.maxStreams = Math.max(1, ev.maxStreams ?? 1);
         this.setShown(ev.displays, ev.current, ev.shown);

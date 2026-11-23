@@ -5,13 +5,16 @@
 //!   文件管理器自己显示进度、可以取消。文件夹里指向文件夹外面的链接不呈现（见 `airhand_proto::files` 的"链接"）；
 //! * 剪贴板（X11 的 CLIPBOARD，Wayland 的程序经 XWayland 也看得到）由一个专门的线程拥有，提供
 //!   `text/uri-list`（KDE、GTK4）、`x-special/gnome-copied-files`（GNOME、Xfce、MATE 的文件管理器）和路径文本；
-//! * 本程序上次没退干净（崩溃）留下的挂载点，启动后第一次挂载时卸掉。
+//! * 退出时卸载（[`shutdown`]：挂载放在静态变量里，进程退出时不会自己卸，FUSE 的守护进程没了挂载点还在，
+//!   一访问就是 "Transport endpoint is not connected"）；上次没退干净（崩溃、被强制结束）留下的，下次启动时卸掉
+//!   （[`sweep_stale`]）。
 //!
 //! 没有 FUSE（`/dev/fuse` 或 `fusermount3` 没有，例如在容器里）时不接收文件，只同步文本（对方照样等得到"放好了"）。
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -352,8 +355,14 @@ impl Filesystem for Fs {
 struct Mounted {
     dir: PathBuf,
     state: Arc<Mutex<State>>,
-    _session: BackgroundSession,
+    /// drop 掉就卸载（见 [`unmount`]）；卸掉之后是 `None`
+    session: Mutex<Option<BackgroundSession>>,
 }
+
+/// 第一次放对方的文件时挂上（见 [`mount`]），挂不上（没有 FUSE）时是 `None`
+static MOUNT: OnceLock<Option<Mounted>> = OnceLock::new();
+/// 退出了（[`shutdown`]）：卸掉了，不再挂
+static CLOSED: AtomicBool = AtomicBool::new(false);
 
 /// 挂载点的上一层（本用户的运行时目录下）
 fn base() -> PathBuf {
@@ -383,51 +392,93 @@ fn clean_stale(base: &Path) {
             .status();
         let _ = std::fs::remove_dir(d.path());
     }
+    // 都清掉了的话上一层也删掉（还有正在用的就删不掉）
+    let _ = std::fs::remove_dir(base);
+}
+
+/// 启动时卸掉上次没退干净（崩溃、被强制结束）留下的挂载点：不等第一次挂载，之后可能一直用不到。
+/// 在占用单实例之后调用
+pub fn sweep_stale() {
+    clean_stale(&base());
+}
+
+/// 退出时卸载、删掉挂载点，之后不再挂。挂载放在静态变量里，进程退出时不会 drop，不卸的话挂载点留着
+/// （守护进程没了，一访问就出错），要等下次启动或者注销才清掉
+pub fn shutdown() {
+    CLOSED.store(true, Ordering::SeqCst);
+    if let Some(Some(m)) = MOUNT.get() {
+        unmount(m);
+    }
+}
+
+/// 卸载（fuser 的延迟卸载：`umount2(MNT_DETACH)`，没有权限时 `fusermount3 -u -z`，文件管理器还开着里面的文件也卸得掉），
+/// 删掉挂载点和空了的上一层。卸过了什么也不做
+fn unmount(m: &Mounted) {
+    let Some(session) = m.session.lock().unwrap().take() else {
+        return;
+    };
+    // 只卸载、不等后台线程：卸掉之后它读到 ENODEV 自己退出
+    drop(session);
+    let _ = std::fs::remove_dir(&m.dir);
+    if let Some(base) = m.dir.parent() {
+        let _ = std::fs::remove_dir(base);
+    }
+    tracing::debug!("unmounted {}", m.dir.display());
 }
 
 fn mount() -> Option<&'static Mounted> {
-    static M: OnceLock<Option<Mounted>> = OnceLock::new();
-    M.get_or_init(|| {
-        let base = base();
-        clean_stale(&base);
-        let dir = base.join(std::process::id().to_string());
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            tracing::warn!("can't create {}: {e}", dir.display());
-            return None;
+    if CLOSED.load(Ordering::SeqCst) {
+        return None;
+    }
+    let m = MOUNT.get_or_init(|| mount_at(&base())).as_ref()?;
+    // 正好在退出（shutdown）的时候挂上：shutdown 可能没看到它，这里卸掉
+    if CLOSED.load(Ordering::SeqCst) {
+        unmount(m);
+        return None;
+    }
+    Some(m)
+}
+
+/// 在 `base` 下以本进程号为名挂上（先卸掉上次留下的）。没有 FUSE 时返回 `None`
+fn mount_at(base: &Path) -> Option<Mounted> {
+    clean_stale(base);
+    let dir = base.join(std::process::id().to_string());
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("can't create {}: {e}", dir.display());
+        return None;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o700));
+    let state = Arc::new(Mutex::new(State::default()));
+    state.lock().unwrap().add(Node {
+        key: 0,
+        path: Vec::new(),
+        kind: FileKind::Dir,
+        size: 0,
+        mtime: None,
+        target: None,
+        children: None,
+    });
+    // 不用 AutoUnmount：fuser 会为它加上 allow_other，要 /etc/fuse.conf 里开了 user_allow_other 才挂得上
+    let options = [
+        MountOption::RO,
+        MountOption::FSName("airhand".into()),
+        MountOption::NoDev,
+        MountOption::NoSuid,
+        MountOption::NoExec,
+    ];
+    match fuser::spawn_mount2(Fs(state.clone()), &dir, &options) {
+        Ok(session) => Some(Mounted {
+            dir,
+            state,
+            session: Mutex::new(Some(session)),
+        }),
+        Err(e) => {
+            tracing::info!("no FUSE, the peer's files can't be pasted here: {e}");
+            let _ = std::fs::remove_dir(&dir);
+            None
         }
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700));
-        let state = Arc::new(Mutex::new(State::default()));
-        state.lock().unwrap().add(Node {
-            key: 0,
-            path: Vec::new(),
-            kind: FileKind::Dir,
-            size: 0,
-            mtime: None,
-            target: None,
-            children: None,
-        });
-        let options = [
-            MountOption::RO,
-            MountOption::FSName("airhand".into()),
-            MountOption::NoDev,
-            MountOption::NoSuid,
-            MountOption::NoExec,
-        ];
-        match fuser::spawn_mount2(Fs(state.clone()), &dir, &options) {
-            Ok(session) => Some(Mounted {
-                dir,
-                state,
-                _session: session,
-            }),
-            Err(e) => {
-                tracing::info!("no FUSE, the peer's files can't be pasted here: {e}");
-                let _ = std::fs::remove_dir(&dir);
-                None
-            }
-        }
-    })
-    .as_ref()
+    }
 }
 
 /// 剪贴板里的文件在哪里（本程序挂的文件系统里的路径：自己放的，不是本机复制的）
@@ -841,6 +892,44 @@ mod tests {
         assert!(files.iter().all(|f| is_our_path(f)));
         withdraw(0x5a);
         assert!(!is_ours());
+    }
+
+    /// 退出时卸载（要 /dev/fuse、fusermount3）：挂载点从挂载表里消失，目录和空了的上一层都删掉；再卸一次什么也不做。
+    /// 手动运行：`cargo test --lib clipfiles::linux -- --ignored`
+    #[test]
+    #[ignore]
+    fn unmounts_and_removes_the_mount_point() {
+        let base =
+            std::env::temp_dir().join(format!("airhand-clip-unmount-{}", std::process::id()));
+        let m = mount_at(&base).expect("FUSE");
+        let mounted = || {
+            std::fs::read_to_string("/proc/self/mounts")
+                .unwrap()
+                .lines()
+                .any(|l| l.split(' ').nth(1) == m.dir.to_str())
+        };
+        assert!(mounted());
+        unmount(&m);
+        assert!(!mounted());
+        assert!(!m.dir.exists() && !base.exists());
+        unmount(&m);
+    }
+
+    /// 上次没退干净留下的挂载点：进程不在了的删掉，还在的（自己的）不动；都删完了上一层也删掉
+    #[test]
+    fn sweeps_only_mount_points_of_dead_processes() {
+        let base = std::env::temp_dir().join(format!("airhand-clip-sweep-{}", std::process::id()));
+        // u32::MAX 不会是进程号（Linux 的进程号最大 2^22）
+        let dead = base.join(u32::MAX.to_string());
+        let alive = base.join(std::process::id().to_string());
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::create_dir_all(&alive).unwrap();
+        clean_stale(&base);
+        assert!(!dead.exists());
+        assert!(alive.exists());
+        std::fs::remove_dir(&alive).unwrap();
+        clean_stale(&base);
+        assert!(!base.exists());
     }
 
     #[test]

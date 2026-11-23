@@ -2,7 +2,7 @@
 
 <h1 align="center">Airhand</h1>
 
-<p align="center"><b>高性能、低延迟的远程桌面</b><br>QUIC 传输 · 硬件编解码 · 最高 120 fps<br>Windows · macOS · Linux · Android · 浏览器</p>
+<p align="center"><b>高性能、低延迟的远程桌面</b><br>QUIC 传输 · 硬件编解码 · 最高 120 fps<br>Windows · macOS · Linux · Android · iOS · 浏览器</p>
 
 <p align="center"><a href="README.md">English</a> · <b>简体中文</b></p>
 
@@ -38,6 +38,7 @@ Airhand 是一个**高性能、低延迟**的远程桌面：画面用 GPU 硬件
 - **控制台**：浏览器式标签页，同时控制多台电脑，多屏总览同时看所有画面。连接过的设备自动保存，下次点一下就连；对方离线时，等它上线自动连上
 - **网页控制台**：控制端也能用 Docker 部署，浏览器打开就能用，操作的电脑上什么都不用装
 - **Android**：在手机上用触控板或触屏的方式控制电脑、手机，也能共享自己的屏幕让别人协助（对方第一次连接时要输入手机上显示的配对码，有设备连上来时会提醒你）；在电视上用遥控器看画面
+- **iPhone / iPad**：和 Android 一样控制电脑、手机（触控板 / 触屏手势、键盘、外接鼠标，iPad 上可以锁定指针、游戏按键），也能用系统的屏幕广播共享自己的屏幕（只能被看：iOS 不允许别的应用操作本机）
 - **声音**：被控端的系统声音同步到控制端（Opus + 自适应抖动缓冲），看视频时可以打开音画同步。反过来，控制端的麦克风可以转发给 Windows、macOS 14.2+ 和 Linux（PipeWire）被控端，供那里的会议软件和语音输入使用。Mac 和 Linux 会在转发期间提供一个 **Airhand Microphone** 录音设备
 - **实用工具**：剪贴板双向同步（文字，以及文件、文件夹：粘贴时才传）、以键盘输入方式发送剪贴板、系统快捷键（Win、Alt+Tab、Ctrl+Shift+Esc……）、多显示器（可以同时显示、同时操作对方的几个显示器，也可以每个显示器单独一个窗口，放到本机的各个显示器上全屏）、全屏时锁定键盘、画质预设
 - **默认安全**：会话端到端加密，中转服务器看不到画面和键盘输入；第一次连接要输入对方托盘里的配对码（不经过服务器），之后认得出对方的身份；TLS 1.3 + 证书指纹固定，控制码防暴力猜测；被控端随时能看到谁连着，一键断开
@@ -48,11 +49,12 @@ Airhand 是一个**高性能、低延迟**的远程桌面：画面用 GPU 硬件
 
 | 平台 | 被控端 | 控制端 | 说明 |
 |---|:-:|:-:|---|
-| Windows 10 / 11 | ✅ | ✅ | 需要安装，被控端作为系统服务运行 |
+| Windows 10 / 11 | ✅ | ✅ | 需要安装，为所有用户安装时被控端作为系统服务运行 |
 | macOS 13+ | ✅ | ✅ | 被控端需要“屏幕与系统录音”和“辅助功能”权限 |
 | Linux | ✅ | ✅ | 被控端只支持 X11 桌面，目前只有软件编码 |
 | Android 7+ 手机 / 平板 | ✅ | ✅ | 开启无障碍服务后才能被操作，否则只能被看；控制端同一时间连一台 |
 | Android TV / Google TV | — | 只看画面 | 全部用遥控器操作 |
+| iOS / iPadOS 17+ | 只能被看 | ✅ | 共享本机用系统的屏幕广播；iOS 不允许别的应用操作本机 |
 | 浏览器（网页控制台） | — | ✅ | Chrome / Edge、Safari 16.4+、Firefox 130+ |
 
 各平台的已知问题见[已知限制](docs/limitations.zh-CN.md)。
@@ -61,9 +63,9 @@ Airhand 是一个**高性能、低延迟**的远程桌面：画面用 GPU 硬件
 
 ```mermaid
 flowchart LR
-    host["被控端<br>Windows / macOS / Linux / Android"]
+    host["被控端<br>Windows / macOS / Linux / Android / iOS"]
     relay["中转服务器<br>airhand-server（Docker）"]
-    ctrl["控制端<br>桌面控制台 / 网页控制台 / Android"]
+    ctrl["控制端<br>桌面控制台 / 网页控制台 / Android / iOS"]
     host <-->|"QUIC · UDP 4433"| relay
     relay <-->|"QUIC · UDP 4433"| ctrl
     host -. "直连（打得通时）" .- ctrl
@@ -125,7 +127,7 @@ npm run tauri build
 
 ### 3. 连接
 
-1. 两台电脑都装上 Airhand（Windows 运行安装程序，需要管理员权限；macOS 第一次打开时按提示授予权限）
+1. 两台电脑都装上 Airhand（Windows 运行安装程序，为所有用户安装需要管理员权限，也可以仅为自己安装，只是不能控制锁屏和 UAC；macOS 第一次打开时按提示授予权限）
 2. 在**被控**的电脑上右键托盘图标（macOS 是单击菜单栏图标），看到 6 位**控制码**
 3. 在**你自己**的电脑上，从托盘菜单选择**打开控制台**（macOS / Linux 是**切换为控制端**），输入控制码。第一次连接这台电脑时还要输入它托盘菜单里的 6 位**配对码**，之后就不用了
 
@@ -149,6 +151,7 @@ AIRHAND_SERVER=relay.example.com:4433 AIRHAND_SERVER_FP=<指纹> docker compose 
 | [使用指南](docs/usage.zh-CN.md) | 被控端、Windows 安装版、配置文件、卸载、控制台、画质、界面语言 |
 | [部署](docs/deploy.zh-CN.md) | 中转服务器的配置、网页控制台、反向代理 |
 | [Android](docs/android.zh-CN.md) | 用手机控制别人、共享本机、手势、电视 |
+| [iOS](docs/ios.zh-CN.md) | iPhone / iPad：控制别人、共享本机、构建 IPA |
 | [构建](docs/building.zh-CN.md) | 各平台的依赖和安装包、签名、APK |
 | [工作原理](docs/architecture.zh-CN.md) | 架构、代码目录、Windows 服务、画面和声音、音画同步、磁盘上的文件 |
 | [安全](docs/security.zh-CN.md) | 加密和证书固定、防暴力猜码、控制码和重连凭证 |
@@ -167,11 +170,12 @@ AIRHAND_SERVER=relay.example.com:4433 AIRHAND_SERVER_FP=<指纹> docker compose 
 
 | 目录 | 内容 |
 |---|---|
-| `crates/` | 协议（`airhand-proto`）和客户端到服务器的链路（`airhand-link`） |
+| `crates/` | 协议（`airhand-proto`）、客户端到服务器的链路（`airhand-link`），Android 和 iOS 共用的手机核心（`airhand-mobile`） |
 | `server/` | 中转服务器 |
 | `web/` | 网页控制台服务 |
 | `client/` | 桌面客户端：Tauri（Rust）+ React 界面，界面也给网页控制台用 |
-| `android/` | Android 应用（Kotlin + Jetpack Compose）和它的 Rust 核心 |
+| `android/` | Android 应用（Kotlin + Jetpack Compose），手机核心的 JNI 包装 |
+| `ios/` | iOS / iPadOS 应用（SwiftUI + UIKit）、屏幕广播扩展，手机核心的 C 接口包装 |
 
 怎么跑测试、调试工具和项目约定（协议版本、界面文案等）见[开发](docs/development.zh-CN.md)。
 

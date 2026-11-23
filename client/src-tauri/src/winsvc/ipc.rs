@@ -268,7 +268,7 @@ async fn handle(msg: ToAgent, agent: &Agent) {
         }
         ToAgent::SetAutostart { on } => {
             let r = tokio::task::spawn_blocking(move || {
-                super::apply_autostart(on)?;
+                super::choose_autostart(on)?;
                 crate::config::save_autostart(on)
             })
             .await;

@@ -24,6 +24,7 @@ import androidx.compose.material.icons.outlined.Computer
 import androidx.compose.material.icons.outlined.DesktopWindows
 import androidx.compose.material.icons.outlined.LaptopMac
 import androidx.compose.material.icons.outlined.PhoneAndroid
+import androidx.compose.material.icons.outlined.PhoneIphone
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
@@ -81,6 +82,7 @@ fun osIcon(os: String?): ImageVector = when (OsKind.of(os)) {
     OsKind.MAC -> Icons.Outlined.LaptopMac
     OsKind.LINUX -> Icons.Outlined.Terminal
     OsKind.ANDROID -> Icons.Outlined.PhoneAndroid
+    OsKind.IOS -> Icons.Outlined.PhoneIphone
     OsKind.UNKNOWN -> Icons.Outlined.Computer
 }
 

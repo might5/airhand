@@ -32,8 +32,9 @@ cargo test --lib mic_reaches_steam_streaming_microphone -- --ignored --nocapture
 # macOS 14.2+ / Linux（PipeWire、pactl）：检查强退后的清理、断开和转发期间卸载
 cargo test --lib native_mic_cleanup -- --ignored --nocapture
 
-# android/native/：Android 的 Rust 核心（在当前电脑上跑：在途控制、关键帧、声音分发、命令格式）
-cargo test
+# 手机核心（Android 和 iOS 共用，crates/airhand-mobile：在途控制、关键帧、声音分发、命令格式）在仓库根目录的 cargo test 里
+# ios/：Swift 单元测试（协议样例、Annex-B、AV1、Opus、抖动缓冲、手势），以及模拟器里的端到端测试，见 docs/ios.zh-CN.md 的“测试”
+xcodebuild -project Airhand.xcodeproj -scheme Airhand -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 17' test
 # android/：手势（触控板 / 触屏 / 多点触摸 / 直通）、键盘、控制码、文案（Rust 的每种问题 / 提示 / 系统操作都有中英文文案）
 ./gradlew testDebugUnitTest -Pairhand.abis=x86_64
 ```
@@ -96,7 +97,7 @@ cargo run --release --example encode_bench
 ```powershell
 # client/src-tauri/
 target\release\airhand.exe --install       # 为这个 airhand.exe 注册并启动服务（在它旁边生成 config.toml）
-target\release\airhand.exe --stop-service  # 重新构建之前先停止：exe 正在使用
+target\release\airhand.exe --stop          # 重新构建之前先停止服务和托盘：exe 正在使用
 target\release\airhand.exe --uninstall     # 删除服务和开机启动项
 ```
 
@@ -146,11 +147,11 @@ v10 开发阶段可以调整线上格式，不保留旧客户端分支。测试�
 cargo test --release -p airhand-server relay_video_bench -- --ignored --nocapture
 ```
 
-### 一份协议，三份实现
+### 一份协议，四份实现
 
 `crates/airhand-proto/tests/v10.rs` 固定当前 v10 的握手、流头、控制消息和媒体包头的线上字节。
 
-Rust、控制台（TypeScript）和 Android（Kotlin）用同一套格式：媒体包（`crates/airhand-proto/src/media.rs`）、输入事件、界面命令、连接选项（`airhand_link::controller::Command`、`ConnectOptions`）。界面和 Rust 之间的 JSON 全都是 camelCase：字段名、枚举值（`"h264"`、`"android"`、`"quickSettings"`），带字段的联合类型用一个字段标明是哪一种（命令 `cmd`、事件和输入 `type`、问题和提示 `kind`）。`crates/airhand-link/tests/protocol.json` 是 Rust 测试生成的样例；`npm test`（`tests/protocol.test.ts`）和 `./gradlew testDebugUnitTest`（`ProtocolTest`）用同一个文件检查各自的解析和拼装。改了格式之后用 `AIRHAND_UPDATE_FIXTURES=1 cargo test -p airhand-link --test protocol` 重新生成，再让另外两边的测试通过。
+Rust、控制台（TypeScript）、Android（Kotlin）和 iOS（Swift）用同一套格式：媒体包（`crates/airhand-proto/src/media.rs`）、输入事件、界面命令、连接选项（`airhand_link::controller::Command`、`ConnectOptions`）。界面和 Rust 之间的 JSON 全都是 camelCase：字段名、枚举值（`"h264"`、`"android"`、`"quickSettings"`），带字段的联合类型用一个字段标明是哪一种（命令 `cmd`、事件和输入 `type`、问题和提示 `kind`）。`crates/airhand-link/tests/protocol.json` 是 Rust 测试生成的样例；`npm test`（`tests/protocol.test.ts`）、`./gradlew testDebugUnitTest`（`ProtocolTest`）和 iOS 的 `xcodebuild test`（`ios/Tests/ProtocolTests.swift`）用同一个文件检查各自的解析和拼装。改了格式之后用 `AIRHAND_UPDATE_FIXTURES=1 cargo test -p airhand-link --test protocol` 重新生成，再让另外三边的测试通过。
 
 `client/tests/protocol-contract.ts` 由同一 Rust 测试生成字面量，并用 `satisfies` 和正式的 TypeScript 类型检查每个字段；`npm test` 会先运行 `tsc`。它不能替换成 `JSON.parse()` 后的类型标注，因为 `any` 会绕过检查。
 

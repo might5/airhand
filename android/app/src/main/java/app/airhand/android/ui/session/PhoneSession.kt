@@ -124,14 +124,14 @@ private enum class UiMode { TRACKPAD, TOUCH }
 private fun gestureMode(m: UiMode, os: OsKind, touch: Boolean) = when {
     m == UiMode.TRACKPAD -> Gestures.Mode.TRACKPAD
     touch -> Gestures.Mode.MULTITOUCH
-    os == OsKind.ANDROID -> Gestures.Mode.PASSTHROUGH
+    os == OsKind.ANDROID || os == OsKind.IOS -> Gestures.Mode.PASSTHROUGH
     else -> Gestures.Mode.TOUCH
 }
 
 private fun initialMode(setting: TouchMode, os: OsKind) = when (setting) {
     TouchMode.TRACKPAD -> UiMode.TRACKPAD
     TouchMode.TOUCH -> UiMode.TOUCH
-    TouchMode.AUTO -> if (os == OsKind.ANDROID) UiMode.TOUCH else UiMode.TRACKPAD
+    TouchMode.AUTO -> if (os == OsKind.ANDROID || os == OsKind.IOS) UiMode.TOUCH else UiMode.TRACKPAD
 }
 
 private enum class Page { MAIN, SHORTCUTS, DISPLAYS, QUALITY, CLIPBOARD, GAME, HELP }
@@ -184,7 +184,7 @@ fun PhoneSession(
     // 游戏按键：只在控制电脑时有（手机那边是触摸，没有键盘可按）
     val games by app.games.flow.collectAsState()
     val gameLayout = games.layoutFor(session.code)
-    val gameOn = os != OsKind.ANDROID && games.isOn(session.code) && gameLayout != null
+    val gameOn = os != OsKind.ANDROID && os != OsKind.IOS && games.isOn(session.code) && gameLayout != null
     var editor by remember { mutableStateOf<LayoutEditor?>(null) }
     LaunchedEffect(editor) { view.editor = editor }
     DisposableEffect(Unit) { onDispose { view.editor = null } }
@@ -563,7 +563,7 @@ private fun MainMenu(
             Action(Icons.Outlined.Monitor, stringResource(R.string.menu_displays), cell) { onPage(Page.DISPLAYS) }
         }
         // 锁定鼠标（控制电脑时）：鼠标一直只发移动了多少，游戏里转视角用；游戏按键：画面上的按钮和摇杆
-        val lockable = os != OsKind.ANDROID
+        val lockable = os != OsKind.ANDROID && os != OsKind.IOS
         if (lockable) {
             Action(Icons.Outlined.Lock, stringResource(if (mouseLock) R.string.menu_mouse_lock_on else R.string.menu_mouse_lock_off), cell, active = mouseLock) {
                 session.mouseLock.value = !mouseLock

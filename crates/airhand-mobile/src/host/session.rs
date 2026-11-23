@@ -151,14 +151,15 @@ impl Platform for Phone {
                 displays: info.displays.clone(),
                 current_display: 0,
                 codecs: info.codecs.clone(),
-                platform: airhand_proto::session::Platform::Android,
+                platform: info.platform,
                 touch: info.touch,
                 actions: info.actions.clone(),
                 // 只有一块屏幕：一路画面
                 shown: vec![0],
                 streams: 1,
             }))?;
-            if !info.input {
+            // iOS 本来就只能看（系统不允许注入触摸），不是缺了什么权限
+            if !info.input && info.platform != airhand_proto::session::Platform::Ios {
                 self.out
                     .send(&HostMsg::Notice(Some(Notice::MissingPermissions {
                         screen: false,

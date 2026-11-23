@@ -6,13 +6,13 @@
 
 Double-click to run (on Windows install it first, see [Windows installation](#windows-installation)). A tray icon appears in the bottom-right corner (on macOS in the menu bar at the top of the screen, on Linux in the top bar / panel status area). Grey means not connected to the server, coloured means connected. The right-click menu (a plain click on macOS) contains:
 
-- Current mode and server status
+- Server status (and the current mode on macOS and Linux)
 - The **control code** and "Copy control code"
 - The **pairing code**, "Copy pairing code" and **Change pairing code**: a controller that hasn't paired with this computer needs it, besides the control code, the first time it connects (see "Pairing" below)
 - Who is controlling this computer right now (with the **safety code** after each connection), and **Disconnect all controllers**
 - **Change control code**: the old code stops working immediately and connected controllers are disconnected; the pairing code changes too and all paired controllers are forgotten
 - **Forget paired controllers**: they'll need the pairing code again
-- Open console and **Start with Windows** (Windows) / Switch to controller (macOS, Linux) and **Open at login** (macOS) / Language / **Uninstall Airhand…** (macOS, see [Uninstalling](#uninstalling)) / Quit
+- Open console and **Start with Windows** (Windows; **Start when you sign in** when installed just for you) / Switch to controller (macOS, Linux) and **Open at login** (macOS) / Language / **Uninstall Airhand…** (macOS, see [Uninstalling](#uninstalling)) / Quit
 
 After a network drop the host reconnects automatically with exponential backoff and **gets its old control code back**, even after a server restart. The code is **fixed**: it's saved in `config.toml`, and the server keeps it for this computer however long it stays offline (codes unused for 180 days are released), so it stays the same across restarts and upgrades until you change it.
 
@@ -26,13 +26,38 @@ After a network drop the host reconnects automatically with exponential backoff 
 
 ## Windows installation
 
-On Windows Airhand is installed with its installer (into `C:\Program Files\Airhand` for all users; needs administrator rights). The host runs as the system service **Airhand**, as SYSTEM in the session of whoever is at the screen, so it keeps working on the lock screen, the sign-in screen and UAC prompts, and follows when users are switched. The tray icon is an ordinary program that shows the service's status and controls it:
+On Windows Airhand is installed with its installer, either for all users or just for you:
+
+| | For all users (recommended) | Just for me |
+|---|---|---|
+| Administrator rights | Needed | Not needed |
+| Installed into | `C:\Program Files\Airhand`, shared by all users | `%LOCALAPPDATA%\Programs\Airhand`, only for you |
+| Host | A system service: the lock screen, the sign-in screen and UAC prompts can be controlled too | Inside the tray process, running as you: the lock screen, the sign-in screen and UAC prompts can't be controlled, and windows running as administrator can only be viewed |
+| Starts automatically | With Windows, so the computer can be controlled before anyone signs in | When you sign in |
+| Install folder | Only inside Program Files: the service runs the program there as SYSTEM, and elsewhere ordinary users might be able to change it | Not inside Program Files or the Windows folder: settings are saved next to the program |
+
+- **First install**: administrator accounts choose in the installer (for all users by default). For other accounts the installer asks first: Yes runs it again as administrator (you'll need an administrator password) to install for all users; No installs just for you
+- **Upgrading, reinstalling**: the installer keeps the way Airhand was installed and doesn't ask again. The copy installed for all users needs administrator rights; other accounts get an explanation and then a prompt for an administrator password. If the tray was open before the upgrade, it opens again afterwards (when you upgrade someone's computer remotely, the connection comes back)
+- **Switching between the two**: uninstall first, then install again
+
+### For all users
+
+The host runs as the system service **Airhand**, as SYSTEM in the session of whoever is at the screen, so it keeps working on the lock screen, the sign-in screen and UAC prompts, and follows when users are switched. The tray icon is an ordinary program that shows the service's status and controls it:
 
 - Opening Airhand starts the service; **Quit** in the tray stops it (as before, the computer can't be controlled after quitting); when the service stops (or is uninstalled) the tray icons close too
-- **Start with Windows** (tray menu, on by default): the service starts at boot, so the computer can be controlled before anyone signs in, and the tray icon appears after signing in
+- **Start with Windows** (tray menu, on by default): the service starts at boot, so the computer can be controlled before anyone signs in, and the tray icon appears after signing in. Disabling Airhand under Startup apps in Task Manager only keeps the tray from opening after sign-in (the service still starts at boot), and the tick in the tray menu doesn't follow it: turn Start with Windows off and on again in the menu to bring it back
 - The configuration file `config.toml` is in the install directory (created on installation, see [Configuration file](#configuration-file)) and maintained by the service; edit it as administrator
 - **Uninstalling** (Settings → Apps) stops and removes the service, the startup entry, `config.toml` and the program; nothing is left behind (see [Uninstalling](#uninstalling)). Installing a new version over an old one keeps `config.toml`, and with it the control code and My devices, even if you choose to uninstall the old version first
-- A bare `airhand.exe` doesn't run without being installed: release builds ask you to run the installer. Debug builds (`npm run tauri dev`) run the host inside the tray process, like on macOS and Linux, with `config.toml` next to the program (`client/src-tauri/target/debug/`)
+
+### Just for me
+
+- The host runs inside the tray process: after **Quit** in the tray the computer can't be controlled, but it keeps running while the console is open, the same as when installed for all users. The top of the tray menu says "Installed just for you"
+- **Start when you sign in** (tray menu, on by default): Airhand starts by itself after you sign in. If you disabled Airhand under Startup apps in Task Manager, the tick in the tray menu doesn't follow it: turn it off and on again in the menu to bring it back
+- The configuration file `config.toml` is in the install directory too (see [Configuration file](#configuration-file)), maintained by the tray; you can edit it directly
+- Uninstalling and upgrading work the same as for all users (see [Uninstalling](#uninstalling))
+- If someone else then installs Airhand for all users, the copy installed just for you stops running (two hosts would run at the same time) and no longer starts when you sign in, and asks whether to uninstall it. This also happens while it's running: its host stops as soon as it notices
+
+A bare `airhand.exe` doesn't run without being installed: release builds ask you to run the installer. Debug builds (`npm run tauri dev`) run the host inside the tray process, like on macOS and Linux, with `config.toml` next to the program (`client/src-tauri/target/debug/`)
 
 ## Configuration file
 
@@ -40,7 +65,7 @@ Everything Airhand saves is in one `config.toml` (with comments). The menu in th
 
 | System | Location |
 |---|---|
-| Windows | The install directory: `C:\Program Files\Airhand\config.toml` (next to the program for debug builds that aren't installed) |
+| Windows | The install directory: `C:\Program Files\Airhand\config.toml`, or `%LOCALAPPDATA%\Programs\Airhand\config.toml` when installed just for you (next to the program for debug builds that aren't installed) |
 | macOS | `~/Library/Application Support/app.airhand.client/config.toml` |
 | Linux | `$XDG_CONFIG_HOME/airhand/config.toml`, by default `~/.config/airhand/config.toml` |
 
@@ -49,8 +74,8 @@ Everything Airhand saves is in one `config.toml` (with comments). The menu in th
 | `server` | Relay server `host:port`; without it, the address built into the program |
 | `server_fp` | Relay certificate fingerprint; `""` means no fixed fingerprint: the server's certificate is remembered on the first connection (`[server_trust]`) and a different one is refused later; without it, the built-in fingerprint |
 | `[server_trust]` | Written by Airhand: the relay's certificate fingerprint remembered on the first connection (when no fingerprint is set). Delete it if the relay really gets a new certificate |
-| `autostart` | Windows: start with Windows (also in the tray menu). macOS: a record of Open at login; System Settings is what counts, so editing only this line has no effect. Without it, Open at login hasn't been turned on by default yet (see above) |
-| `language` | UI language, `"zh"` or `"en"`: written when you pick one in the tray menu or the console (see [Language](#language)). Without it, the system language. On Windows it applies to every account on the computer (the file is shared) |
+| `autostart` | Windows: start with Windows, or when you sign in when installed just for you (also in the tray menu). macOS: a record of Open at login; System Settings is what counts, so editing only this line has no effect. Without it, Open at login hasn't been turned on by default yet (see above) |
+| `language` | UI language, `"zh"` or `"en"`: written when you pick one in the tray menu or the console (see [Language](#language)). Without it, the system language. On Windows installed for all users it applies to every account on the computer (the file is shared) |
 | `[code]` | This computer's control code, and the secret that gets it back. Delete `code` and `secret` to get a new code |
 | `[host]` | Maintained by Airhand: this computer's end-to-end identity as a host (`key`), the pairing code and whether pairing is paused, all stored encrypted. Deleting `key` creates a new identity: controllers that connected before will warn that this computer's identity changed |
 | `[[paired]]` | Maintained by Airhand: paired controllers (public key, name, when they paired); they connect without the pairing code. Delete an entry to forget that controller |
@@ -59,7 +84,7 @@ Everything Airhand saves is in one `config.toml` (with comments). The menu in th
 
 - Restart Airhand after changing settings (Quit, then open it again). Airhand keeps your edits and comments when it saves the code or devices
 - **Deleted by accident** (the file or the whole directory): it's recreated with the default settings at startup, and within a few seconds while running. This computer's control code, the autostart setting (on macOS, the record of Open at login), the UI language, the end-to-end identities, the paired controllers and My devices carry over from before the deletion, so nothing is lost; other settings go back to their defaults
-- A control code is enough to control its computer, so treat it like a key. On macOS / Linux only your account can read and write the file (mode 600, directory 700). On Windows the file is in the install directory, readable by every account on the computer: this computer's secret is encrypted with DPAPI for the SYSTEM account, and the codes in My devices with the Windows account that saved them, so other accounts and other computers can't read them (each account on the same computer only sees its own devices)
+- A control code is enough to control its computer, so treat it like a key. On macOS / Linux only your account can read and write the file (mode 600, directory 700). On Windows the file is in the install directory, readable by every account on the computer when installed for all users: this computer's secret is encrypted with DPAPI for the SYSTEM account (your account when installed just for you), and the codes in My devices with the Windows account that saved them, so other accounts and other computers can't read them (each account on the same computer only sees its own devices)
 - Windows removes it when uninstalling; on macOS / Linux it stays after the program is removed (as is customary there), so remove it too, see [Uninstalling](#uninstalling)
 
 ## Uninstalling
@@ -68,7 +93,7 @@ After these steps nothing of Airhand is left on the computer (except two things 
 
 ### Windows
 
-Settings → Apps → Airhand → Uninstall. The uninstaller stops and removes the Airhand service and the startup entry, and deletes the install directory (including `config.toml`), the registry keys the installer wrote, the Windows Firewall rules added for `airhand.exe`, and the console's temporary directories. Nothing else to do by hand.
+Settings → Apps → Airhand → Uninstall. The uninstaller stops and removes the Airhand service (when installed just for you, it closes the tray instead) and the startup entry (including whether it was enabled or disabled under Startup apps in Task Manager; otherwise it would still be disabled after reinstalling), and deletes the install directory (including `config.toml`), the registry keys the installer wrote, the Windows Firewall rules added for `airhand.exe`, and the console's temporary directories. Nothing else to do by hand.
 
 (Choosing "uninstall the old version first" during an upgrade isn't an uninstall: `config.toml` is kept, see [Windows installation](#windows-installation).)
 
@@ -151,7 +176,7 @@ sudo apt remove airhand     # stops the packaged app and releases its PipeWire m
 rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/airhand"  # remove this user's configuration and pairings
 ```
 
-There's no startup entry and no system permission to clean up on Linux. The tray icon's and the console's temporary directories (`$XDG_RUNTIME_DIR/airhand-run-*`, `/tmp/airhand-webview-*`) are deleted when Airhand quits; they're only left behind if the process was killed (they're cleaned up at the next start), and the system usually clears them when you log out or reboot. To remove them by hand: `rm -rf "$XDG_RUNTIME_DIR"/airhand-run-* /tmp/airhand-webview-*`.
+There's no startup entry and no system permission to clean up on Linux. The tray icon's and the console's temporary directories (`$XDG_RUNTIME_DIR/airhand-run-*`, `/tmp/airhand-webview-*`) are deleted when Airhand quits, and the FUSE mount holding files copied on the other side (`$XDG_RUNTIME_DIR/airhand-clip/<pid>`) is unmounted then too; they're only left behind if the process was killed (they're cleaned up at the next start), and the system usually clears them when you log out or reboot. To clean up by hand (unmount first, then delete): `fusermount3 -uz "$XDG_RUNTIME_DIR"/airhand-clip/* 2>/dev/null; rm -rf "$XDG_RUNTIME_DIR"/airhand-run-* "$XDG_RUNTIME_DIR"/airhand-clip /tmp/airhand-webview-*`.
 
 ### Android
 
@@ -159,7 +184,7 @@ Uninstall the app in the system: the settings, saved devices and this phone's co
 
 ## Controller
 
-Tray → **Switch to controller** opens the console. Closing the console window switches back to host mode. On Windows, double-click the Airhand tray icon or choose **Open console** from its menu. If the console is already open, double-clicking brings it to the front. The installed host service keeps running while the console is open.
+Tray → **Switch to controller** opens the console. Closing the console window switches back to host mode. On Windows, double-click the Airhand tray icon or choose **Open console** from its menu. If the console is already open, double-clicking brings it to the front. On Windows the host keeps running while the console is open (whether installed for all users or just for you), so the computer can still be controlled; on macOS and Linux switching to controller pauses the host until the console is closed.
 
 - It works like a browser: each computer gets a **tab** that you can drag to reorder and close (= disconnect) with × or a middle click. Click **+** for a new connection, enter the 6-digit control code (pasting `123 456` works), and once connected that tab becomes the computer. With two or more connections a **Multi-screen overview** tab appears on the left
 - **First connection to a computer or phone**: it asks for a pairing code (every host does), and the new-connection page shows a "Pairing code" field: enter the 6-digit pairing code shown there (a computer's tray menu, a phone's Share screen tab in Airhand) and connect again (or paste all 12 digits at once: control code + pairing code). Once paired, it remembers this console

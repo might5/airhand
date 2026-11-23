@@ -478,6 +478,8 @@ open_enum! {
         Mac = 1 => "mac",
         Linux = 2 => "linux",
         Android = 3 => "android",
+        /// iPhone / iPad：只能被看（iOS 不允许别的应用注入触摸），屏幕由 ReplayKit 的广播扩展采集
+        Ios = 4 => "ios",
     }
 }
 
@@ -1186,6 +1188,7 @@ mod tests {
             serde_json::to_value(Platform::Android).unwrap(),
             json!("android")
         );
+        assert_eq!(serde_json::to_value(Platform::Ios).unwrap(), json!("ios"));
         assert_eq!(
             serde_json::to_value([MicState::NoDevice, MicState::Ready]).unwrap(),
             json!(["noDevice", "ready"])

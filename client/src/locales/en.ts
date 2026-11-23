@@ -306,6 +306,7 @@ const en: Record<MsgKey, Msg> = {
   "fileError.busy": "too many transfers at once, try again shortly",
   "fileError.tooMany": "the folder has too many items",
   "fileError.closed": "the connection was lost",
+  "notice.iosViewOnly": "The remote is an iPhone / iPad: iOS doesn't let other apps control it, so you can only watch",
   "notice.androidNoInput":
     "Remote control (Airhand's accessibility service) is off on the remote phone, so you can watch but not control it. The phone's owner can turn it on in Airhand → Share screen",
 

@@ -12,8 +12,9 @@
 //!   （固定不变，见 `airhand_proto::signal` 的"固定控制码"）、控制台的"我的设备"（见 [`crate::devices`]），
 //!   Windows 上还有开机自动启动（macOS 上是登录时自动启动的记录，见 [`autostart_default_pending`]），
 //!   托盘菜单、控制台里选的界面语言（`language`，见 [`crate::i18n`]）。所有数据都只在这一个文件里。位置（见 [`path`]）：
-//!   * Windows：程序所在目录（安装目录）。文件由系统服务里的被控端维护（见 [`crate::winsvc`]），
-//!     托盘进程没有写权限，控制台保存设备时经命名管道交给它写；
+//!   * Windows：程序所在目录（安装目录）。为所有用户安装时文件由系统服务里的被控端维护（见 [`crate::winsvc`]），
+//!     托盘进程没有写权限，控制台保存设备时经命名管道交给它写；仅为当前用户安装时（见 `crate::winsvc::user`）
+//!     安装目录在用户自己的目录里，由托盘进程维护；
 //!   * macOS：`~/Library/Application Support/app.airhand.client/`；Linux：`~/.config/airhand/`。只有本账户能读写（600）。
 //! * 文件由 Airhand 维护，手动修改的内容和注释都会保留；改了设置要重新启动 Airhand 才生效。
 //! * 文件不存在时（第一次运行、被删掉了）按默认配置重新生成：启动时检查一次，运行中每隔几秒检查一次（[`keep_file`]），
@@ -141,7 +142,8 @@ impl Settings {
 }
 
 /// 配置文件的路径：
-/// * Windows：程序所在目录（安装目录）下的 `config.toml`，被控端（系统服务）和所有账户共用；
+/// * Windows：程序所在目录（安装目录）下的 `config.toml`。为所有用户安装时被控端（系统服务）和所有账户共用，
+///   仅为当前用户安装时只有这个用户用；
 /// * macOS：`~/Library/Application Support/app.airhand.client/config.toml`（Apple 的建议：
 ///   Application Support 下以 bundle ID 命名的目录）；
 /// * Linux：`$XDG_CONFIG_HOME/airhand/config.toml`，默认 `~/.config/airhand/config.toml`（XDG 基础目录规范）。
@@ -348,7 +350,7 @@ fn template() -> String {
     }
 }
 
-/// Windows 的模板：文件在安装目录里，由系统服务维护
+/// Windows 的模板：文件在安装目录里，由系统服务（仅为当前用户安装时是托盘进程）维护
 #[cfg(windows)]
 fn template_windows(server: &str, fp: &str) -> String {
     tr!(
@@ -363,7 +365,8 @@ fn template_windows(server: &str, fp: &str) -> String {
 # 设为 "" 表示不固定指纹：第一次连接时记住服务器的证书（下面的 [server_trust]），之后证书变了就拒绝连接。不设置时使用编译进程序的指纹：{fp}
 # server_fp = ""
 
-# 开机自动启动：开机后被控端服务自动运行（登录之前也能被控制），登录后显示托盘图标。托盘菜单里也可以切换
+# 开机自动启动。为所有用户安装时：开机后被控端服务自动运行（登录之前也能被控制），登录后显示托盘图标；
+# 仅为当前用户安装时：这个用户登录后自动打开 Airhand。托盘菜单里也可以切换
 autostart = true
 
 # 控制码：第一次连上服务器时由服务器分配，之后一直使用同一个（重启、掉线、升级都不变）。
@@ -382,8 +385,8 @@ autostart = true
 # "" means no fixed fingerprint: the server's certificate is remembered on the first connection ([server_trust] below) and a different one is refused later. Without it the built-in fingerprint is used: {fp}
 # server_fp = ""
 
-# Start with Windows: the host service runs after boot (the computer can be controlled before anyone signs in),
-# and the tray icon shows up after signing in. Can also be changed in the tray menu
+# Start with Windows. Installed for all users: the host service runs after boot (the computer can be controlled before anyone signs in),
+# and the tray icon shows up after signing in. Installed just for one user: Airhand opens when that user signs in. Can also be changed in the tray menu
 autostart = true
 
 # Control code: assigned by the server the first time, then always the same (across restarts, disconnects and upgrades).
@@ -657,9 +660,10 @@ pub fn keep_file() {
     }
 }
 
-/// 卸载（macOS 菜单里的"卸载 Airhand…"）：从现在起不再写配置文件，配置文件被删掉也不再重新生成。
-/// 还在运行的东西（例如正在停下来的被控端保存控制码）也写不回去。返回时，正在写的那一次已经写完
-#[cfg(target_os = "macos")]
+/// 卸载（macOS 菜单里的"卸载 Airhand…"）、Windows 仅为当前用户安装的那一份给为所有用户安装的那份让开时：
+/// 从现在起不再写配置文件，配置文件被删掉也不再重新生成。还在运行的东西（例如正在停下来的被控端保存控制码）
+/// 也写不回去。返回时，正在写的那一次已经写完
+#[cfg(any(target_os = "macos", windows))]
 pub fn freeze() {
     let _wait = last();
     FROZEN.store(true, std::sync::atomic::Ordering::Release);

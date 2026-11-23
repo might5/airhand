@@ -1,5 +1,6 @@
 //! Airhand 的 Android 核心：Kotlin 经 JNI（`app.airhand.android.core.Native`）调用。
 //!
+//! 控制端、被控端的网络部分和 iOS 共用（`crates/airhand-mobile`），这里只是 JNI 的包装：
 //! * [`ctl`]：控制端（看 / 操作别的设备），包装 `airhand_link` 的控制端服务；
 //! * [`host`]：被控端（手机被别人看 / 操作）：网络部分在这里，采集、编码、注入输入在 Kotlin 那边；
 //! * 句柄：`start` 返回一个 `long`，之后的调用都带着它；`stop` 之后作废。
@@ -7,12 +8,7 @@
 //! 数据交换尽量简单：命令和事件是 JSON 字符串，画面 / 声音是字节数组（Rust → Kotlin）或直接缓冲区（Kotlin → Rust）。
 //! Rust 不回调 Java：Kotlin 的线程用 `poll*` 阻塞地取（见 [`queue`]）。
 
-pub mod ctl;
-pub mod files;
-pub mod host;
-pub mod queue;
-pub mod rt;
-mod session_queue;
+pub use airhand_mobile::{ctl, files, hex, host, queue, rt, unhex};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -26,22 +22,6 @@ use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jbyteArray, jint, jlong, jstring};
 
 use ctl::Ctl;
 use host::Host;
-
-pub fn hex(b: &[u8]) -> String {
-    b.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-pub fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
-    let s = s.trim();
-    if s.len() != N * 2 {
-        return None;
-    }
-    let mut out = [0u8; N];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
-}
 
 // ───────────────────────────── 句柄 ─────────────────────────────
 
@@ -476,19 +456,4 @@ pub extern "system" fn Java_app_airhand_android_core_Native_hostAudio(
         return;
     };
     guard((), || host.audio_hub().push(data, capture_us.max(0) as u64));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hex_roundtrip() {
-        let b = [0u8, 1, 0xab, 0xff];
-        assert_eq!(hex(&b), "0001abff");
-        assert_eq!(unhex::<4>("0001abff"), Some(b));
-        assert_eq!(unhex::<4>("0001ABFF"), Some(b));
-        assert_eq!(unhex::<4>("0001ab"), None);
-        assert_eq!(unhex::<2>("zzzz"), None);
-    }
 }

@@ -228,7 +228,7 @@ export type FileError =
   | "closed";
 
 /** 被控端的平台，与 airhand_proto::session::Platform 对应（对方的版本更新、报了这边不认识的平台时是 linux） */
-export type Platform = "windows" | "mac" | "linux" | "android";
+export type Platform = "windows" | "mac" | "linux" | "android" | "ios";
 
 /**
  * 被控端能不能接本机的麦克风（airhand_proto::session::MicState）：unsupported = 那个平台还不支持；

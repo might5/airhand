@@ -306,6 +306,7 @@ export default {
   "notice.h264Undecodable": "本机无法解码 H.264 画面",
   "notice.codecFallback": "本机无法解码 {codec} 画面，已改用 {to}",
   "notice.noOpus": "本机不支持 Opus 解码，无法播放远程声音",
+  "notice.iosViewOnly": "对方是 iPhone / iPad：iOS 不允许别的应用操作它，只能看不能操作",
   "notice.androidNoInput": "对方手机没有开启 Airhand 的“远程操作”（无障碍服务），只能看不能操作。需要手机的主人在 Airhand 的“共享本机”页里开启",
   "notice.fileError": "“{name}”传不了：{reason}",
   "notice.filesUnsupported": "对方的 Airhand 版本较旧，不能通过剪贴板传文件",

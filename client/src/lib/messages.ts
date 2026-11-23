@@ -13,6 +13,8 @@ export type LocalNotice =
   | { kind: "noOpus" }
   /** 对方是 Android 手机，没有开启 Airhand 的"远程操作"（被控端发来的 missingPermissions） */
   | { kind: "androidNoInput" }
+  /** 对方是 iPhone / iPad：iOS 不允许别的应用操作它，只能看 */
+  | { kind: "iosViewOnly" }
   /** 剪贴板里的文件传不了（对方那边的、这边的，见 files.ts） */
   | { kind: "fileError"; name: string; error: FileError }
   /** 对方的版本旧，不支持剪贴板里的文件 */

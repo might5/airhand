@@ -584,7 +584,7 @@ export function SessionView({ s }: { s: RemoteSession }) {
               )}
             </div>
           )}
-          {s.hostPlatform !== "android" && (
+          {s.hostPlatform !== "android" && s.hostPlatform !== "ios" && (
             // 鼠标：自动 / 桌面 / 游戏（见 input.ts），还有画面里有光标时显不显示本机光标。手机是点触屏的，没有这些
             <div className="menu-anchor">
               <button

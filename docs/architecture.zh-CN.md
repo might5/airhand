@@ -140,7 +140,10 @@ Android 被控端只有一个编码器，但每个观看者分别计在途字节
 | `server/` | 中转服务器（quinn + rustls）及其 `Dockerfile`。`src/broker/`：`registry`（控制码登记、连接请求）、`relay`（会话通道的配对和转发、数据报）、`limits`（限速）、`tokens`（密钥和重连凭证）；锁的先后在调试构建里有检查（`lock.rs`） |
 | `web/` | 网页控制台服务（axum：静态网页 + WebSocket，HTTP / HTTPS 同一端口）及其 `Dockerfile`、`docker-compose.yml`。和 `client/src-tauri/` 一样是独立的 Cargo 工作区 |
 | `client/src-tauri/` | 桌面客户端 Rust 部分：被控端 `host/`、托盘、控制台窗口和命令，对方复制的文件放进系统剪贴板（`clipfiles/`） |
-| `android/native/` | Android 的 Rust 核心（JNI）：控制端用 `airhand-link`；被控端的网络部分（服务器连接、会话和它的各条通道用 `airhand_link::host`，Android 只实现 `host::Platform`；在途控制和码率控制与桌面版相同）。和 `client/src-tauri/`、`web/` 一样是独立的 Cargo 工作区 |
+| `crates/airhand-mobile` | Android 和 iOS 共用的手机核心：控制端用 `airhand-link`（命令和事件是 JSON，会话数据由界面的线程阻塞地取）；被控端的网络部分（服务器连接、会话和它的各条通道用 `airhand_link::host`，手机只实现 `host::Platform`；画面分发、在途控制和码率控制与桌面版相同）。和协议、链路库一样属于根目录的工作区 |
+| `android/native/` | Android 的 Rust 核心：`airhand-mobile` 的 JNI 包装。和 `client/src-tauri/`、`web/` 一样是独立的 Cargo 工作区 |
+| `ios/native/` | iOS 的 Rust 核心：`airhand-mobile` 的 C 接口包装（`include/airhand.h`），编译成静态库给 App 和屏幕广播扩展链接；`examples/fake_host.rs` 是测 iOS 控制端用的模拟被控端。独立的 Cargo 工作区 |
+| `ios/` | iOS / iPadOS 应用（SwiftUI + UIKit，`project.yml` 用 XcodeGen 生成工程）：VideoToolbox 解码 / 编码、AudioToolbox 的 Opus、手势和键鼠、屏幕广播扩展（被控端，只能看），见 [iOS](ios.zh-CN.md) |
 | `android/app/` | Android 应用（Kotlin + Jetpack Compose）：手机和电视界面、MediaCodec 解码 / 编码、屏幕录制、无障碍服务（远程操作） |
 | `client/src/` | `lib/session.ts` 管理会话，`connection-attempt.ts` 隔离连接代际，`media.ts` 解析媒体包，`video.ts` 管理解码 / 画面队列，`input.ts` 管理输入（含相对移动和指针锁定），`screens.ts` 摆放同时显示的几个显示器（多屏）；控制台界面（React 19 + TypeScript，不依赖 UI 库），桌面版和网页版共用，区别只在 `client/src/lib/backend/`；文案在 `client/src/locales/` |
 | `assets/icon.svg` | 应用图标源文件 |
@@ -172,7 +175,10 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 | `airhand.exe` | 登录的用户 | 托盘和控制台 |
 | `airhand.exe --service` | SYSTEM，会话 0 | 系统服务 Airhand：在控制台会话（物理屏幕前的那个会话）里启动被控端并看护它；控制台会话变了（切换用户、注销）就把它挪过去，退出了就重新启动 |
 | `airhand.exe --agent` | SYSTEM，控制台会话 | 被控端：连接服务器、采集、编码、注入键鼠、声音、剪贴板 |
-| `airhand.exe --install` / `--uninstall` / `--stop-service` | 管理员 | 安装程序调用 |
+| `airhand.exe --install` / `--install-user` | 管理员 / 登录的用户 | 安装程序复制完文件后调用：为所有用户安装时注册并启动服务，仅为当前用户安装时记下安装位置；都按 `config.toml` 设置自动启动 |
+| `airhand.exe --stop` / `--uninstall` | 安装程序的身份 | 升级前停下这一份 Airhand（服务、托盘）；卸载时删除这一份注册的东西。只动属于这个 airhand.exe 的东西，两种安装方式通用 |
+
+仅为当前用户安装时没有系统服务（`client/src-tauri/src/winsvc/user.rs`）：被控端和 macOS、Linux 一样在托盘进程里运行，所以下面说的安全桌面、命名管道都用不上，锁屏、登录界面和 UAC 确认框不能控制。一台电脑上只该有一份 Airhand 运行被控端：安装程序按已有的安装升级（`client/src-tauri/windows/hooks.nsh`），别的用户为所有用户安装之后，仅为当前用户安装的那份让开。托盘在命名事件 `Local\Airhand.Quit` 上等着被叫退出，安装程序也看它在不在，决定升级后要不要重新打开托盘。
 
 - 桌面复制和 `SendInput` 只对调用线程所在的桌面有效。UAC 确认框、锁屏和登录界面在安全桌面 `Winlogon` 上，只有 SYSTEM 能打开；采集线程和注入线程在用之前先切到当前接收输入的桌面上（`client/src-tauri/src/host/desktop.rs`）
 - 托盘和被控端之间是每个会话一个的命名管道（`\\.\pipe\airhand-host-<会话>`），每行一条 JSON 消息。只有交互登录的用户能连接，不能再开一个同名管道实例冒充被控端，托盘还会核对管道属于 SYSTEM
@@ -278,7 +284,7 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 | 平台 | 做法 |
 |---|---|
 | Windows | OLE 虚拟文件（`FileGroupDescriptorW` + `FileContents`，和远程桌面一样，`client/src-tauri/src/clipfiles/windows.rs`）：资源管理器粘贴时才要整棵树和每个文件的内容，`IStream::Read` 读多少取多少，进度条和取消都是资源管理器自己的。不提供 `CF_HDROP`，本机的剪贴板同步也就不会把它当成本机复制了文件、又公告回去。退出时不调 `OleFlushClipboard`（那会把所有格式都要一遍）。被控端在系统服务里时由托盘放，见 [Windows 服务](#windows-服务) |
-| Linux | 只读的 FUSE 文件系统（`fuser`），挂在 `$XDG_RUNTIME_DIR/airhand-clip/<进程号>`，每个公告一个子目录；X11 剪贴板里放 `text/uri-list`、`x-special/gnome-copied-files` 和路径文本。文件管理器列哪个目录才向对方列，读到哪里才取到哪里。上次没退干净留下的挂载点启动后卸掉。没有 FUSE 时不放，只同步文本 |
+| Linux | 只读的 FUSE 文件系统（`fuser`），挂在 `$XDG_RUNTIME_DIR/airhand-clip/<进程号>`，每个公告一个子目录；X11 剪贴板里放 `text/uri-list`、`x-special/gnome-copied-files` 和路径文本。文件管理器列哪个目录才向对方列，读到哪里才取到哪里。退出时卸载（收到 SIGTERM / SIGINT 也一样）；崩溃、被强制结束留下的挂载点下次启动时卸掉。没有 FUSE 时不放，只同步文本 |
 | macOS | 在内存中保留最新公告后回复 `Ready`。用户在菜单栏选“接收文件到…”并确认目标目录后，才列目录、分块取文件。每个顶层项目先写入同卷的私有临时目录，完整后以独占改名发布。临时目录的恢复记录和清理见[卸载](usage.zh-CN.md#macos)。 |
 | Android | `ClipFilesProvider` 提供 content URI（`content://<包名>.clipfiles/...`），别的应用读的时候才取。Android 8 起是代理文件描述符（`StorageManager.openProxyFileDescriptor`，可以跳着读），之前是管道。剪贴板里只放文件，文件夹只能在通知里“保存到下载”（Android 10 起经 MediaStore，之前存在应用自己的目录） |
 | 网页控制台 | 不进本机剪贴板（网页写不了文件）：提示“对方复制了 N 项”，点“下载”才取。Chrome / Edge 存进用户选的文件夹 / 文件，边取边写；别的浏览器在内存里拼好（几个文件、文件夹打成不压缩的 ZIP），最多 1 GiB |
@@ -292,7 +298,7 @@ Windows 上这些都运行在系统服务里（见 [Windows 服务](#windows-服
 - 单实例锁用的是内核对象而不是锁文件：Windows 是命名互斥量，Linux 是抽象命名空间的 Unix 套接字，macOS 是登记在 bootstrap 服务里的 Mach 端口名
 - 控制台的 WebView 需要数据目录：放在临时目录下的随机子目录，开启隐私模式（不保存 Cookie 和缓存），关闭窗口或退出程序时删除；进程被强制结束时，下次启动会清理残留。macOS 的 WKWebView 不需要数据目录，隐私模式下不保存网页数据
 - macOS 上还有几样东西不在 Airhand 的目录里，是系统记着的、或者系统框架以 Airhand 的名义建的：登录时自动启动（系统的登录项）、“屏幕与系统录音”“辅助功能”等权限记录、WebKit 和 Metal 在系统临时 / 缓存目录里建的几个目录（大多是空的）、用户挪动或关掉菜单栏图标时系统记下的设置（`~/Library/Preferences/app.airhand.client.plist`，Airhand 自己不用）。完整的清单和卸载时怎么一起清掉见[卸载 → macOS](usage.zh-CN.md#macos)
-- Linux 上几样只能以文件形式交出去的东西（交给 AppIndicator 的托盘图标、WebKitGTK 的 GStreamer 插件缓存）放在 `XDG_RUNTIME_DIR`（内存盘）里本进程专用的随机目录，退出时删除（收到 SIGTERM / SIGINT 也一样）。对方复制的文件挂在 `XDG_RUNTIME_DIR/airhand-clip/<进程号>`（FUSE，不占磁盘；见[剪贴板里的文件](#剪贴板里的文件)）；Mesa / NVIDIA 的着色器磁盘缓存直接关闭
+- Linux 上几样只能以文件形式交出去的东西（交给 AppIndicator 的托盘图标、WebKitGTK 的 GStreamer 插件缓存）放在 `XDG_RUNTIME_DIR`（内存盘）里本进程专用的随机目录，退出时删除（收到 SIGTERM / SIGINT 也一样）。对方复制的文件挂在 `XDG_RUNTIME_DIR/airhand-clip/<进程号>`（FUSE，不占磁盘，退出时卸载；见[剪贴板里的文件](#剪贴板里的文件)）；Mesa / NVIDIA 的着色器磁盘缓存直接关闭
 - 选的界面语言记在 `config.toml` 里（`language`）；控制台的其它设置（关闭的标签……）只保存在内存里
 - Android：只在应用自己的私有目录里保存设置、连接过的设备和本机的控制码，不备份、不迁移，卸载时由系统全部删除（见[数据保存在哪里](android.zh-CN.md#数据保存在哪里)）
 - 以上说的是桌面客户端。网页控制台是部署在服务器上的服务：它把自签名的 HTTPS 证书存在 `web/data/` 里，浏览器那边也只在内存里保存设置，我的设备不保存、刷新页面后清空（登录密码时会有一个会话 Cookie）

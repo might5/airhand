@@ -66,7 +66,7 @@ The output is under `client/src-tauri/target/release/`:
 
 ### Windows notes
 
-- The installer installs for all users and registers the system service (see [Windows installation](usage.md#windows-installation)); its extra steps are in `client/src-tauri/windows/hooks.nsh`
+- The installer installs for all users and registers the system service, or installs just for the current user (see [Windows installation](usage.md#windows-installation)); its extra steps are in `client/src-tauri/windows/hooks.nsh`
 - `npm run tauri build -- --no-bundle` only builds `airhand.exe`, but a release build refuses to run until installed
 - The C runtime is statically linked, so the VC++ redistributable isn't needed
 - Media Foundation is delay-loaded, so Windows N editions (without the Media Feature Pack) still run and use software encoding

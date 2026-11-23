@@ -1,5 +1,5 @@
-//! 系统托盘：图标 + 右键菜单（模式、服务器状态、控制码、切换模式、开机自动启动 / macOS 的登录时自动启动、
-//! 语言、退出）。
+//! 系统托盘：图标 + 右键菜单（模式、服务器状态、控制码、切换模式、开机自动启动 / 登录时自动启动（macOS、
+//! Windows 仅为当前用户安装）、语言、退出）。
 
 use std::sync::OnceLock;
 
@@ -9,7 +9,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, Tray
 use tauri::{AppHandle, Wry};
 
 use crate::i18n::{self, Lang};
-use crate::status::{AppStatus, Mode, ServiceStatus};
+use crate::status::{AppStatus, HOST_WITH_CONSOLE, Mode, ServiceStatus};
 use airhand_link::{Problem, ServerState};
 
 const TRAY_ID: &str = "airhand";
@@ -106,9 +106,11 @@ pub fn create(app: &AppHandle) -> tauri::Result<TrayIcon> {
         .build(app)
 }
 
-/// macOS 卸载时：先拿掉菜单栏图标。AppKit 移除图标时会改写 App 自己的偏好设置（清掉图标的位置等），
-/// 要在删偏好设置之前做，删完之后再移除会留下一个空的偏好设置文件（见 `uninstall::remove_preferences`）
-#[cfg(target_os = "macos")]
+/// 拿掉托盘图标（在主线程上调用）：
+/// * macOS 卸载时：AppKit 移除图标时会改写 App 自己的偏好设置（清掉图标的位置等），要在删偏好设置之前做，
+///   删完之后再移除会留下一个空的偏好设置文件（见 `uninstall::remove_preferences`）；
+/// * Windows 仅为当前用户安装的那一份让开时：被控端已经停了，菜单里的控制码、连接状态都不对了
+#[cfg(any(target_os = "macos", windows))]
 pub fn remove(app: &AppHandle) {
     drop(app.remove_tray_by_id(TRAY_ID));
 }
@@ -140,10 +142,39 @@ fn build_menu(app: &AppHandle, st: &AppStatus) -> tauri::Result<Menu<Wry>> {
         app,
         format!("Airhand  v{}", crate::config::VERSION),
     )?)?;
+    // Windows 仅为当前用户安装：说明做不到的事（为所有用户安装才行）
+    #[cfg(windows)]
+    if st.user_autostart.is_some() {
+        menu.append(&label(
+            app,
+            tr!(
+                "仅为当前用户安装：不能控制锁屏和 UAC",
+                "Installed just for you: no lock screen or UAC control"
+            ),
+        )?)?;
+    }
     menu.append(&PredefinedMenuItem::separator(app)?)?;
 
     match st.service {
         Some(svc) => service_items(app, &menu, st, svc)?,
+        // Windows 仅为当前用户安装、调试构建：被控端在本进程里，和服务里的一样一直运行，打开控制台也不停
+        None if HOST_WITH_CONSOLE => {
+            host_items(app, &menu, st)?;
+            menu.append(&PredefinedMenuItem::separator(app)?)?;
+            menu.append(&item(app, "console", tr!("打开控制台", "Open console"))?)?;
+            #[cfg(windows)]
+            if let Some(on) = st.user_autostart {
+                menu.append(&CheckMenuItem::with_id(
+                    app,
+                    "autostart",
+                    tr!("登录时自动启动", "Start when you sign in"),
+                    true,
+                    on,
+                    None::<&str>,
+                )?)?;
+            }
+        }
+        // macOS / Linux：被控端和控制端轮流运行
         None => {
             let mode = match st.mode {
                 Mode::Host => tr!("当前模式：被控端", "Mode: Host"),

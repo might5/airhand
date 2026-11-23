@@ -4,6 +4,7 @@ client/dist/
 client/src-tauri/gen/
 *.log
 web/.env
+.DS_Store
 
 # docker compose 挂载的 data 目录：运行时自动生成的证书、私钥、SQLite 数据库等，不要提交
 # （写成 /data/ 只匹配根目录这一个；android 里有个同名的 data 包，不能用不带斜杠开头的 data/）

@@ -178,7 +178,7 @@ data class Stats(
  * 连上之后以被控端报告的平台（`HostHello.platform`）为准；连上之前（例如"我的设备"里的图标）按系统名称猜
  */
 enum class OsKind(val wire: String) {
-    WINDOWS("windows"), MAC("mac"), LINUX("linux"), ANDROID("android"), UNKNOWN("");
+    WINDOWS("windows"), MAC("mac"), LINUX("linux"), ANDROID("android"), IOS("ios"), UNKNOWN("");
 
     companion object {
         fun fromWire(s: String?): OsKind = entries.firstOrNull { it.wire == s && s.isNotEmpty() } ?: UNKNOWN
@@ -187,6 +187,7 @@ enum class OsKind(val wire: String) {
             val s = os?.lowercase() ?: return UNKNOWN
             return when {
                 s.startsWith("android") -> ANDROID
+                s.startsWith("ios") || s.startsWith("ipados") -> IOS
                 s.contains("windows") -> WINDOWS
                 s.contains("mac") || s.contains("os x") -> MAC
                 s.isNotBlank() -> LINUX

@@ -2,7 +2,7 @@
 
 <h1 align="center">Airhand</h1>
 
-<p align="center"><b>High-performance, low-latency remote desktop</b><br>QUIC transport · hardware encoding and decoding · up to 120 fps<br>Windows · macOS · Linux · Android · browser</p>
+<p align="center"><b>High-performance, low-latency remote desktop</b><br>QUIC transport · hardware encoding and decoding · up to 120 fps<br>Windows · macOS · Linux · Android · iOS · browser</p>
 
 <p align="center"><b>English</b> · <a href="README.zh-CN.md">简体中文</a></p>
 
@@ -38,6 +38,7 @@ See [How it works → Video](docs/architecture.md#video) for details.
 - **Console**: browser-style tabs to control several computers at once, plus a multi-screen overview to watch them all. Computers you've connected to are saved and reconnect with one click; if one is offline, it connects as soon as it comes back
 - **Web console**: the controller can also run in Docker and be used from a browser, with nothing to install on the computer you control from
 - **Android**: control computers and phones from a phone as a trackpad or touchscreen, or share your own screen to get help (a device needs the pairing code shown on the phone the first time, and you're notified whenever one connects); watch on a TV with the remote
+- **iPhone / iPad**: the same remote control as on Android (trackpad / touch gestures, keyboard, mouse with pointer lock on iPad, game controls), or share the screen through the system screen broadcast (view only: iOS doesn't let apps be controlled)
 - **Audio**: the host's system audio plays on the controller (Opus + adaptive jitter buffer), with optional A/V sync for watching videos. The other way, the controller can send its microphone to meeting apps and voice typing on Windows, macOS 14.2+ and Linux (PipeWire) hosts. Mac and Linux hosts publish **Airhand Microphone** while forwarding is on
 - **Handy tools**: two-way clipboard sync (text, plus files and folders, sent when you paste), typing the clipboard as keystrokes, system shortcuts (Win, Alt+Tab, Ctrl+Shift+Esc…), multiple monitors (switch between them, show and control several at once, or give each its own window to put on your own screens in full screen), keyboard lock in fullscreen, quality presets
 - **Secure by default**: sessions are end-to-end encrypted, so the relay server can't see the screen or keystrokes; the first connection needs the pairing code from the other computer's tray (it never goes through the server), and its identity is recognized afterwards; TLS 1.3 with certificate pinning, brute-force protection for control codes; the host always sees who is connected and can disconnect them with one click
@@ -48,11 +49,12 @@ See [How it works → Video](docs/architecture.md#video) for details.
 
 | Platform | Host | Controller | Notes |
 |---|:-:|:-:|---|
-| Windows 10 / 11 | ✅ | ✅ | Installed; the host runs as a system service |
+| Windows 10 / 11 | ✅ | ✅ | Installed; for all users the host runs as a system service |
 | macOS 13+ | ✅ | ✅ | The host needs the Screen & System Audio Recording and Accessibility permissions |
 | Linux | ✅ | ✅ | The host supports X11 desktops only, with software encoding for now |
 | Android 7+ phones / tablets | ✅ | ✅ | Can only be watched until the accessibility service is turned on; the controller connects to one device at a time |
 | Android TV / Google TV | — | View only | Operated entirely with the remote |
+| iOS / iPadOS 17+ | View only | ✅ | Sharing uses the system screen broadcast; iOS doesn't allow controlling the device |
 | Browser (web console) | — | ✅ | Chrome / Edge, Safari 16.4+, Firefox 130+ |
 
 See [Known limitations](docs/limitations.md) for platform-specific caveats.
@@ -61,9 +63,9 @@ See [Known limitations](docs/limitations.md) for platform-specific caveats.
 
 ```mermaid
 flowchart LR
-    host["Host<br>Windows / macOS / Linux / Android"]
+    host["Host<br>Windows / macOS / Linux / Android / iOS"]
     relay["Relay server<br>airhand-server (Docker)"]
-    ctrl["Controller<br>desktop console / web console / Android"]
+    ctrl["Controller<br>desktop console / web console / Android / iOS"]
     host <-->|"QUIC · UDP 4433"| relay
     relay <-->|"QUIC · UDP 4433"| ctrl
     host -. "direct (when possible)" .- ctrl
@@ -125,7 +127,7 @@ The server address and fingerprint can also be changed later in [`config.toml`](
 
 ### 3. Connect
 
-1. Install Airhand on both computers (on Windows run the installer, which needs administrator rights; on macOS grant the permissions it asks for the first time)
+1. Install Airhand on both computers (on Windows run the installer: installing for all users needs administrator rights, installing just for yourself doesn't but can't control the lock screen and UAC prompts; on macOS grant the permissions it asks for the first time)
 2. On the computer **to be controlled**, right-click the tray icon (on macOS, click the menu bar icon) to see its 6-digit **control code**
 3. On **your** computer, choose **Open console** from the tray menu (**Switch to controller** on macOS / Linux) and enter the code. The first time you connect to that computer, also enter the 6-digit **pairing code** from its tray menu; after that it isn't needed
 
@@ -149,6 +151,7 @@ Open `http://localhost:8080` on that machine, or `https://<its address>:8080` fr
 | [Usage](docs/usage.md) | Host, Windows installation, configuration file, uninstalling, console, quality, language |
 | [Deployment](docs/deploy.md) | Relay server settings, web console, reverse proxies |
 | [Android](docs/android.md) | Controlling from a phone, sharing the phone, gestures, TVs |
+| [iOS](docs/ios.md) | iPhone / iPad: controlling, sharing the screen, building the IPA |
 | [Building](docs/building.md) | Per-platform requirements and packages, signing, APK |
 | [How it works](docs/architecture.md) | Architecture, source layout, Windows service, video and audio pipelines, A/V sync, files on disk |
 | [Security](docs/security.md) | Encryption and pinning, brute-force protection, control codes and resume tokens |
@@ -167,11 +170,12 @@ See [Security](docs/security.md) for details.
 
 | Directory | Contents |
 |---|---|
-| `crates/` | The protocol (`airhand-proto`) and the client-to-relay link (`airhand-link`) |
+| `crates/` | The protocol (`airhand-proto`), the client-to-relay link (`airhand-link`) and the phone core shared by Android and iOS (`airhand-mobile`) |
 | `server/` | Relay server |
 | `web/` | Web console service |
 | `client/` | Desktop client: Tauri (Rust) + React UI, which the web console uses too |
-| `android/` | Android app (Kotlin + Jetpack Compose) and its Rust core |
+| `android/` | Android app (Kotlin + Jetpack Compose) and its JNI wrapper of the phone core |
+| `ios/` | iOS / iPadOS app (SwiftUI + UIKit), screen broadcast extension and the C ABI wrapper of the phone core |
 
 How to run the tests, the debugging tools and the project conventions (protocol versions, UI strings…) are in [Development](docs/development.md).
 
