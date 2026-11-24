@@ -2,6 +2,7 @@ name: Build desktop clients
 
 # 注：macOS arm64 hosted runner 常因容量不足在排队 15 分钟后被取消（job cancelled），
 # 遇此情况只需对本文件做任意改动再 push，即可重新触发整套客户端构建。
+# 2026-11-24：fork 的 Actions 被停用后重新启用，用本文件改动触发首次构建。
 permissions:
   contents: write
 
