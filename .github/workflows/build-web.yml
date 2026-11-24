@@ -2,6 +2,7 @@ name: Build web image
 
 # 网页控制台（控制端跑在容器里）的镜像：推到 ghcr.io/<owner>/airhand-web，同时把镜像存成 tar.gz
 # 挂在 Release 上（没网 / 不想登录 GHCR 时 docker load 进去就能用）。
+# 2026-11-24：客户端触控显隐改动（a390142）未触发本流水线，用本文件改动重新构建 web 镜像。
 # 只构建 linux/amd64：NAS、家里的小服务器基本都是 x86_64；要 arm64 的话在 platforms 里加 linux/arm64
 # （走 QEMU，Rust 编译会慢很多）。
 permissions:
