@@ -7,6 +7,7 @@ import { errorText, noticeText, problemText, sessionStateText } from "../lib/mes
 import { CODEC_LABEL } from "../lib/presets";
 import type { RemoteSession } from "../lib/session";
 import { store, useSession, useSessionTitle, useStore, type TouchMode } from "../lib/store";
+import { useTouchable } from "../lib/touchable";
 import {
   IconChevron,
   IconClipboard,
@@ -40,12 +41,6 @@ import {
 import { FloatingBall } from "./FloatingBall";
 import { Popover } from "./Popover";
 import { QualityPanel, fmtKbps } from "./QualityPanel";
-
-/**
- * 这台设备有触摸屏（平板、触摸显示器）：才显示软键盘按钮。没有实体键盘的时候只能靠它打字。
- * 触摸系统的键盘不会自己弹出来（画面不是输入框），所以得有个按钮明确叫它。
- */
-const TOUCHABLE = typeof navigator !== "undefined" && (navigator.maxTouchPoints ?? 0) > 0;
 
 /** 把会话的 canvas 挂到当前位置（同一时刻只会挂在一个地方） */
 export function CanvasHost({ s, interactive }: { s: RemoteSession; interactive: boolean }) {
@@ -203,6 +198,11 @@ export function SessionView({ s }: { s: RemoteSession }) {
   const reveal = useToolbarReveal(immersive, toolbarRef);
   // 专注模式：工具栏默认收着，点悬浮球才出来；菜单开着的时候不收起（见下面的 CSS :has(.popover)）
   const compact = useStore((st) => st.chrome === "compact");
+  /**
+   * 触摸屏才用得上的按钮（触摸方式、软键盘）：有触控操作才显示、静默一会儿就收起，见 lib/touchable.ts。
+   * 触摸系统的键盘不会自己弹出来（画面不是输入框），没有实体键盘的时候只能靠软键盘按钮打字。
+   */
+  const touchable = useTouchable();
   /** 触摸方式（见 store 的 touchMode）：只有触摸屏上才用得上 */
   const touchMode = useStore((st) => st.touchMode);
   // 两种情况下工具栏都浮在画面上：全屏、专注模式
@@ -438,7 +438,7 @@ export function SessionView({ s }: { s: RemoteSession }) {
             {menu === "quality" && <QualityPanel s={s} onClose={closeMenu} />}
           </div>
 
-          {TOUCHABLE && (
+          {touchable && (
             <div className="menu-anchor">
               <button
                 className={`tb-btn icon ${menu === "touch" ? "on" : ""}`}
@@ -451,7 +451,7 @@ export function SessionView({ s }: { s: RemoteSession }) {
             </div>
           )}
 
-          {TOUCHABLE && (
+          {touchable && (
             <div className="menu-anchor">
               <button
                 className={`tb-btn icon ${s.keypadOpen ? "on" : ""}`}
