@@ -315,13 +315,23 @@ jobs:
         run: |
           APP=$(ls -d *.app | head -1)
           echo "app=$APP"
-          codesign -dv --verbose=4 "$APP" 2>&1 | grep -E "Identifier|Authority|TeamIdentifier|flags"
-          codesign -d -r- "$APP" 2>&1 | grep designated
+          SIG=$(codesign -dv --verbose=4 "$APP" 2>&1 || true)
+          echo "$SIG" | grep -E "Identifier|Authority|TeamIdentifier|flags" || true
+          codesign -d -r- "$APP" 2>&1 | grep designated || true
           codesign --verify --strict --verbose=2 "$APP"
-          codesign -dv "$APP" 2>&1 | grep -q "Signature=adhoc" && {
-            echo "::error::产物仍是 ad-hoc 签名，证书未生效"; exit 1; } || true
-          codesign -dv "$APP" 2>&1 | grep -q "Authority=${{ secrets.APPLE_SIGNING_IDENTITY }}" || {
-            echo "::error::签名身份不是 ${{ secrets.APPLE_SIGNING_IDENTITY }}"; exit 1; }
+          # 这里不能用 codesign ... | grep -q：grep 命中即退出会让 codesign 收到 SIGPIPE，
+          # 在 pipefail 下把校验成功的用例误判为失败
+          IDENTITY="${{ secrets.APPLE_SIGNING_IDENTITY }}"
+          case "$SIG" in
+            *"Signature=adhoc"*)
+              echo "::error::产物仍是 ad-hoc 签名，证书未生效"; exit 1;;
+          esac
+          case "$SIG" in
+            *"Authority=$IDENTITY"*)
+              echo "签名身份校验通过";;
+            *)
+              echo "::error::签名身份不是预期证书"; exit 1;;
+          esac
 
       - name: Collect
         run: |
