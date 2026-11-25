@@ -51,9 +51,49 @@ jobs:
         working-directory: client
         run: npm ci
 
+      # 用固定的本地代码签名身份签名，避免每次构建 ad-hoc 签名导致 TCC（屏幕录制/辅助功能）
+      # 授权因二进制内容哈希变化而失效。证书为自签 Code Signing 证书，经 secret 下发。
+      - name: 导入本地代码签名证书
+        id: signing
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置 APPLE_CERTIFICATE，本次构建将走 ad-hoc 签名"
+            exit 0
+          fi
+          P12="$RUNNER_TEMP/airhand-signing.p12"
+          PEM="$RUNNER_TEMP/airhand-signing.pem"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$P12"
+          # 自签证书必须加入系统信任域，否则 codesign 只认 ad-hoc、find-identity 报 0 valid
+          openssl pkcs12 -in "$P12" -passin pass:"$APPLE_CERTIFICATE_PASSWORD" -clcerts -nokeys -out "$PEM"
+          security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$PEM"
+          rm -f "$P12" "$PEM"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          security find-identity -v -p codesigning | head -5
+
       - name: 构建 dmg
         working-directory: client
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: npm run tauri build -- --bundles dmg
+
+      - name: 校验签名身份
+        if: steps.signing.outputs.enabled == 'true'
+        working-directory: client/src-tauri/target/release/bundle/macos
+        run: |
+          APP=$(ls -d *.app | head -1)
+          echo "app=$APP"
+          codesign -dv --verbose=4 "$APP" 2>&1 | grep -E "Identifier|Authority|TeamIdentifier|flags"
+          codesign -d -r- "$APP" 2>&1 | grep designated
+          codesign --verify --strict --verbose=2 "$APP"
+          # 身份必须是配置的签名证书，不能退回 ad-hoc
+          codesign -dv "$APP" 2>&1 | grep -q "Signature=adhoc" && {
+            echo "::error::签名仍为 ad-hoc，证书未生效"; exit 1; } || true
 
       - name: 列出构建产物
         working-directory: client/src-tauri/target/release/bundle/dmg
