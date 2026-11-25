@@ -126,11 +126,32 @@ jobs:
             exit 0
           fi
           KS="$RUNNER_TEMP/airhand-release.p12"
-          printf '%s' "$AIRHAND_KEYSTORE_B64" | base64 --decode > "$KS"
+          # secret 可能是多行 base64，先清掉换行与空白再解码
+          printf '%s' "$AIRHAND_KEYSTORE_B64" | tr -d '\r\n \t' | base64 --decode > "$KS"
+          SIZE=$(wc -c < "$KS")
+          echo "密钥库解码后大小：${SIZE} 字节"
+          if [ "$SIZE" -lt 1000 ]; then
+            echo "::error::AIRHAND_KEYSTORE 解码后仅 ${SIZE} 字节，secret 内容可能损坏（应为一整个 p12 的 base64）"
+            exit 1
+          fi
           echo "AIRHAND_KEYSTORE=$KS" >> "$GITHUB_ENV"
           echo "enabled=true" >> "$GITHUB_OUTPUT"
-          openssl pkcs12 -in "$KS" -passin pass:"${{ secrets.AIRHAND_KEYSTORE_PASSWORD }}" -clcerts -nokeys -out /dev/stdout 2>/dev/null \
-            | openssl x509 -noout -subject -enddate
+          # 该 p12 采用 RC2-40/3DES 旧加密算法：OpenSSL 3 需加载 legacy provider，否则读不出来，
+          # 所以先试 -legacy，再退回默认 provider，最后用 keytool 兜底（签名正确性最终由 apksigner 校验）
+          KSPASS='${{ secrets.AIRHAND_KEYSTORE_PASSWORD }}'
+          if ! openssl pkcs12 -legacy -in "$KS" -passin pass:"$KSPASS" -clcerts -nokeys \
+                 -out /dev/null 2>/dev/null; then
+            if ! openssl pkcs12 -in "$KS" -passin pass:"$KSPASS" -clcerts -nokeys \
+                   -out /dev/null 2>/dev/null; then
+              echo "::warning::openssl 无法解析该密钥库（旧算法），改用 keytool 校验"
+              keytool -list -v -keystore "$KS" -storetype PKCS12 -storepass "$KSPASS" || {
+                echo "::error::密钥库无法用 AIRHAND_KEYSTORE_PASSWORD 打开"
+                exit 1
+              }
+            fi
+          fi
+          openssl pkcs12 -legacy -in "$KS" -passin pass:"$KSPASS" -nokeys -out /dev/stdout 2>/dev/null \
+            | openssl x509 -noout -subject -enddate || true
 
       - name: 构建 APK
         working-directory: android
