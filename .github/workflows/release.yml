@@ -421,9 +421,9 @@ jobs:
     name: iOS
     needs: prepare
     # 本次只验证 iOS：手机横屏菜单改过，其余平台不动
-    # 代码用到了新 SDK 的接口（如 allowBluetoothHFP），macos-15 默认的 Xcode 16.4 编不过；和开发时一样用 Xcode 27
-    # fork 环境没有上游自建的 xcode-27 runner，iOS 需要新 SDK，用 macOS 26 镜像
-    runs-on: macos-26
+    # macos-26 镜像排队 15 分钟拿不到 runner 就被取消（连续 3 次），退回容量充足的 macos-15
+    # 代码里唯一的 iOS 26 新 API（allowBluetoothHFP）已用 #if compiler(>=6.2) 兼容老 SDK
+    runs-on: macos-15
     timeout-minutes: 60
     env:
       VERSION: ${{ needs.prepare.outputs.version }}

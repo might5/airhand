@@ -94,7 +94,12 @@ final class AudioIO {
             return
         }
         if mic {
+            // allowBluetoothHFP 是 iOS 26 SDK 才有的选项；老 SDK（Swift < 6.2）回退到 allowBluetooth
+            #if compiler(>=6.2)
             try s.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP])
+            #else
+            try s.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
+            #endif
         } else {
             try s.setCategory(.playback, mode: .default, options: [])
         }
