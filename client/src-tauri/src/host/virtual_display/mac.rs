@@ -430,10 +430,13 @@ fn run() {
         }
         // 有会话：预备、补屏；只是开着"不自动睡眠"：预备，合上盖子之后留着系统换上去的那块（合盖之后再建的没有画面，
         // 不建）
+        // 合上盖子时 lid 直接参与判断：此时系统会自己换上一块没内容的占位屏（unkn/virt/serial=0）算进 usable 让
+        // fill=false，两条件都不成立就会把自建屏撤掉，Clamshell Sleep 随即生效、只剩那块占位屏可采，画面全黑。
+        // 所以合盖时无论如何都留着自建屏（万一把它撤了，宁可先不建新的也不撤旧的）
         let wanted = can_create
             && !stopping
-            && ((sessions && (fill || standby.is_some()))
-                || (ready && (standby.is_some() || (fill && filling.is_some()))));
+            && ((sessions && (fill || standby.is_some() || lid))
+                || (ready && (standby.is_some() || lid || (fill && filling.is_some()))));
         match (&filling, wanted) {
             // 照着现在看到的本机显示器建；读不到的话（没见过这样的，兜底）照着最近看到的，什么都没见过才是 1080p：
             // 有画面总比合上盖子之后黑屏强（见模块说明）
