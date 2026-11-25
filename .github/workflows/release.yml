@@ -549,8 +549,7 @@ jobs:
 
   release:
     name: Publish
-    if: false  # 本次只跑 iOS，其余平台临时跳过
-    needs: [prepare, windows, linux, macos, android, ios, server-linux, server-windows]
+    needs: [prepare, ios]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
