@@ -11,6 +11,8 @@ struct SessionMenuActions {
     var tips: () -> Void
     var disconnect: () -> Void
     var minimize: () -> Void
+    /// 只关掉菜单、回到远程画面（横屏时下拉手势被系统抢走，靠这个按钮退出）
+    var close: () -> Void
 }
 
 /// 远程画面的菜单（从画面边上的圆钮打开）：顶部是对方和连接信息，下面是常用操作和几个子页面
@@ -20,24 +22,53 @@ struct SessionMenu: View {
     let ui: SessionUIState
     let actions: SessionMenuActions
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.verticalSizeClass) private var vSize
 
     private var computer: Bool { !session.os.isPhone }
 
+    /// 手机横屏：高度很紧，改成左右两列，别让「回到首页 / 断开」被挤到要滚动才看得见
+    private var landscape: Bool { vSize == .compact }
+
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    header
-                    tiles
-                    pages
-                }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 12)
+            Group {
+                if landscape { wideLayout } else { tallLayout }
             }
             .background(Theme.bg.ignoresSafeArea())
             .toolbar(.hidden, for: .navigationBar)
         }
         .preferredColorScheme(.dark)
+    }
+
+    private var tallLayout: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                header
+                tiles
+                pages
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 12)
+        }
+    }
+
+    private var wideLayout: some View {
+        ScrollView {
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 14) {
+                    header
+                    tiles
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                VStack(alignment: .leading, spacing: 14) {
+                    pages
+                }
+                .frame(width: 320)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+        }
     }
 
     // ── 顶部 ──
@@ -53,8 +84,26 @@ struct SessionMenu: View {
                 }
             }
             Spacer(minLength: 0)
+            closeButton
         }
         .padding(.top, 8)
+    }
+
+    /// 始终可见的退出入口：横屏全屏时下拉是系统通知/控制中心，没法靠手势关掉这个页
+    private var closeButton: some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            actions.close()
+        } label: {
+            Image(systemName: "xmark")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(Theme.sub)
+                .frame(width: 34, height: 34)
+                .background(Theme.card, in: Circle())
+                .overlay(Circle().stroke(Theme.stroke))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(L.t("close"))
     }
 
     private var statsLine: String {

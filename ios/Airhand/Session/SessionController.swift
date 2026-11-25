@@ -953,7 +953,8 @@ final class SessionController: UIViewController, Gestures.Out, UIPointerInteract
             editGame: { [weak self] l in self?.dismissThen { self?.editGame(l) } },
             tips: { [weak self] in self?.dismissThen { self?.showTips() } },
             disconnect: { [weak self] in self?.dismissThen { self?.disconnect(confirm: true) } },
-            minimize: { [weak self] in self?.dismissThen { self?.app.showingSession = false } }
+            minimize: { [weak self] in self?.dismissThen { self?.app.showingSession = false } },
+            close: { [weak self] in self?.dismissThen {} }
         ))
         let host = UIHostingController(rootView: menu)
         host.view.backgroundColor = UIColor(Theme.bg)

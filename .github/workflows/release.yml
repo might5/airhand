@@ -107,6 +107,7 @@ jobs:
 
   windows:
     name: Windows x64
+    if: false  # 本次只跑 iOS，其余平台临时跳过
     needs: prepare
     runs-on: windows-latest
     timeout-minutes: 90
@@ -155,6 +156,7 @@ jobs:
 
   linux:
     name: Linux ${{ matrix.arch }}
+    if: false  # 本次只跑 iOS，其余平台临时跳过
     needs: prepare
     strategy:
       fail-fast: false
@@ -214,6 +216,7 @@ jobs:
 
   macos:
     name: macOS ${{ matrix.arch }}
+    if: false  # 本次只跑 iOS，其余平台临时跳过
     needs: prepare
     strategy:
       fail-fast: false
@@ -349,6 +352,7 @@ jobs:
 
   android:
     name: Android
+    if: false  # 本次只跑 iOS，其余平台临时跳过
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -416,8 +420,7 @@ jobs:
   ios:
     name: iOS
     needs: prepare
-    # 临时暂停：托管 macOS runner 容量紧张，本次只为抢到 macOS arm64 的构建名额
-    if: false
+    # 本次只验证 iOS：手机横屏菜单改过，其余平台不动
     # 代码用到了新 SDK 的接口（如 allowBluetoothHFP），macos-15 默认的 Xcode 16.4 编不过；和开发时一样用 Xcode 27
     # fork 环境没有上游自建的 xcode-27 runner，iOS 需要新 SDK，用 macOS 26 镜像
     runs-on: macos-26
@@ -466,6 +469,7 @@ jobs:
 
   server-linux:
     name: Server linux-${{ matrix.arch }}
+    if: false  # 本次只跑 iOS，其余平台临时跳过
     needs: prepare
     strategy:
       fail-fast: false
@@ -511,6 +515,7 @@ jobs:
 
   server-windows:
     name: Server windows-x64
+    if: false  # 本次只跑 iOS，其余平台临时跳过
     needs: prepare
     runs-on: windows-latest
     timeout-minutes: 45
@@ -544,6 +549,7 @@ jobs:
 
   release:
     name: Publish
+    if: false  # 本次只跑 iOS，其余平台临时跳过
     needs: [prepare, windows, linux, macos, android, ios, server-linux, server-windows]
     runs-on: ubuntu-latest
     timeout-minutes: 15
