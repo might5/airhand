@@ -221,8 +221,9 @@ jobs:
         include:
           - arch: arm64
             target: aarch64-apple-darwin
-          - arch: x64
-            target: x86_64-apple-darwin
+          # 临时只出 arm64：托管 runner 容量紧张，同时抢两个 macOS job 容易被取消
+          # - arch: x64
+          #   target: x86_64-apple-darwin
     # Xcode 27 只有 Apple 芯片的机器：Intel 版在上面交叉编译。Xcode 27 的 SDK 仍然能编 x86_64（部署目标低于
     # macOS 27 即可，这里是 13）；C 依赖由 cc / cmake 按 --target 编（cmake-rs 会设 CMAKE_OSX_ARCHITECTURES）
     # fork 环境没有上游自建的 xcode-27 runner，改用 GitHub 托管镜像
@@ -405,6 +406,8 @@ jobs:
   ios:
     name: iOS
     needs: prepare
+    # 临时暂停：托管 macOS runner 容量紧张，本次只为抢到 macOS arm64 的构建名额
+    if: false
     # 代码用到了新 SDK 的接口（如 allowBluetoothHFP），macos-15 默认的 Xcode 16.4 编不过；和开发时一样用 Xcode 27
     # fork 环境没有上游自建的 xcode-27 runner，iOS 需要新 SDK，用 macOS 26 镜像
     runs-on: macos-26
