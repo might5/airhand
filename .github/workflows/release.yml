@@ -318,7 +318,9 @@ jobs:
           AIRHAND_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           AIRHAND_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           AIRHAND_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: ./gradlew assembleRelease
+        # Kotlin 在 Gradle 进程里编译：不另开 Kotlin 守护进程（CI 只构建一次，用不上），也就没有它启动时的误报
+        # “e: The daemon has terminated unexpectedly ... Kotlin compile daemon is ready”
+        run: ./gradlew assembleRelease -Pkotlin.compiler.execution.strategy=in-process
 
       - name: Collect
         run: |

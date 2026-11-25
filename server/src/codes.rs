@@ -331,7 +331,8 @@ impl Bindings {
         self.entries.contains_key(&code)
     }
 
-    /// `code` 作废了（[`Bindings::retire`]）
+    /// `code` 作废了（[`Bindings::retire`]）。只有测试用
+    #[cfg(test)]
     pub fn is_retired(&self, code: u32) -> bool {
         self.retired.contains_key(&code)
     }

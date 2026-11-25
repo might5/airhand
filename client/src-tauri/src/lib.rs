@@ -66,6 +66,7 @@ pub struct AppState {
     console_opening: AtomicBool,
     webview_dirs: Mutex<Vec<PathBuf>>,
     /// Windows 安装版：被控端在系统服务里运行（托盘只负责显示和操作），切换模式不影响它
+    #[cfg_attr(not(windows), allow(dead_code))]
     service_mode: bool,
     /// 控制台连过来的 WebSocket 地址（第一次要的时候开始监听，见 [`console`]）
     console: tokio::sync::OnceCell<String>,
@@ -707,6 +708,11 @@ pub fn run() {
     if user_install && winsvc::service_present() {
         winsvc::user::step_aside();
         return;
+    }
+    // 被控端在本进程里运行：双显卡电脑上桌面复制要找对显卡，在用到 DXGI 之前（见 host::capture::ignore_gpu_preference）
+    #[cfg(windows)]
+    if !service_mode {
+        host::capture::ignore_gpu_preference();
     }
     #[cfg(not(windows))]
     let service_mode = false;

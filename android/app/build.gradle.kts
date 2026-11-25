@@ -5,7 +5,7 @@ plugins {
 }
 
 // 产品版本与桌面客户端一致（client/src-tauri/tauri.conf.json）；发布时 CI 按 tag 改写（.github/scripts/set-version.mjs）
-val appVersion = "0.3.1"
+val appVersion = "0.4.0"
 
 /**
  * versionCode 由版本号算出：主版本 × 1000000 + 次版本 × 10000 + 修订号 × 100 + 后缀（rc.N → N，正式版 → 99）。
@@ -148,6 +148,8 @@ val cargoBuild by tasks.registering(Exec::class) {
     outputs.dir(outDir)
     doFirst {
         environment("ANDROID_NDK_HOME", android.ndkDirectory.absolutePath)
+        // CI 的运行环境预先把 ANDROID_NDK_ROOT 设成它自带的 NDK：不一致的话 cargo-ndk 会警告（它用的是 ANDROID_NDK_HOME）
+        environment("ANDROID_NDK_ROOT", android.ndkDirectory.absolutePath)
     }
     val args = mutableListOf("cargo", "ndk")
     rustAbis.forEach { args += listOf("-t", it) }

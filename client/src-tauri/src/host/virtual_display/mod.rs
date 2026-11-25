@@ -18,8 +18,9 @@
 //! * 整台被控端一份：哪个控制端打开的都一样，哪一个都能关；
 //! * 打开它的控制端都走了：接着开着，远程控制结束了才关掉（[`release_privacy`]，见 `host::ending`）——
 //!   控制端断开了马上关（一个会话都不剩的话先锁屏），断线了等它重连一会儿（重连时在介绍里带着它，接着开着，
-//!   本机屏幕不会在重连的间隙里露出来）。本机的人想结束它：断开网络，过一会儿会话断了，防窥也就关了
-//!   （锁着屏）；或者重启电脑；
+//!   本机屏幕不会在重连的间隙里露出来）。控制端断线之后本机有人按键、点鼠标（或者按了之后不久控制端
+//!   断线了：手机上划掉了应用）就不等它重连，马上锁屏、关掉防窥（[`block`]、[`curtain`] 告诉 `host::ending`）。
+//!   本机的人想结束还连着的控制端开的防窥：断开网络，过一会儿会话断了，再按一下键（锁着屏）；或者重启电脑；
 //! * 关掉时停用虚拟显示器，按 Windows 记着的设置恢复本机的显示器（改设置时从不存进 Windows 的显示设置数据库，
 //!   见 [`topology`]）。进程意外退出、断电重启之后，下次启动时恢复（[`recover`]）。macOS 上进程退出时系统自己
 //!   恢复（gamma 表、窗口、事件监听都是这个进程的）；
@@ -64,6 +65,7 @@ const HAS_PRIVACY: bool = cfg!(any(windows, target_os = "macos"));
 /// 万一没人叫它，本机的显示器也不会一直黑着、键盘鼠标一直不能用
 const PRIVACY_HOLD_MAX: Duration = Duration::from_secs(90);
 /// 最后一个会话结束之后，补屏的虚拟显示器再留这么久（等断线重连）
+#[cfg(any(windows, target_os = "macos"))]
 const SESSION_LINGER: Duration = Duration::from_secs(30);
 /// 会话开始时没有显示器：最多等虚拟显示器这么久
 pub const APPEAR_WAIT: Duration = Duration::from_secs(15);
@@ -137,6 +139,7 @@ impl Wanted {
         !self.holders.is_empty() || self.linger.is_some_and(|t| now < t)
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     fn sessions(&self, now: Instant) -> bool {
         !self.sessions.is_empty() || self.idle_since.is_some_and(|t| now < t + SESSION_LINGER)
     }
@@ -359,6 +362,23 @@ pub fn cover_windows() -> Vec<u32> {
 #[cfg(target_os = "macos")]
 pub fn cover_generation() -> u64 {
     curtain::cover_generation()
+}
+
+/// 补屏的虚拟显示器在桌面上的名字（和 `DisplayInfo::name` 一样，例如 `DISPLAY19`）；没在补屏（没有它、开着防窥）时
+/// 为 `None`。本机的显示器回到桌面上之后它马上就要停用：会话不再跟着它（见 `host::session`）。要查显示设置，
+/// 放在不挡异步任务的线程上调用
+pub fn filling_in() -> Option<String> {
+    #[cfg(windows)]
+    {
+        if HUB.wants.lock().unwrap().privacy(Instant::now()) {
+            return None;
+        }
+        topology::virtual_name()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 /// 进程启动时（还没有会话）、卸载时：上次意外退出没恢复的恢复掉（见模块说明）
