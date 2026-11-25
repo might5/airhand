@@ -503,12 +503,13 @@ enum AV1 {
     // 单独成函数：整个闭包放在 withUnsafeBytes 里会让类型检查器超时（Xcode 16.4 报 "unable to type-check"）
     private static func configRecordBody(_ b: UnsafeRawBufferPointer, obu: Data) -> Data? {
             guard b.count > 2 else { return nil }
-            let ext = b[0] & 0x04 != 0
-            let hasSize = b[0] & 0x02 != 0
-            var start = 1 + (ext ? 1 : 0)
+            let ext: Bool = b[0] & 0x04 != 0
+            let hasSize: Bool = b[0] & 0x02 != 0
+            var start: Int = 1 + (ext ? 1 : 0)
             if hasSize { while start < b.count, b[start] & 0x80 != 0 { start += 1 }; start += 1 }
             guard start < b.count else { return nil }
-            var r = BitReader(UnsafeRawBufferPointer(rebasing: b[start...]))
+            let rest: UnsafeRawBufferPointer = UnsafeRawBufferPointer(rebasing: b[start...])
+            var r = BitReader(rest)
             let profile = r.bits(3)
             _ = r.bits(1) // still_picture
             let reduced = r.bits(1) == 1
@@ -574,8 +575,9 @@ enum AV1 {
                 if sx == 1, sy == 1 { csp = r.bits(2) }
             }
             guard !r.overrun else { return nil }
-            var out = Data([0x81, UInt8(profile << 5 | level),
-                            UInt8(tier << 7 | high << 6 | twelve << 5 | mono << 4 | sx << 3 | sy << 2 | csp), 0])
+            let firstByte: UInt8 = UInt8(truncatingIfNeeded: profile << 5 | level)
+            let packed: UInt8 = UInt8(truncatingIfNeeded: tier << 7 | high << 6 | twelve << 5 | mono << 4 | sx << 3 | sy << 2 | csp)
+            var out: Data = Data([UInt8(0x81), firstByte, packed, UInt8(0)])
             out.append(obu)
             return out
     }
