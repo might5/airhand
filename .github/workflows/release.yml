@@ -223,7 +223,8 @@ jobs:
             target: x86_64-apple-darwin
     # Xcode 27 只有 Apple 芯片的机器：Intel 版在上面交叉编译。Xcode 27 的 SDK 仍然能编 x86_64（部署目标低于
     # macOS 27 即可，这里是 13）；C 依赖由 cc / cmake 按 --target 编（cmake-rs 会设 CMAKE_OSX_ARCHITECTURES）
-    runs-on: xcode-27
+    # fork 环境没有上游自建的 xcode-27 runner，改用 GitHub 托管镜像
+    runs-on: macos-15
     timeout-minutes: 90
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -232,7 +233,11 @@ jobs:
 
       - name: Select Xcode
         run: |
-          sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
+          if [ -d "/Applications/Xcode_${XCODE_VERSION}.app" ]; then
+            sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
+          else
+            echo "镜像里没有 Xcode ${XCODE_VERSION}，使用镜像默认版本"
+          fi
           xcodebuild -version
 
       - uses: actions/setup-node@v6
@@ -339,7 +344,8 @@ jobs:
     name: iOS
     needs: prepare
     # 代码用到了新 SDK 的接口（如 allowBluetoothHFP），macos-15 默认的 Xcode 16.4 编不过；和开发时一样用 Xcode 27
-    runs-on: xcode-27
+    # fork 环境没有上游自建的 xcode-27 runner，iOS 需要新 SDK，用 macOS 26 镜像
+    runs-on: macos-26
     timeout-minutes: 60
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -348,7 +354,11 @@ jobs:
 
       - name: Select Xcode
         run: |
-          sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
+          if [ -d "/Applications/Xcode_${XCODE_VERSION}.app" ]; then
+            sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
+          else
+            echo "镜像里没有 Xcode ${XCODE_VERSION}，使用镜像默认版本"
+          fi
           xcodebuild -version
 
       - uses: dtolnay/rust-toolchain@stable

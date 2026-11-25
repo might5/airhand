@@ -16,8 +16,19 @@ fi
 
 VER="$1"
 shift
-TAG="v${VER}"
 REPO="${GITHUB_REPOSITORY:?缺少 GITHUB_REPOSITORY 环境变量}"
+
+# 发布规则对齐上游：一个版本(tag)一个 Release，老产物不再被后续构建覆盖。
+# 只有在 vX.Y.Z(-rc.N) tag 上运行时才算正式版本；手动/一键构建一律挂到 ci-<版本>-<run> 的预发布。
+PRE=()
+if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [[ "${GITHUB_REF_NAME:-}" == v* ]]; then
+  TAG="${GITHUB_REF_NAME}"
+  VER="${TAG#v}"
+else
+  TAG="ci-${VER}-${GITHUB_RUN_NUMBER:-$(date +%Y%m%d%H%M%S)}"
+  PRE=(--prerelease)
+  echo "非 tag 运行，产物挂到临时的预发布 ${TAG}（不会覆盖正式版本）"
+fi
 
 for f in "$@"; do
   if [ ! -f "${f}" ]; then
@@ -45,8 +56,8 @@ EOF
 
 # 各 job 是并行跑的，可能同时抢着创建同一 tag：谁先建成算谁的，另一个 create 失败属正常
 if ! gh release view "${TAG}" --repo "${REPO}" >/dev/null 2>&1; then
-  gh release create "${TAG}" --repo "${REPO}" --latest \
-    --title "Airhand ${VER}" --notes "${NOTES}" || true
+  gh release create "${TAG}" --repo "${REPO}" \
+    --title "Airhand ${VER}" --notes "${NOTES}" ${PRE[@]+"${PRE[@]}"} || true
 fi
 
 # 等 Release 真的可见（另一个 job 可能正在创建）
@@ -62,7 +73,7 @@ for i in $(seq 1 20); do
   sleep 3
 done
 
-# --clobber：同一版本重跑时覆盖同名产物，不会报 already exists
+# --clobber：仅同一 tag 重跑时覆盖自己的同名产物（跨版本不会互相覆盖）
 gh release upload "${TAG}" "$@" --clobber --repo "${REPO}"
 echo "已挂到 ${TAG}，本次上传：$*"
 gh release view "${TAG}" --repo "${REPO}" --json url -q .url

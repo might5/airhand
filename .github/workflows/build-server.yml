@@ -8,14 +8,8 @@ permissions:
   packages: write
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "server/**"
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/build-server.yml"
+  # 发布统一走 git tag（见 release.yml，与上游一致）：一个版本对应一个 Release，老产物不会被后续构建覆盖。
+  # 本文件只保留手动/被 build-all 调用的入口，产物挂到 CI 临时 tag，不碰正式版本 Release。
   workflow_dispatch:
   workflow_call:
 
