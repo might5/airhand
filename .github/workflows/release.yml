@@ -255,12 +255,53 @@ jobs:
       - name: Set version
         run: node .github/scripts/set-version.mjs "$VERSION"
 
+      # 用固定的本地代码签名身份签名：TCC（屏幕录制/辅助功能）授权记录绑定的是这张证书的根，
+      # 只要每次构建都用同一身份，装上新包就不会再要求重新授权。ad-hoc 签名的绑定对象是二进制
+      # 内容哈希，每构建一次就变，每次安装都会丢授权。证书为自签 Code Signing 证书，经 secret 下发。
+      - name: Import signing identity
+        id: signing
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::未配置 APPLE_CERTIFICATE，本次产物将退回 ad-hoc 签名，安装后需要重新授权"
+            exit 0
+          fi
+          P12="$RUNNER_TEMP/airhand-signing.p12"
+          PEM="$RUNNER_TEMP/airhand-signing.pem"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$P12"
+          # 自签证书必须加入系统信任域，否则 security find-identity -v 看不到它，Tauri 会退回 ad-hoc
+          openssl pkcs12 -in "$P12" -passin pass:"$APPLE_CERTIFICATE_PASSWORD" -clcerts -nokeys -out "$PEM"
+          sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$PEM"
+          rm -f "$P12" "$PEM"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          security find-identity -v -p codesigning | head -5
+
       # CI=true 时 Tauri 打 dmg 跳过 Finder 排版（CI 里没有图形会话）
       - name: Build
         working-directory: client
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
           npm ci --no-audit --no-fund
           npx tauri build --target ${{ matrix.target }}
+
+      # 身份不生效就让构建失败：装上一个 ad-hoc 的包会让用户以为修复无效
+      - name: Verify signature
+        if: steps.signing.outputs.enabled == 'true'
+        working-directory: client/src-tauri/target/${{ matrix.target }}/release/bundle/macos
+        run: |
+          APP=$(ls -d *.app | head -1)
+          echo "app=$APP"
+          codesign -dv --verbose=4 "$APP" 2>&1 | grep -E "Identifier|Authority|TeamIdentifier|flags"
+          codesign -d -r- "$APP" 2>&1 | grep designated
+          codesign --verify --strict --verbose=2 "$APP"
+          codesign -dv "$APP" 2>&1 | grep -q "Signature=adhoc" && {
+            echo "::error::产物仍是 ad-hoc 签名，证书未生效"; exit 1; } || true
+          codesign -dv "$APP" 2>&1 | grep -q "Authority=${{ secrets.APPLE_SIGNING_IDENTITY }}" || {
+            echo "::error::签名身份不是 ${{ secrets.APPLE_SIGNING_IDENTITY }}"; exit 1; }
 
       - name: Collect
         run: |
@@ -515,7 +556,7 @@ jobs:
           | Relay server, Linux arm64 | $(link "airhand-server_${v}_linux-arm64.tar.gz") |
           | Relay server, Windows x64 | $(link "airhand-server_${v}_windows-x64.zip") |
 
-          - **macOS**: ad-hoc signed, not notarized, so macOS refuses to open it ("damaged" / "can't be verified"). After dragging Airhand into Applications, run this once in Terminal: \`xattr -dr com.apple.quarantine /Applications/Airhand.app\`
+          - **macOS**: signed with a fixed self-signed certificate (not notarized). Every release uses the same identity, so screen-recording / accessibility permissions granted to one version stay valid after updating (ad-hoc builds lose them on every install). Gatekeeper still blocks the first launch because the certificate is not notarized: after dragging Airhand into Applications, run this once in Terminal: \`xattr -dr com.apple.quarantine /Applications/Airhand.app\`
           - **Android TV / Google TV**: the same APK; sideload it (e.g. \`adb install\`) and it shows up in the TV's launcher. View only, operated entirely with the remote
           - **Linux**: \`sudo apt install ./Airhand_${v}_linux-x64.deb\` (pulls in the tray, audio and GStreamer dependencies)
           - **iOS**: the IPA has no real signature; re-sign it (Sideloadly, AltStore or your own certificate) before installing
