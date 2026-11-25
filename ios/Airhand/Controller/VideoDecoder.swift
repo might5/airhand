@@ -497,7 +497,11 @@ enum AV1 {
 
     /// av1C（AV1CodecConfigurationRecord）：从序列头 OBU 里读出档次、级别、位深和色度采样
     static func configRecord(sequenceHeaderObu obu: Data) -> Data? {
-        obu.withUnsafeBytes { b -> Data? in
+        obu.withUnsafeBytes { b in configRecordBody(b, obu: obu) }
+    }
+
+    // 单独成函数：整个闭包放在 withUnsafeBytes 里会让类型检查器超时（Xcode 16.4 报 "unable to type-check"）
+    private static func configRecordBody(_ b: UnsafeRawBufferPointer, obu: Data) -> Data? {
             guard b.count > 2 else { return nil }
             let ext = b[0] & 0x04 != 0
             let hasSize = b[0] & 0x02 != 0
@@ -574,7 +578,6 @@ enum AV1 {
                             UInt8(tier << 7 | high << 6 | twelve << 5 | mono << 4 | sx << 3 | sy << 2 | csp), 0])
             out.append(obu)
             return out
-        }
     }
 
     struct BitReader {
