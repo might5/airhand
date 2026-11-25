@@ -7,8 +7,9 @@
 # Android 的 versionCode 由版本号算出（0.4.0-rc.1 → 40001，0.4.0 → 40099，见 android/app/build.gradle.kts）。
 #
 # 需要在仓库 Settings → Secrets and variables → Actions 里配置：
-#   Variables（必需）：AIRHAND_SERVER     中转服务器地址，如 relay.example.com:4433
+#   Variables（可选）：AIRHAND_SERVER     中转服务器地址，如 relay.example.com:4433
 #                      AIRHAND_SERVER_FP  服务器证书的 SHA-256 指纹（64 位十六进制）
+#                      不配置时回退到下面 RELAY_FALLBACK_* 的默认值（本 fork 的线上中继，与已发布客户端里编译进去的一致）
 #   Secrets（可选，Android 发布签名；不配置时用一次性的调试密钥签名，装不上覆盖旧版本）：
 #                      ANDROID_KEYSTORE_BASE64    keystore 文件的 base64（base64 -w0 release.jks）
 #                      ANDROID_KEYSTORE_PASSWORD  keystore 密码
@@ -43,8 +44,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AIRHAND_SERVER: ${{ vars.AIRHAND_SERVER }}
-  AIRHAND_SERVER_FP: ${{ vars.AIRHAND_SERVER_FP }}
+  # 仓库没配 Variables 时回退到线上中继（本 fork 专用；上游要求 Variables 必须配置）
+  AIRHAND_SERVER: ${{ vars.AIRHAND_SERVER || '39.105.40.56:4433' }}
+  AIRHAND_SERVER_FP: ${{ vars.AIRHAND_SERVER_FP || '5c1e5ad85089bfa938b8b7f5008076c42ad6dfe3aee5e623300ef93d0efa8fbe' }}
   CARGO_TERM_COLOR: always
   # macOS / iOS 用的 Xcode（xcode-27 机器上装着的版本之一），和开发时用的一致
   XCODE_VERSION: "27.2"
