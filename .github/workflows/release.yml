@@ -107,7 +107,6 @@ jobs:
 
   windows:
     name: Windows x64
-    if: false  # 本次只跑 iOS，其余平台临时跳过
     needs: prepare
     runs-on: windows-latest
     timeout-minutes: 90
@@ -156,7 +155,6 @@ jobs:
 
   linux:
     name: Linux ${{ matrix.arch }}
-    if: false  # 本次只跑 iOS，其余平台临时跳过
     needs: prepare
     strategy:
       fail-fast: false
@@ -223,9 +221,8 @@ jobs:
         include:
           - arch: arm64
             target: aarch64-apple-darwin
-          # 临时只出 arm64：托管 runner 容量紧张，同时抢两个 macOS job 容易被取消
-          # - arch: x64
-          #   target: x86_64-apple-darwin
+          - arch: x64
+            target: x86_64-apple-darwin
     # Xcode 27 只有 Apple 芯片的机器：Intel 版在上面交叉编译。Xcode 27 的 SDK 仍然能编 x86_64（部署目标低于
     # macOS 27 即可，这里是 13）；C 依赖由 cc / cmake 按 --target 编（cmake-rs 会设 CMAKE_OSX_ARCHITECTURES）
     # fork 环境没有上游自建的 xcode-27 runner，改用 GitHub 托管镜像
@@ -351,7 +348,6 @@ jobs:
 
   android:
     name: Android
-    if: false  # 本次只跑 iOS，其余平台临时跳过
     needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -468,7 +464,6 @@ jobs:
 
   server-linux:
     name: Server linux-${{ matrix.arch }}
-    if: false  # 本次只跑 iOS，其余平台临时跳过
     needs: prepare
     strategy:
       fail-fast: false
@@ -514,7 +509,6 @@ jobs:
 
   server-windows:
     name: Server windows-x64
-    if: false  # 本次只跑 iOS，其余平台临时跳过
     needs: prepare
     runs-on: windows-latest
     timeout-minutes: 45
@@ -548,7 +542,7 @@ jobs:
 
   release:
     name: Publish
-    needs: [prepare, ios, macos]
+    needs: [prepare, windows, linux, macos, android, ios, server-linux, server-windows]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
