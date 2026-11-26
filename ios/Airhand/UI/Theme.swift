@@ -28,6 +28,59 @@ extension Color {
     }
 }
 
+// ───────────────────────────── 液态玻璃 ─────────────────────────────
+
+/// 液态玻璃面板：新系统走系统 Liquid Glass，老系统用材质 + 高光描边兜底，两边观感一致
+struct GlassSurface<S: InsettableShape>: View {
+    let shape: S
+    var tint: Color?
+    var line: CGFloat = 1
+
+    init(_ shape: S, tint: Color? = nil, line: CGFloat = 1) {
+        self.shape = shape
+        self.tint = tint
+        self.line = line
+    }
+
+    var body: some View {
+        #if compiler(>=6.2)
+            if #available(iOS 26.0, *) {
+                Color.clear.glassEffect(tint.map { Glass.regular.tint($0) } ?? .regular, in: shape)
+            } else {
+                fallback
+            }
+        #else
+            fallback
+        #endif
+    }
+
+    private var fallback: some View {
+        shape
+            .fill(.ultraThinMaterial)
+            .overlay {
+                shape.fill(LinearGradient(colors: [Color.white.opacity(0.13), Color.white.opacity(0.02)],
+                                          startPoint: .top, endPoint: .bottom))
+            }
+            .overlay {
+                shape.strokeBorder(LinearGradient(colors: [Color.white.opacity(0.30), Color.white.opacity(0.07)],
+                                                  startPoint: .topLeading, endPoint: .bottomTrailing), lineWidth: line)
+            }
+    }
+}
+
+/// 整页玻璃背板：sheet 透明后，底下的远程画面透上来形成玻璃
+struct GlassBackdrop: View {
+    var body: some View {
+        ZStack {
+            Rectangle().fill(.ultraThinMaterial)
+            // 压一层深色，玻璃透亮但字还看得清
+            Rectangle().fill(Color.black.opacity(0.22))
+            LinearGradient(colors: [Color.white.opacity(0.06), Color.clear, Color.black.opacity(0.22)],
+                           startPoint: .top, endPoint: .bottom)
+        }
+    }
+}
+
 /// 圆角卡片
 struct Card<Content: View>: View {
     var padding: CGFloat = 16

@@ -29,53 +29,70 @@ struct SessionMenu: View {
     /// 手机横屏：高度很紧，改成左右两列，别让「回到首页 / 断开」被挤到要滚动才看得见
     private var landscape: Bool { vSize == .compact }
 
+    /// 左右边距和列间距：竖屏、横屏共用同一套，保证所有内容对齐同一条线
+    private var gutter: CGFloat { 22 }
+    private var gap: CGFloat { 18 }
+
     var body: some View {
         NavigationStack {
-            Group {
-                if landscape { wideLayout } else { tallLayout }
+            GeometryReader { geo in
+                ScrollView {
+                    if landscape && geo.size.width >= 620 {
+                        wideLayout(width: geo.size.width)
+                    } else {
+                        tallLayout(width: geo.size.width)
+                    }
+                }
+                .scrollIndicators(.hidden)
             }
-            .background(Theme.bg.ignoresSafeArea())
             .toolbar(.hidden, for: .navigationBar)
         }
+        .background { GlassBackdrop().ignoresSafeArea() }
+        .presentationBackground(.clear)
         .preferredColorScheme(.dark)
     }
 
-    private var tallLayout: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                header
-                tiles
-                pages
-            }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 12)
+    private func tallLayout(width: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            header
+            tiles(columns: columns(for: width - gutter * 2), height: 74)
+            pages
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, gutter)
+        .padding(.top, 14)
+        .padding(.bottom, 22)
     }
 
-    private var wideLayout: some View {
-        ScrollView {
-            HStack(alignment: .top, spacing: 16) {
-                VStack(alignment: .leading, spacing: 14) {
-                    header
-                    tiles
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                VStack(alignment: .leading, spacing: 14) {
-                    pages
-                }
-                .frame(width: 320)
+    /// 横屏：左列是设备和常用操作，右列是子页面；两列同一条顶线，右列按屏宽取窄栏
+    private func wideLayout(width: CGFloat) -> some View {
+        let side = min(max(280, width * 0.32), 360)
+        let leading = width - gutter * 2 - gap - side
+        return HStack(alignment: .top, spacing: gap) {
+            VStack(alignment: .leading, spacing: 14) {
+                header
+                tiles(columns: columns(for: leading), height: 62)
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            pages
+                .frame(width: side)
         }
+        .padding(.horizontal, gutter)
+        .padding(.top, 14)
+        .padding(.bottom, 20)
+    }
+
+    /// 按可用宽度定死列数：格子等宽，最后一行不满也按同宽排，不会忽宽忽窄
+    private func columns(for width: CGFloat) -> Int {
+        max(2, min(5, Int(width / 118)))
     }
 
     // ── 顶部 ──
 
     private var header: some View {
         HStack(spacing: 14) {
-            DeviceIcon(os: session.os, size: 48)
+            DeviceIcon(os: session.os, size: 46)
             VStack(alignment: .leading, spacing: 4) {
                 Text(session.hostName).font(.title3.weight(.bold)).foregroundStyle(Theme.text).lineLimit(1)
                 Text(statsLine).font(.caption).foregroundStyle(Theme.sub).lineLimit(2)
@@ -83,10 +100,10 @@ struct SessionMenu: View {
                     Label(L.t("session_safety", s), systemImage: "checkmark.shield").font(.caption2).foregroundStyle(Theme.faint)
                 }
             }
-            Spacer(minLength: 0)
+            Spacer(minLength: 12)
             closeButton
         }
-        .padding(.top, 8)
+        .frame(minHeight: 46)
     }
 
     /// 始终可见的退出入口：横屏全屏时下拉是系统通知/控制中心，没法靠手势关掉这个页
@@ -97,10 +114,9 @@ struct SessionMenu: View {
         } label: {
             Image(systemName: "xmark")
                 .font(.system(size: 14, weight: .bold))
-                .foregroundStyle(Theme.sub)
-                .frame(width: 34, height: 34)
-                .background(Theme.card, in: Circle())
-                .overlay(Circle().stroke(Theme.stroke))
+                .foregroundStyle(Theme.text.opacity(0.9))
+                .frame(width: 36, height: 36)
+                .background { GlassSurface(Circle(), tint: Color.white.opacity(0.08)) }
         }
         .buttonStyle(.plain)
         .accessibilityLabel(L.t("close"))
@@ -121,56 +137,57 @@ struct SessionMenu: View {
 
     // ── 常用操作 ──
 
-    private var tiles: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 84), spacing: 10)], spacing: 10) {
+    private func tiles(columns: Int, height: CGFloat) -> some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: columns), spacing: 10) {
             if !session.viewOnly {
-                tile("keyboard", L.t("menu_keyboard")) { actions.keyboard() }
+                tile("keyboard", L.t("menu_keyboard"), height: height) { actions.keyboard() }
             }
-            tile(session.audioOn ? "speaker.wave.2.fill" : "speaker.slash", L.t("menu_sound"), on: session.audioOn) {
+            tile(session.audioOn ? "speaker.wave.2.fill" : "speaker.slash", L.t("menu_sound"), on: session.audioOn, height: height) {
                 session.setAudio(!session.audioOn)
             }
             if let st = session.micState, !session.viewOnly {
-                tile(session.micOn ? "mic.fill" : "mic.slash", L.t("menu_mic"), on: session.micOn, dim: st != "ready" && !session.micOn) {
+                tile(session.micOn ? "mic.fill" : "mic.slash", L.t("menu_mic"), on: session.micOn,
+                     dim: st != "ready" && !session.micOn, height: height) {
                     session.setMic(!session.micOn)
                 }
             }
             if computer {
                 tile(ui.effectiveMode == "touch" ? "hand.point.up.left" : "rectangle.and.hand.point.up.left",
-                     ui.effectiveMode == "touch" ? L.t("mode_touch") : L.t("mode_trackpad")) {
+                     ui.effectiveMode == "touch" ? L.t("mode_touch") : L.t("mode_trackpad"), height: height) {
                     actions.mode(ui.effectiveMode == "touch" ? "trackpad" : "touch")
                 }
-                tile(session.mouseLock ? "lock.fill" : "lock.open", L.t("menu_mouse_lock"), on: session.mouseLock) {
+                tile(session.mouseLock ? "lock.fill" : "lock.open", L.t("menu_mouse_lock"), on: session.mouseLock, height: height) {
                     session.mouseLock.toggle()
                 }
             }
-            tile("arrow.down.right.and.arrow.up.left", L.t("menu_fit")) { actions.fit() }
-            if let r = actions.rotate { tile("rotate.right", L.t("menu_rotate"), action: r) }
+            tile("arrow.down.right.and.arrow.up.left", L.t("menu_fit"), height: height) { actions.fit() }
+            if let r = actions.rotate { tile("rotate.right", L.t("menu_rotate"), height: height, action: r) }
             if !session.viewOnly {
-                tile("doc.badge.arrow.up", L.t("menu_files")) { actions.files() }
+                tile("doc.badge.arrow.up", L.t("menu_files"), height: height) { actions.files() }
             }
-            tile("hand.raised", L.t("menu_help")) { actions.tips() }
-            tile("rectangle.portrait.and.arrow.forward", L.t("menu_minimize")) { actions.minimize() }
-            tile("xmark.circle.fill", L.t("disconnect"), tint: Theme.bad) { actions.disconnect() }
+            tile("hand.raised", L.t("menu_help"), height: height) { actions.tips() }
+            tile("rectangle.portrait.and.arrow.forward", L.t("menu_minimize"), height: height) { actions.minimize() }
+            tile("xmark.circle.fill", L.t("disconnect"), tint: Theme.bad, height: height) { actions.disconnect() }
         }
     }
 
     private func tile(_ icon: String, _ title: String, on: Bool = false, dim: Bool = false, tint: Color = Theme.text,
-                      action: @escaping () -> Void) -> some View {
-        Button {
+                      height: CGFloat, action: @escaping () -> Void) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
+        return Button {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             action()
         } label: {
-            VStack(spacing: 8) {
+            VStack(spacing: 6) {
                 Image(systemName: icon).font(.system(size: 20, weight: .semibold))
                     .foregroundStyle(on ? .white : tint)
                 Text(title).font(.caption.weight(.medium)).foregroundStyle(on ? .white : Theme.sub).lineLimit(1).minimumScaleFactor(0.7)
             }
-            .frame(maxWidth: .infinity, minHeight: 74)
+            .frame(maxWidth: .infinity, minHeight: height)
             .background {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(on ? AnyShapeStyle(Theme.gradient) : AnyShapeStyle(Theme.card))
+                GlassSurface(shape, tint: on ? Theme.c2.opacity(0.55) : nil)
             }
-            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Theme.stroke))
+            .contentShape(shape)
             .opacity(dim ? 0.5 : 1)
         }
         .buttonStyle(.plain)
@@ -209,20 +226,20 @@ struct SessionMenu: View {
                 }
             }
         }
-        .background(Theme.card, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Theme.stroke))
+        .background { GlassSurface(RoundedRectangle(cornerRadius: 20, style: .continuous)) }
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 
     private func row(_ icon: String, _ title: String, value: String? = nil) -> some View {
         HStack(spacing: 14) {
             Image(systemName: icon).font(.system(size: 17, weight: .semibold)).foregroundStyle(Theme.c3).frame(width: 24)
             Text(title).foregroundStyle(Theme.text)
-            Spacer()
+            Spacer(minLength: 8)
             if let value { Text(value).foregroundStyle(Theme.sub).font(.subheadline) }
             Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(Theme.faint)
         }
         .padding(.horizontal, 16)
-        .frame(minHeight: 52)
+        .frame(minHeight: 50)
         .contentShape(Rectangle())
     }
 }
@@ -276,7 +293,7 @@ struct ShortcutsPage: View {
             }
         }
         .scrollContentBackground(.hidden)
-        .background(Theme.bg)
+        .background(Theme.bg.opacity(0.55))
         .navigationTitle(L.t("menu_shortcuts"))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.visible, for: .navigationBar)
@@ -346,7 +363,7 @@ struct QualityPage: View {
             }
         }
         .scrollContentBackground(.hidden)
-        .background(Theme.bg)
+        .background(Theme.bg.opacity(0.55))
         .navigationTitle(L.t("menu_quality"))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.visible, for: .navigationBar)
@@ -368,7 +385,7 @@ struct ClipboardPage: View {
             }
         }
         .scrollContentBackground(.hidden)
-        .background(Theme.bg)
+        .background(Theme.bg.opacity(0.55))
         .navigationTitle(L.t("menu_clipboard"))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.visible, for: .navigationBar)
@@ -419,7 +436,7 @@ struct DisplaysPage: View {
             }
         }
         .scrollContentBackground(.hidden)
-        .background(Theme.bg)
+        .background(Theme.bg.opacity(0.55))
         .navigationTitle(L.t("menu_displays"))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.visible, for: .navigationBar)
@@ -453,7 +470,7 @@ struct PrivacyPage: View {
             }
         }
         .scrollContentBackground(.hidden)
-        .background(Theme.bg)
+        .background(Theme.bg.opacity(0.55))
         .navigationTitle(L.t("privacy_toggle"))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.visible, for: .navigationBar)
@@ -531,7 +548,7 @@ struct GamePage: View {
             }
         }
         .scrollContentBackground(.hidden)
-        .background(Theme.bg)
+        .background(Theme.bg.opacity(0.55))
         .navigationTitle(L.t("menu_game"))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.visible, for: .navigationBar)

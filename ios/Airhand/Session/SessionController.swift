@@ -957,13 +957,14 @@ final class SessionController: UIViewController, Gestures.Out, UIPointerInteract
             close: { [weak self] in self?.dismissThen {} }
         ))
         let host = UIHostingController(rootView: menu)
-        host.view.backgroundColor = UIColor(Theme.bg)
+        // 菜单自己是玻璃面板：宿主背景清空，sheet 透明后底下的远程画面才能透上来
+        host.view.backgroundColor = .clear
         host.overrideUserInterfaceStyle = .dark
         if let sheet = host.sheetPresentationController {
             sheet.detents = [.medium(), .large()]
             sheet.prefersGrabberVisible = true
             sheet.prefersScrollingExpandsWhenScrolledToEdge = true
-            sheet.preferredCornerRadius = 24
+            sheet.preferredCornerRadius = 28
         }
         host.presentationController?.delegate = self
         present(host, animated: true)
