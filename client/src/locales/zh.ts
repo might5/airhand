@@ -133,7 +133,7 @@ export default {
   "quality.enhance.hint": "在这台电脑的显卡上把画面放大得更清楚、锐化文字边缘，不增加带宽；太强会让压缩的痕迹更明显。对所有连接生效",
   "quality.fps": "帧率",
   "quality.displayHz": "刷新率",
-  "quality.displayHzHint": "被控端虚拟显示器的刷新率：「自动」跟着帧率走（不低于 30Hz）；也可以固定一档。只有 macOS 合盖补屏时用得上，实际能到多少看对方显示器支持",
+  "quality.displayHzHint": "被控端虚拟显示器的刷新率：「自动」跟着帧率走（不低于 50Hz）；也可以固定一档。只有 macOS 合盖补屏时用得上，实际能到多少看对方显示器支持",
   "quality.auto": "自动",
   "quality.bitrate": "码率上限",
   "quality.idleHint": "画面静止时几乎不占带宽",

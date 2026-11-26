@@ -125,7 +125,7 @@ const en: Record<MsgKey, Msg> = {
   "quality.enhance.hint": "Upscales the picture on this computer's GPU with a sharper filter and sharpens text edges, with no extra bandwidth. Strong settings also make compression artifacts more visible. Applies to all connections",
   "quality.fps": "Frame rate",
   "quality.displayHz": "Refresh rate",
-  "quality.displayHzHint": "Refresh rate of the host's virtual display: \"Auto\" follows the frame rate (never below 30Hz), or pin it to one step. Only used for the macOS virtual display; what you actually get depends on the host's display",
+  "quality.displayHzHint": "Refresh rate of the host's virtual display: \"Auto\" follows the frame rate (never below 50Hz), or pin it to one step. Only used for the macOS virtual display; what you actually get depends on the host's display",
   "quality.auto": "Auto",
   "quality.bitrate": "Max bitrate",
   "quality.idleHint": "Almost no bandwidth when the screen is still",

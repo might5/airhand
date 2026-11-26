@@ -89,6 +89,19 @@ static double select_mode(CGDirectDisplayID display, uint32_t width, uint32_t he
     return picked;
 }
 
+// 只注册一个模式并让它生效。合成节拍（WindowServer 多久更新一次这块屏）跟的是 modes 的**第一个**元素，
+// 不是当前选中的那一个：注册 [30,60,90,120] 时不管切到 60/90/120，采集都只有 30 帧；只放一档（或把目标档
+// 放在首位）节拍才跟着走。建屏和换档都走这里。
+static BOOL apply_single_mode(CGVirtualDisplay *virtualDisplay, uint32_t width, uint32_t height,
+                              int hidpi, double hz) {
+    CGVirtualDisplayMode *mode = [[modeClass() alloc] initWithWidth:width height:height refreshRate:hz];
+    if (!mode) return NO;
+    CGVirtualDisplaySettings *settings = [[settingsClass() alloc] init];
+    settings.modes = @[(CGVirtualDisplayMode *)mode];
+    settings.hiDPI = hidpi ? 1 : 0;
+    return [virtualDisplay applySettings:settings];
+}
+
 int ah_vd_supported(void) {
     Class d = descriptorClass(), m = modeClass(), s = settingsClass(), v = displayClass();
     return d && m && s && v &&
@@ -104,14 +117,12 @@ int ah_vd_supported(void) {
            [v instancesRespondToSelector:@selector(displayID)];
 }
 
-// `width` x `height`: points when `hidpi` (the frame buffer is twice as large), pixels otherwise. Registers one
-// mode per entry of `rates` (all the same size, different refresh rates), and starts on the one closest to `hz`
-// so that ah_vd_set_refresh_rate can switch between them later.
+// `width` x `height`: points when `hidpi` (the frame buffer is twice as large), pixels otherwise. Only `hz` is
+// registered (see apply_single_mode); ah_vd_set_refresh_rate replaces it later without rebuilding the display.
 // Returns the display (retained: it exists until ah_vd_destroy) and its CGDirectDisplayID in `display`.
 void *ah_vd_create(uint32_t width, uint32_t height, int hidpi, double hz,
-                   const double *rates, int rate_count, double mm_w, double mm_h,
-                   uint32_t vendor, uint32_t product, uint32_t serial, const char *name,
-                   uint32_t *display, char *error, size_t size) {
+                   double mm_w, double mm_h, uint32_t vendor, uint32_t product, uint32_t serial,
+                   const char *name, uint32_t *display, char *error, size_t size) {
     @autoreleasepool {
         *display = kCGNullDirectDisplay;
         if (!ah_vd_supported()) return failure(error, size, @"this macOS has no usable CGVirtualDisplay");
@@ -136,22 +147,7 @@ void *ah_vd_create(uint32_t width, uint32_t height, int hidpi, double hz,
 
             CGVirtualDisplay *virtualDisplay = [[displayClass() alloc] initWithDescriptor:descriptor];
             if (!virtualDisplay) return failure(error, size, @"CGVirtualDisplay refused the descriptor");
-            NSMutableArray *modes = [NSMutableArray array];
-            for (int i = 0; i < rate_count; i++) {
-                CGVirtualDisplayMode *mode =
-                    [[modeClass() alloc] initWithWidth:width height:height refreshRate:rates[i]];
-                if (mode) [modes addObject:mode];
-            }
-            if (modes.count == 0) {
-                CGVirtualDisplayMode *mode =
-                    [[modeClass() alloc] initWithWidth:width height:height refreshRate:hz];
-                if (!mode) return failure(error, size, @"CGVirtualDisplayMode refused the mode");
-                [modes addObject:mode];
-            }
-            CGVirtualDisplaySettings *settings = [[settingsClass() alloc] init];
-            settings.modes = modes;
-            settings.hiDPI = hidpi ? 1 : 0;
-            if (![virtualDisplay applySettings:settings])
+            if (!apply_single_mode(virtualDisplay, width, height, hidpi, hz))
                 return failure(error, size, @"CGVirtualDisplay refused the settings");
             *display = virtualDisplay.displayID;
             // applySettings picks a mode itself (usually the fastest one registered): put it back on the
@@ -165,9 +161,11 @@ void *ah_vd_create(uint32_t width, uint32_t height, int hidpi, double hz,
     }
 }
 
-// Switch a display made by ah_vd_create to another of its registered refresh rates (see ah_vd_create).
+// Switch a display made by ah_vd_create to another refresh rate: replace its only mode and apply the settings
+// again. The display itself is kept (same CGDirectDisplayID, so the arrangement and the windows' places stay),
+// and this takes effect at once — measured 50 -> 47.7 fps, then 75 -> 74.7 fps on the same display.
 // Returns the refresh rate now in use, or -1 (reason in `error`).
-double ah_vd_set_refresh_rate(void *display, uint32_t width, uint32_t height, double hz,
+double ah_vd_set_refresh_rate(void *display, uint32_t width, uint32_t height, int hidpi, double hz,
                              char *error, size_t size) {
     @autoreleasepool {
         if (!display) {
@@ -175,7 +173,19 @@ double ah_vd_set_refresh_rate(void *display, uint32_t width, uint32_t height, do
             return -1;
         }
         CGVirtualDisplay *virtualDisplay = (__bridge CGVirtualDisplay *)display;
-        return select_mode(virtualDisplay.displayID, width, height, hz, error, size);
+        if (!apply_single_mode(virtualDisplay, width, height, hidpi, hz)) {
+            snprintf(error, size, "CGVirtualDisplay refused %g Hz", hz);
+            return -1;
+        }
+        char ignored[128];
+        select_mode(virtualDisplay.displayID, width, height, hz, ignored, sizeof ignored);
+        double got = -1;
+        CGDisplayModeRef now = CGDisplayCopyDisplayMode(virtualDisplay.displayID);
+        if (now) {
+            got = CGDisplayModeGetRefreshRate(now);
+            CFRelease(now);
+        }
+        return got > 0 ? got : hz;
     }
 }
 
