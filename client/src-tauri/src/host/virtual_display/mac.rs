@@ -352,8 +352,9 @@ impl VirtualDisplay {
         })
     }
 
-    /// 控制端改了刷新率（或者改了帧率，自动档跟着变）：换到该用的那一档，不用重建这块屏——只把这块屏的
-    /// 模式换成新的一档再 `applySettings`（见 `mac.m` 的 `apply_single_mode`），displayID 不变。
+    /// 控制端改了刷新率（或者改了帧率，自动档跟着变）：换到该用的那一档，不用重建这块屏——把这档排到
+    /// 注册模式的首位再 `applySettings`，其余档补回去（见 `mac.m` 的 `apply_modes`），displayID 不变。
+    /// 系统设置 → 显示器 里能挑刷新率，靠的就是建屏时把 [`HZ_RATES`] 全注册上。
     ///
     /// 镜像着内建的显示器时不换：实测在镜像里换模式（`applySettings`）内建的显示器会一直撕裂，换模式
     /// （`CGConfigureDisplayWithDisplayMode`）走的是同一条显示器配置，冒不起这个险——开着盖子照着本机屏幕用的
