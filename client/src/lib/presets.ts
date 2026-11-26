@@ -5,16 +5,23 @@ export type PresetId = "saver" | "balanced" | "smooth" | "hd" | "native";
 
 export interface Preset {
   id: PresetId;
-  settings: Omit<QualitySettings, "codec">;
+  settings: Omit<QualitySettings, "codec" | "fps">;
 }
+
+/**
+ * 帧率不再由画质面板定：客户端只提一个上限，实际帧率由被控端显示器自己跑的那一档决定
+ * （虚拟屏的刷新率在被控端 系统设置 → 显示器 里挑）。取最高档，屏幕降低了刷新率
+ * 采集自然按屏的节拍投帧，不会把画面卡在更低的档上。
+ */
+export const FPS = 120;
 
 /** 预设：从省流到原画。码率是上限，画面静止时几乎不占带宽。名称与说明见 i18n.ts 的 preset.* */
 export const PRESETS: Preset[] = [
-  { id: "saver", settings: { fps: 24, bitrateKbps: 1200, maxShort: 720, adaptive: true } },
-  { id: "balanced", settings: { fps: 30, bitrateKbps: 4000, maxShort: 1080, adaptive: true } },
-  { id: "smooth", settings: { fps: 60, bitrateKbps: 8000, maxShort: 1080, adaptive: true } },
-  { id: "hd", settings: { fps: 60, bitrateKbps: 16000, maxShort: 1440, adaptive: true } },
-  { id: "native", settings: { fps: 60, bitrateKbps: 30000, maxShort: 0, adaptive: true } },
+  { id: "saver", settings: { bitrateKbps: 1200, maxShort: 720, adaptive: true } },
+  { id: "balanced", settings: { bitrateKbps: 4000, maxShort: 1080, adaptive: true } },
+  { id: "smooth", settings: { bitrateKbps: 8000, maxShort: 1080, adaptive: true } },
+  { id: "hd", settings: { bitrateKbps: 16000, maxShort: 1440, adaptive: true } },
+  { id: "native", settings: { bitrateKbps: 30000, maxShort: 0, adaptive: true } },
 ];
 
 export const DEFAULT_PRESET: PresetId = "balanced";
@@ -25,16 +32,13 @@ export const codecHint = (c: Codec) => t(`codec.hint.${c}`);
 
 export function presetSettings(id: PresetId, codec: Codec): QualitySettings {
   const p = PRESETS.find((p) => p.id === id) ?? PRESETS[1];
-  return { ...p.settings, codec };
+  return { ...p.settings, fps: FPS, codec };
 }
 
-/** 判断当前设置是否与某个预设一致 */
+/** 判断当前设置是否与某个预设一致（帧率跟着被控端的显示器走，不参与判断） */
 export function matchPreset(s: QualitySettings): PresetId | null {
   const p = PRESETS.find(
-    (p) =>
-      p.settings.fps === s.fps &&
-      p.settings.bitrateKbps === s.bitrateKbps &&
-      p.settings.maxShort === s.maxShort,
+    (p) => p.settings.bitrateKbps === s.bitrateKbps && p.settings.maxShort === s.maxShort,
   );
   return p?.id ?? null;
 }

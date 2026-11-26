@@ -30,8 +30,11 @@ use super::capture::{self, Frame};
 use super::cursor::{Reported, SharedCursor};
 use super::encoder::{Encoder, LtrControl};
 use super::pace::Pacer;
-use super::virtual_display;
 
+/// 采集与节流的帧率上限：控制端不再提供帧率选项，屏上跑多少帧就出多少帧。
+/// ScreenCaptureKit 的 `minimumFrameInterval` 只封顶不补帧，所以这里给到最高档（120）之后，
+/// 虚拟屏在 系统设置 → 显示器 里选 75 就出 75 帧、选 90 就出 90 帧（实测 75 档稳定 75.0fps）
+const CAPTURE_FPS: u8 = 120;
 /// 画面停下来之后，同一帧最多再编这么多次
 const REFINE_FRAMES: u8 = 8;
 /// 画面静止这么久之后才开始补：画面还在连续变化（打字、播放）时不和新画面抢编码器
@@ -189,12 +192,11 @@ fn drop_encoder(enc: &mut Option<Encoder>) {
 fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
     capture::raise_priority();
     let mut settings = *ctrl.settings.lock().unwrap();
-    // 补屏的虚拟显示器建屏那一档刷新率按控制端的帧率走（见 virtual_display::set_quality）
-    virtual_display::set_quality(settings.fps);
+    // 刷新率不跟控制端走：虚拟屏建屏后注册了全部档位，用哪一档由被控端 系统设置 → 显示器 决定
     let mut ver = ctrl.settings_ver.load(Ordering::Acquire);
     // 控制端的游戏模式要光标画进画面：读带光标的那一路（见 capture 的"带光标的画面"）
     let mut draw = settings.draw_cursor;
-    let mut sub = capture::subscribe(screen, settings.fps, settings.max_short, draw);
+    let mut sub = capture::subscribe(screen, CAPTURE_FPS, settings.max_short, draw);
     let mut enc: Option<Encoder> = None;
     // 硬件编码器连续失败时改用软件编码；GPU 零拷贝连续失败时硬件编码器改用内存里的画面
     let mut hw_failures = 0u32;
@@ -203,7 +205,7 @@ fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out:
     // 光标有变化还没发出去（大块通道的队列满了）：下一轮再发最新的
     let mut cursor_pending = false;
     let mut last_frame: Option<Arc<Frame>> = None;
-    let mut pacer = Pacer::new(settings.fps);
+    let mut pacer = Pacer::new(CAPTURE_FPS);
     // 码率估计属于会话（换显示器重建管线时接着用），画质设置里的码率是上限
     ctrl.flow
         .set_target(settings.bitrate_kbps, settings.adaptive);
@@ -237,14 +239,13 @@ fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out:
                     ctrl.force_key.store(true, Ordering::Release);
                 }
                 draw = settings.draw_cursor;
-                sub = capture::subscribe(screen, settings.fps, settings.max_short, draw);
+                sub = capture::subscribe(screen, CAPTURE_FPS, settings.max_short, draw);
                 (frame_seq, cursor_seq, shape_seq) = (0, 0, 0);
                 last_frame = None;
                 refine_left = 0;
             }
-            sub.set_fps(settings.fps);
-            pacer.set_fps(settings.fps);
-            virtual_display::set_quality(settings.fps);
+            sub.set_fps(CAPTURE_FPS);
+            pacer.set_fps(CAPTURE_FPS);
             ctrl.flow
                 .set_target(settings.bitrate_kbps, settings.adaptive);
             if let Some(e) = &mut enc {
@@ -340,7 +341,7 @@ fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out:
         // 在途控制：网络跟不上时在这里等待（期间新的画面会覆盖旧画面，不会排队）
         while !ctrl
             .flow
-            .wait_window(settings.fps, &ctrl.stop, Duration::from_millis(50))
+            .wait_window(CAPTURE_FPS, &ctrl.stop, Duration::from_millis(50))
         {
             if ctrl.stop.load(Ordering::Acquire) {
                 return;

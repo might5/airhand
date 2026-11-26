@@ -99,15 +99,15 @@ export default {
 
   // 画质预设
   "preset.saver": "省流",
-  "preset.saver.desc": "720p · 24fps · 1.2 Mbps，适合移动网络",
+  "preset.saver.desc": "720p · 1.2 Mbps，适合移动网络",
   "preset.balanced": "均衡",
-  "preset.balanced.desc": "1080p · 30fps · 4 Mbps，办公首选",
+  "preset.balanced.desc": "1080p · 4 Mbps，办公首选",
   "preset.smooth": "流畅",
-  "preset.smooth.desc": "1080p · 60fps · 8 Mbps，滚动与动画更顺滑",
+  "preset.smooth.desc": "1080p · 8 Mbps，滚动与动画更顺滑",
   "preset.hd": "高清",
-  "preset.hd.desc": "1440p · 60fps · 16 Mbps，设计/看图",
+  "preset.hd.desc": "1440p · 16 Mbps，设计/看图",
   "preset.native": "原画",
-  "preset.native.desc": "原始分辨率 · 60fps · 30 Mbps，局域网",
+  "preset.native.desc": "原始分辨率 · 30 Mbps，局域网",
 
   "codec.hint.h264": "兼容性最好",
   "codec.hint.h265": "同画质省 30~40% 带宽",
@@ -131,7 +131,6 @@ export default {
   "quality.enhance.medium": "中",
   "quality.enhance.high": "强",
   "quality.enhance.hint": "在这台电脑的显卡上把画面放大得更清楚、锐化文字边缘，不增加带宽；太强会让压缩的痕迹更明显。对所有连接生效",
-  "quality.fps": "帧率",
   "quality.auto": "自动",
   "quality.bitrate": "码率上限",
   "quality.idleHint": "画面静止时几乎不占带宽",

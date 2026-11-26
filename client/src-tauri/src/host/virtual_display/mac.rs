@@ -72,13 +72,14 @@ const RETRY: Duration = Duration::from_secs(10);
 const STARTING: Duration = Duration::from_millis(100);
 /// 打开防窥之后这么久黑窗口还没盖上（主线程没处理），就算没能打开
 const COVER_WAIT: Duration = Duration::from_secs(5);
-/// 虚拟显示器的刷新率档位：私有接口实测建得出来、也切得动（控制端的手动档就落在这几档里，见 [`wanted_hz`]）。
-/// 屏上只注册当前这一档：合成节拍跟的是 `modes` 的第一个元素而不是当前选中的模式，一次注册多档时（不管切到
-/// 哪一档）节拍都按最低那档走——实测注册 [30,60,90,120] 时 60/90/120 都只有 30 帧。换档走
+/// 虚拟显示器的刷新率档位：全部注册进 `settings.modes`，系统设置 → 显示器 里就能挑（多档才出选单）。
+/// 合成节拍跟的是**当前选中的那一档**，不是 `modes` 的第一个元素（实测：Crisp 的虚拟屏注册 50/60/75，
+/// 选中 75 时 ScreenCaptureKit 稳定采到 75.0fps、p99 间隔 13.33ms）。换档走
 /// [`VirtualDisplay::sync_refresh_rate`]，只替换模式、不重建屏
 const HZ_RATES: [f64; 5] = [50.0, 60.0, 75.0, 90.0, 120.0];
-/// 还没有控制端的设置在用时建屏用的刷新率（[`HzWant::default`] 的自动档算出来也是它）
-const HZ: f64 = 60.0;
+/// 建屏用的刷新率（[`HzWant::default`] 算出来也是它）：取最高档。刷新率由被控端
+/// 系统设置 → 显示器 决定（客户端不再提要求），这里只是建屏那一刻的默认值
+const HZ: f64 = 120.0;
 /// 自动档的刷新率不低于它：屏太慢，控制端操作起来一卡一卡的
 const HZ_MIN: f64 = HZ_RATES[0];
 /// 虚拟显示器的身份（"AH"、"vd"）：一直一样，macOS 按它记住排列和窗口的位置
@@ -142,11 +143,11 @@ struct HzWant {
 
 impl Default for HzWant {
     fn default() -> Self {
-        Self { fps: 60, epoch: 0 }
+        Self { fps: 120, epoch: 0 }
     }
 }
 
-static HZ_WANT: Mutex<HzWant> = Mutex::new(HzWant { fps: 60, epoch: 0 });
+static HZ_WANT: Mutex<HzWant> = Mutex::new(HzWant { fps: 120, epoch: 0 });
 
 /// 现在该用的刷新率和控制端的要求序号
 fn wanted() -> (f64, u64) {
@@ -175,8 +176,11 @@ fn nearest_hz(hz: f64) -> f64 {
         .unwrap_or(HZ)
 }
 
-/// 控制端的画质设置（见 `airhand_proto::session::QualitySettings`）：虚拟显示器的刷新率跟着它走，
-/// 已经在补屏的那块下一轮就换（见 [`VirtualDisplay::sync_refresh_rate`]）
+/// 改虚拟显示器的刷新率（[`VirtualDisplay::sync_refresh_rate`] 会跟上）。
+///
+/// 控制端已经不再提这个要求（画质面板没有帧率/刷新率选项了，见 pipeline 的 `CAPTURE_FPS`）：建屏后
+/// 用哪一档由被控端 系统设置 → 显示器 决定，这里留着给测试和命令行用。
+#[allow(dead_code)]
 pub(super) fn set_quality(fps: u8) {
     let mut want = HZ_WANT.lock().unwrap();
     if want.fps != fps {

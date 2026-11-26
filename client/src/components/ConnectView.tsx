@@ -8,7 +8,7 @@ import { deviceTitle, matchDevice, relativeTime } from "../lib/devices";
 import { getLang, useT } from "../lib/i18n";
 import { problemText, sessionStateText } from "../lib/messages";
 import { bestCodec } from "../lib/codec";
-import { CODEC_LABEL, PRESETS, matchPreset, presetDesc, presetName, presetSettings } from "../lib/presets";
+import { CODEC_LABEL, FPS, PRESETS, matchPreset, presetDesc, presetName, presetSettings } from "../lib/presets";
 import type { RemoteSession } from "../lib/session";
 import { store, useSession, useStore, type Draft } from "../lib/store";
 
@@ -83,8 +83,9 @@ export function ConnectView() {
     void openSession(code, presetSettings(preset, codec), { pairing: pairingReady ? pairing : null });
   };
 
-  /** 我的设备：用上次的画质连（没记下画质的用默认预设） */
-  const openDevice = (d: SavedDevice) => void openSession(d.code, d.quality ?? presetSettings(preset, codec));
+  /** 我的设备：用上次的画质连（没记下画质的用默认预设）。帧率不跟着上次存的值走（见 presets.FPS） */
+  const openDevice = (d: SavedDevice) =>
+    void openSession(d.code, d.quality ? { ...d.quality, fps: FPS } : presetSettings(preset, codec));
 
   return (
     <div className="newtab">
