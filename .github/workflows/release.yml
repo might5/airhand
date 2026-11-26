@@ -216,7 +216,6 @@ jobs:
 
   macos:
     name: macOS ${{ matrix.arch }}
-    if: false  # 本次只跑 iOS，其余平台临时跳过
     needs: prepare
     strategy:
       fail-fast: false
@@ -549,7 +548,7 @@ jobs:
 
   release:
     name: Publish
-    needs: [prepare, ios]
+    needs: [prepare, ios, macos]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
