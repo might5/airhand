@@ -30,6 +30,7 @@ use super::capture::{self, Frame};
 use super::cursor::{Reported, SharedCursor};
 use super::encoder::{Encoder, LtrControl};
 use super::pace::Pacer;
+use super::virtual_display;
 
 /// 画面停下来之后，同一帧最多再编这么多次
 const REFINE_FRAMES: u8 = 8;
@@ -188,6 +189,8 @@ fn drop_encoder(enc: &mut Option<Encoder>) {
 fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
     capture::raise_priority();
     let mut settings = *ctrl.settings.lock().unwrap();
+    // 补屏的虚拟显示器按控制端的帧率、刷新率走（见 virtual_display::set_quality）
+    virtual_display::set_quality(settings.fps, settings.display_hz);
     let mut ver = ctrl.settings_ver.load(Ordering::Acquire);
     // 控制端的游戏模式要光标画进画面：读带光标的那一路（见 capture 的"带光标的画面"）
     let mut draw = settings.draw_cursor;
@@ -241,6 +244,7 @@ fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out:
             }
             sub.set_fps(settings.fps);
             pacer.set_fps(settings.fps);
+            virtual_display::set_quality(settings.fps, settings.display_hz);
             ctrl.flow
                 .set_target(settings.bitrate_kbps, settings.adaptive);
             if let Some(e) = &mut enc {

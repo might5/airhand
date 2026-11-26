@@ -346,6 +346,15 @@ pub fn set_ready(on: bool) {
     w.poke();
 }
 
+/// 控制端的画质设置（最大帧率、虚拟显示器的刷新率，见 `airhand_proto::session::QualitySettings`）：
+/// macOS 补屏的那块虚拟显示器跟着换刷新率（刷新率 0 是自动，跟着帧率走），别的平台什么也不做
+pub fn set_quality(fps: u8, display_hz: u8) {
+    #[cfg(target_os = "macos")]
+    mac::set_quality(fps, display_hz);
+    #[cfg(not(target_os = "macos"))]
+    let _ = (fps, display_hz);
+}
+
 /// 本进程补屏的虚拟显示器的像素大小（macOS，见 [`mac`]）；`id` 不是它时为 `None`
 #[cfg(target_os = "macos")]
 pub fn pixels(id: u32) -> Option<(u32, u32)> {

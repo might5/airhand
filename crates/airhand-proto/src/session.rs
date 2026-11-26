@@ -808,6 +808,12 @@ pub struct QualitySettings {
     #[cbor(n(5), skip_if = "is_false")]
     #[serde(default)]
     pub draw_cursor: bool,
+    /// 被控端虚拟显示器（macOS 补屏的那块）的刷新率，Hz：0（默认）自动跟着 [`QualitySettings::fps`] 走，
+    /// 否则固定在这一档（私有接口实测能建到 120，见 `host::virtual_display::mac`）。
+    /// 只有 macOS 的虚拟显示器用得到，其余平台、真显示器都不理它；自动（0）不写进线上的数组
+    #[cbor(n(6), skip_if = "is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub display_hz: u8,
 }
 
 /// 默认是 false 的开关不写进线上的数组（光标、介绍里的防窥模式）
@@ -824,6 +830,7 @@ impl Default for QualitySettings {
             adaptive: true,
             codec: Codec::H264,
             draw_cursor: false,
+            display_hz: 0,
         }
     }
 }
@@ -834,6 +841,12 @@ impl QualitySettings {
         self.fps = self.fps.clamp(1, 120);
         self.bitrate_kbps = self.bitrate_kbps.clamp(100, 100_000);
         self.codec = self.codec.or_h264();
+        // 刷新率：0 是自动；认不出的档（0..24、120 以上）当自动
+        self.display_hz = if (24..=120).contains(&self.display_hz) {
+            self.display_hz
+        } else {
+            0
+        };
         self
     }
 }
@@ -1190,6 +1203,7 @@ mod tests {
     fn json_is_camel_case() {
         use serde_json::json;
         let q = QualitySettings {
+            display_hz: 0,
             fps: 60,
             bitrate_kbps: 8000,
             max_short: 1080,

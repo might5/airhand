@@ -72,8 +72,13 @@ const RETRY: Duration = Duration::from_secs(10);
 const STARTING: Duration = Duration::from_millis(100);
 /// 打开防窥之后这么久黑窗口还没盖上（主线程没处理），就算没能打开
 const COVER_WAIT: Duration = Duration::from_secs(5);
-/// 刷新率：私有接口最高 60
+/// 虚拟显示器的刷新率档位：私有接口实测建得出来、也切得动（控制端的手动档就落在这几档里，见 [`wanted_hz`]）。
+/// 建屏时一次全注册上，之后换档只是换 mode，不用重建（见 [`VirtualDisplay::sync_refresh_rate`]）
+const HZ_RATES: [f64; 4] = [30.0, 60.0, 90.0, 120.0];
+/// 还没有控制端的设置在用时建屏用的刷新率（[`HzWant::default`] 的自动档算出来也是它）
 const HZ: f64 = 60.0;
+/// 自动档的刷新率不低于它：屏太慢，控制端操作起来一卡一卡的
+const HZ_MIN: f64 = HZ_RATES[0];
 /// 虚拟显示器的身份（"AH"、"vd"）：一直一样，macOS 按它记住排列和窗口的位置
 const VENDOR: u32 = 0x4148;
 const PRODUCT: u32 = 0x7664;
@@ -83,11 +88,14 @@ const SERIAL: u32 = if cfg!(test) { 0x7e57 } else { 1 };
 
 unsafe extern "C" {
     fn ah_vd_supported() -> c_int;
+    #[allow(clippy::too_many_arguments)]
     fn ah_vd_create(
         width: u32,
         height: u32,
         hidpi: c_int,
         hz: f64,
+        rates: *const f64,
+        rate_count: c_int,
         mm_w: f64,
         mm_h: f64,
         vendor: u32,
@@ -99,6 +107,14 @@ unsafe extern "C" {
         len: usize,
     ) -> *mut c_void;
     fn ah_vd_destroy(display: *mut c_void);
+    fn ah_vd_set_refresh_rate(
+        display: *mut c_void,
+        width: u32,
+        height: u32,
+        hz: f64,
+        error: *mut c_char,
+        len: usize,
+    ) -> f64;
     fn ah_vd_mirror(display: u32, of: u32) -> i32;
 }
 
@@ -109,6 +125,62 @@ fn mirror(id: CGDirectDisplayID, of: CGDirectDisplayID) {
         info!(id, of, "virtual display mirroring");
     } else {
         warn!(id, of, "can't mirror the virtual display: CGError {r}");
+    }
+}
+
+/// 控制端要的虚拟显示器刷新率：手动档（1..=120）就用它，0（默认）是自动、跟着帧率走（不低于 [`HZ_MIN`]）。
+/// 档位落在 [`HZ_RATES`] 里最近的一档上：屏上只有注册过的模式能换
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HzWant {
+    /// 控制端要的最大帧率（自动档跟着它）
+    fps: u8,
+    /// 控制端选的刷新率，0 是自动
+    display_hz: u8,
+}
+
+impl Default for HzWant {
+    fn default() -> Self {
+        Self {
+            fps: 60,
+            display_hz: 0,
+        }
+    }
+}
+
+static HZ_WANT: Mutex<HzWant> = Mutex::new(HzWant {
+    fps: 60,
+    display_hz: 0,
+});
+
+/// 现在该用的刷新率
+fn wanted_hz() -> f64 {
+    let want = *HZ_WANT.lock().unwrap();
+    let hz = if want.display_hz == 0 {
+        f64::from(want.fps).clamp(HZ_MIN, *HZ_RATES.last().unwrap())
+    } else {
+        f64::from(want.display_hz).clamp(HZ_MIN, *HZ_RATES.last().unwrap())
+    };
+    nearest_hz(hz)
+}
+
+/// 注册过的档位里离 `hz` 最近的一档：只有注册过的模式能换，离得远也比没得换好
+fn nearest_hz(hz: f64) -> f64 {
+    HZ_RATES
+        .iter()
+        .copied()
+        .min_by(|a, b| (a - hz).abs().total_cmp(&(b - hz).abs()))
+        .unwrap_or(HZ)
+}
+
+/// 控制端的画质设置（见 `airhand_proto::session::QualitySettings`）：虚拟显示器的刷新率跟着它走，
+/// 已经在补屏的那块下一轮就换（见 [`VirtualDisplay::sync_refresh_rate`]）
+pub(super) fn set_quality(fps: u8, display_hz: u8) {
+    let mut want = HZ_WANT.lock().unwrap();
+    if *want != (HzWant { fps, display_hz }) {
+        *want = HzWant { fps, display_hz };
+        drop(want);
+        // 叫醒管理线程：不用等下一次 WATCH
+        HUB.wants.lock().unwrap().poke();
     }
 }
 
@@ -231,6 +303,10 @@ fn orient<T: PartialOrd>((w, h): (T, T), portrait: bool) -> (T, T) {
 struct VirtualDisplay {
     handle: NonNull<c_void>,
     id: CGDirectDisplayID,
+    /// 点大小（换刷新率时按它找模式）
+    size: (u32, u32),
+    /// 现在的刷新率（Hz）
+    hz: f64,
 }
 
 // 只是一个 Objective-C 对象的引用，在哪个线程上释放都行
@@ -240,12 +316,15 @@ impl VirtualDisplay {
     fn create(shape: Shape) -> Result<Self> {
         let mut id = 0;
         let mut error = [0 as c_char; 256];
+        let hz = wanted_hz();
         let handle = unsafe {
             ah_vd_create(
                 shape.width,
                 shape.height,
                 shape.hidpi as c_int,
-                HZ,
+                hz,
+                HZ_RATES.as_ptr(),
+                HZ_RATES.len() as c_int,
                 shape.mm.0,
                 shape.mm.1,
                 VENDOR,
@@ -263,7 +342,48 @@ impl VirtualDisplay {
         };
         let (pw, ph) = shape.pixels();
         *CURRENT.lock().unwrap() = Some((id, pw, ph));
-        Ok(Self { handle, id })
+        Ok(Self {
+            handle,
+            id,
+            size: (shape.width, shape.height),
+            hz,
+        })
+    }
+
+    /// 控制端改了刷新率（或者改了帧率，自动档跟着变）：换到该用的那一档，不用重建这块屏。
+    ///
+    /// 镜像着内建的显示器时不换：实测在镜像里换模式（`applySettings`）内建的显示器会一直撕裂，换模式
+    /// （`CGConfigureDisplayWithDisplayMode`）走的是同一条显示器配置，冒不起这个险——开着盖子照着本机屏幕用的
+    /// 时候就还按建屏时的那一档，合上盖子（不镜像了）之后自动跟上。
+    fn sync_refresh_rate(&mut self) {
+        let hz = wanted_hz();
+        if (self.hz - hz).abs() < 0.5 {
+            return;
+        }
+        if CGDisplayMirrorsDisplay(self.id) != 0 {
+            info!(hz, "virtual display: leaving the refresh rate alone while it is mirrored");
+            return;
+        }
+        let mut error = [0 as c_char; 128];
+        let got = unsafe {
+            ah_vd_set_refresh_rate(
+                self.handle.as_ptr(),
+                self.size.0,
+                self.size.1,
+                hz,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if got < 0.0 {
+            let msg = unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
+            warn!(hz, "can't change the virtual display's refresh rate: {msg}");
+            // 记下来不重试：省得每一轮都试一遍、刷屏
+            self.hz = hz;
+            return;
+        }
+        info!(hz = got, "virtual display refresh rate");
+        self.hz = got;
     }
 }
 
@@ -369,6 +489,10 @@ fn run() {
             (w.sessions(now), w.ready, w.stopping, privacy)
         };
         follow_privacy(&mut curtain, privacy, now);
+        // 控制端改了刷新率、改了帧率：已经在补屏的那块跟着换（不重建，见 VirtualDisplay::sync_refresh_rate）
+        if let Some(f) = &mut filling {
+            f.display.sync_refresh_rate();
+        }
         let ours = filling.as_ref().map(|f| f.display.id);
         let lid_state = macos::lid_state();
         let lid = lid_state == Some(true);
@@ -534,6 +658,38 @@ fn wait(period: Duration) {
             .0;
     }
     w.poked = false;
+}
+
+#[cfg(test)]
+mod hz_tests {
+    use super::*;
+
+    #[test]
+    fn the_refresh_rate_lands_on_a_registered_step() {
+        assert_eq!(nearest_hz(120.0), 120.0);
+        assert_eq!(nearest_hz(144.0), 120.0);
+        assert_eq!(nearest_hz(75.0), 60.0);
+        assert_eq!(nearest_hz(15.0), 30.0);
+        // 自动档跟着帧率走，不低于 30
+        *HZ_WANT.lock().unwrap() = HzWant {
+            fps: 120,
+            display_hz: 0,
+        };
+        assert_eq!(wanted_hz(), 120.0);
+        *HZ_WANT.lock().unwrap() = HzWant {
+            fps: 15,
+            display_hz: 0,
+        };
+        assert_eq!(wanted_hz(), 30.0);
+        // 手动档就用它
+        *HZ_WANT.lock().unwrap() = HzWant {
+            fps: 15,
+            display_hz: 90,
+        };
+        assert_eq!(wanted_hz(), 90.0);
+        *HZ_WANT.lock().unwrap() = HzWant::default();
+        assert_eq!(wanted_hz(), HZ);
+    }
 }
 
 #[cfg(test)]

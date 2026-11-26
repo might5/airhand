@@ -4,6 +4,7 @@
 // time and checked before use: if a macOS release changes them we report an error instead of crashing.
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
+#include <math.h>
 #include <stdio.h>
 
 @interface CGVirtualDisplayDescriptor : NSObject
@@ -42,6 +43,52 @@ static void *failure(char *error, size_t size, NSString *what) {
     return NULL;
 }
 
+// Switch `display` to the registered mode closest to `hz` (same point size), for this login session.
+// The modes are registered up front (see ah_vd_create): picking another one is a plain display
+// reconfiguration, not applySettings again (which would tear the built-in display while mirrored).
+// Returns the refresh rate now in use, or -1 (reason in `error`).
+static double select_mode(CGDirectDisplayID display, uint32_t width, uint32_t height, double hz,
+                          char *error, size_t size) {
+    CFArrayRef all = CGDisplayCopyAllDisplayModes(display, NULL);
+    if (!all) {
+        snprintf(error, size, "CGDisplayCopyAllDisplayModes: no modes");
+        return -1;
+    }
+    CGDisplayModeRef best = NULL;
+    double best_diff = -1;
+    for (CFIndex i = 0; i < CFArrayGetCount(all); i++) {
+        CGDisplayModeRef mode = (CGDisplayModeRef)CFArrayGetValueAtIndex(all, i);
+        if (CGDisplayModeGetWidth(mode) != width || CGDisplayModeGetHeight(mode) != height) continue;
+        double diff = fabs(CGDisplayModeGetRefreshRate(mode) - hz);
+        if (best_diff < 0 || diff < best_diff) {
+            best_diff = diff;
+            best = mode;
+        }
+    }
+    if (!best) {
+        CFRelease(all);
+        snprintf(error, size, "no registered %ux%u mode", width, height);
+        return -1;
+    }
+    double picked = CGDisplayModeGetRefreshRate(best);
+    CGDisplayConfigRef config;
+    CGError code = CGBeginDisplayConfiguration(&config);
+    if (!code) code = CGConfigureDisplayWithDisplayMode(config, display, best, NULL);
+    if (code) {
+        CGCancelDisplayConfiguration(config);
+        CFRelease(all);
+        snprintf(error, size, "display configuration: %d", code);
+        return -1;
+    }
+    CFRelease(all);
+    code = CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
+    if (code) {
+        snprintf(error, size, "display configuration: %d", code);
+        return -1;
+    }
+    return picked;
+}
+
 int ah_vd_supported(void) {
     Class d = descriptorClass(), m = modeClass(), s = settingsClass(), v = displayClass();
     return d && m && s && v &&
@@ -57,9 +104,12 @@ int ah_vd_supported(void) {
            [v instancesRespondToSelector:@selector(displayID)];
 }
 
-// One mode, `width` x `height`: points when `hidpi` (the frame buffer is twice as large), pixels otherwise.
+// `width` x `height`: points when `hidpi` (the frame buffer is twice as large), pixels otherwise. Registers one
+// mode per entry of `rates` (all the same size, different refresh rates), and starts on the one closest to `hz`
+// so that ah_vd_set_refresh_rate can switch between them later.
 // Returns the display (retained: it exists until ah_vd_destroy) and its CGDirectDisplayID in `display`.
-void *ah_vd_create(uint32_t width, uint32_t height, int hidpi, double hz, double mm_w, double mm_h,
+void *ah_vd_create(uint32_t width, uint32_t height, int hidpi, double hz,
+                   const double *rates, int rate_count, double mm_w, double mm_h,
                    uint32_t vendor, uint32_t product, uint32_t serial, const char *name,
                    uint32_t *display, char *error, size_t size) {
     @autoreleasepool {
@@ -86,18 +136,46 @@ void *ah_vd_create(uint32_t width, uint32_t height, int hidpi, double hz, double
 
             CGVirtualDisplay *virtualDisplay = [[displayClass() alloc] initWithDescriptor:descriptor];
             if (!virtualDisplay) return failure(error, size, @"CGVirtualDisplay refused the descriptor");
-            CGVirtualDisplayMode *mode = [[modeClass() alloc] initWithWidth:width height:height refreshRate:hz];
-            if (!mode) return failure(error, size, @"CGVirtualDisplayMode refused the mode");
+            NSMutableArray *modes = [NSMutableArray array];
+            for (int i = 0; i < rate_count; i++) {
+                CGVirtualDisplayMode *mode =
+                    [[modeClass() alloc] initWithWidth:width height:height refreshRate:rates[i]];
+                if (mode) [modes addObject:mode];
+            }
+            if (modes.count == 0) {
+                CGVirtualDisplayMode *mode =
+                    [[modeClass() alloc] initWithWidth:width height:height refreshRate:hz];
+                if (!mode) return failure(error, size, @"CGVirtualDisplayMode refused the mode");
+                [modes addObject:mode];
+            }
             CGVirtualDisplaySettings *settings = [[settingsClass() alloc] init];
-            settings.modes = @[mode];
+            settings.modes = modes;
             settings.hiDPI = hidpi ? 1 : 0;
             if (![virtualDisplay applySettings:settings])
                 return failure(error, size, @"CGVirtualDisplay refused the settings");
             *display = virtualDisplay.displayID;
+            // applySettings picks a mode itself (usually the fastest one registered): put it back on the
+            // one we asked for. Failing here is not fatal: the display exists, just possibly at another rate.
+            char ignored[128];
+            select_mode(*display, width, height, hz, ignored, sizeof ignored);
             return (__bridge_retained void *)virtualDisplay;
         } @catch (NSException *e) {
             return failure(error, size, [NSString stringWithFormat:@"CGVirtualDisplay: %@", e.reason]);
         }
+    }
+}
+
+// Switch a display made by ah_vd_create to another of its registered refresh rates (see ah_vd_create).
+// Returns the refresh rate now in use, or -1 (reason in `error`).
+double ah_vd_set_refresh_rate(void *display, uint32_t width, uint32_t height, double hz,
+                             char *error, size_t size) {
+    @autoreleasepool {
+        if (!display) {
+            snprintf(error, size, "no display");
+            return -1;
+        }
+        CGVirtualDisplay *virtualDisplay = (__bridge CGVirtualDisplay *)display;
+        return select_mode(virtualDisplay.displayID, width, height, hz, error, size);
     }
 }
 
