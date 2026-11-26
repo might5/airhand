@@ -133,35 +133,37 @@ fn mirror(id: CGDirectDisplayID, of: CGDirectDisplayID) {
 /// 档位落在 [`HZ_RATES`] 里最近的一档上：屏上只有注册过的模式能换
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HzWant {
-    /// 控制端要的最大帧率（自动档跟着它）
+    /// 控制端要的最大帧率
     fps: u8,
-    /// 控制端选的刷新率，0 是自动
-    display_hz: u8,
+    /// 控制端改过几次：只有它变了才说明"这是控制端新提的要求"，否则屏上的档位听用户的
+    /// （用户在 系统设置 → 显示器 里自己挑的那一档，Airhand 不去覆盖）
+    epoch: u64,
 }
 
 impl Default for HzWant {
     fn default() -> Self {
-        Self {
-            fps: 60,
-            display_hz: 0,
-        }
+        Self { fps: 60, epoch: 0 }
     }
 }
 
-static HZ_WANT: Mutex<HzWant> = Mutex::new(HzWant {
-    fps: 60,
-    display_hz: 0,
-});
+static HZ_WANT: Mutex<HzWant> = Mutex::new(HzWant { fps: 60, epoch: 0 });
+
+/// 现在该用的刷新率和控制端的要求序号
+fn wanted() -> (f64, u64) {
+    (wanted_hz(), HZ_WANT.lock().unwrap().epoch)
+}
+
+/// 屏上现在真正在跑的那一档（`id` 是别的进程建的也读得出；读不到就是 None）
+fn shown_hz(id: CGDirectDisplayID) -> Option<f64> {
+    let mode = CGDisplayCopyDisplayMode(id)?;
+    let hz = CGDisplayMode::refresh_rate(Some(&mode));
+    (hz > 0.0).then_some(hz)
+}
 
 /// 现在该用的刷新率
 fn wanted_hz() -> f64 {
-    let want = *HZ_WANT.lock().unwrap();
-    let hz = if want.display_hz == 0 {
-        f64::from(want.fps).clamp(HZ_MIN, *HZ_RATES.last().unwrap())
-    } else {
-        f64::from(want.display_hz).clamp(HZ_MIN, *HZ_RATES.last().unwrap())
-    };
-    nearest_hz(hz)
+    let fps = HZ_WANT.lock().unwrap().fps;
+    nearest_hz(f64::from(fps).clamp(HZ_MIN, *HZ_RATES.last().unwrap()))
 }
 
 /// 注册过的档位里离 `hz` 最近的一档：只有注册过的模式能换，离得远也比没得换好
@@ -175,10 +177,11 @@ fn nearest_hz(hz: f64) -> f64 {
 
 /// 控制端的画质设置（见 `airhand_proto::session::QualitySettings`）：虚拟显示器的刷新率跟着它走，
 /// 已经在补屏的那块下一轮就换（见 [`VirtualDisplay::sync_refresh_rate`]）
-pub(super) fn set_quality(fps: u8, display_hz: u8) {
+pub(super) fn set_quality(fps: u8) {
     let mut want = HZ_WANT.lock().unwrap();
-    if *want != (HzWant { fps, display_hz }) {
-        *want = HzWant { fps, display_hz };
+    if want.fps != fps {
+        let epoch = want.epoch.wrapping_add(1);
+        *want = HzWant { fps, epoch };
         drop(want);
         // 叫醒管理线程：不用等下一次 WATCH
         HUB.wants.lock().unwrap().poke();
@@ -310,6 +313,8 @@ struct VirtualDisplay {
     hidpi: bool,
     /// 现在的刷新率（Hz）
     hz: f64,
+    /// 建屏／上一次换档时控制端的要求序号（见 [`HzWant::epoch`]）
+    epoch: u64,
 }
 
 // 只是一个 Objective-C 对象的引用，在哪个线程上释放都行
@@ -349,6 +354,7 @@ impl VirtualDisplay {
             size: (shape.width, shape.height),
             hidpi: shape.hidpi,
             hz,
+            epoch: wanted().1,
         })
     }
 
@@ -360,7 +366,20 @@ impl VirtualDisplay {
     /// （`CGConfigureDisplayWithDisplayMode`）走的是同一条显示器配置，冒不起这个险——开着盖子照着本机屏幕用的
     /// 时候就还按建屏时的那一档，合上盖子（不镜像了）之后自动跟上。
     fn sync_refresh_rate(&mut self) {
-        let hz = wanted_hz();
+        // 屏上现在那一档才是真的：用户可能在 系统设置 → 显示器 里自己挑过档，读回来当基准，
+        // 别拿上一轮记下的值当现状。
+        if let Some(now) = shown_hz(self.id) {
+            if (self.hz - now).abs() >= 0.5 {
+                info!(hz = now, "virtual display: refresh rate picked elsewhere, following it");
+                self.hz = now;
+            }
+        }
+        let (hz, epoch) = wanted();
+        // 控制端没提新要求：屏上这一档就是用户自己挑的，留着不动（这正是"跟随系统设置"）
+        if epoch == self.epoch {
+            return;
+        }
+        self.epoch = epoch;
         if (self.hz - hz).abs() < 0.5 {
             return;
         }
@@ -677,22 +696,15 @@ mod hz_tests {
         assert_eq!(nearest_hz(15.0), 50.0);
         assert_eq!(nearest_hz(70.0), 75.0);
         // 自动档跟着帧率走，不低于 50
-        *HZ_WANT.lock().unwrap() = HzWant {
-            fps: 120,
-            display_hz: 0,
-        };
+        *HZ_WANT.lock().unwrap() = HzWant { fps: 120, epoch: 1 };
         assert_eq!(wanted_hz(), 120.0);
-        *HZ_WANT.lock().unwrap() = HzWant {
-            fps: 15,
-            display_hz: 0,
-        };
+        *HZ_WANT.lock().unwrap() = HzWant { fps: 15, epoch: 2 };
         assert_eq!(wanted_hz(), 50.0);
-        // 手动档就用它
-        *HZ_WANT.lock().unwrap() = HzWant {
-            fps: 15,
-            display_hz: 90,
-        };
+        // 90 落在 90 上，76 落回 75
+        *HZ_WANT.lock().unwrap() = HzWant { fps: 90, epoch: 3 };
         assert_eq!(wanted_hz(), 90.0);
+        *HZ_WANT.lock().unwrap() = HzWant { fps: 76, epoch: 4 };
+        assert_eq!(wanted_hz(), 75.0);
         *HZ_WANT.lock().unwrap() = HzWant::default();
         assert_eq!(wanted_hz(), HZ);
     }
@@ -799,7 +811,8 @@ mod tests {
         assert_eq!(pixels(id), None);
     }
 
-    /// 换刷新率不用重建屏：同一块屏逐档切过去，读回都是那一档，displayID 也不变。
+    /// 控制端改帧率时换刷新率不用重建屏：同一块屏逐档切过去，读回都是那一档，displayID 也不变。
+    /// 用户在 系统设置 → 显示器 里自己挑的档不被覆盖（`epoch` 没变就不动）。
     /// `cargo test --lib changes_the_refresh_rate_in_place -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -816,10 +829,7 @@ mod tests {
         let id = vd.id;
         std::thread::sleep(Duration::from_millis(300));
         for hz in [120u8, 75, 50, 90, 60] {
-            *HZ_WANT.lock().unwrap() = HzWant {
-                fps: 60,
-                display_hz: hz,
-            };
+            set_quality(hz);
             vd.sync_refresh_rate();
             println!("要 {hz} Hz，现在是 {} Hz，displayID 还是 {}", vd.hz, vd.id);
             assert_eq!(vd.id, id, "换刷新率不该换掉这块屏");

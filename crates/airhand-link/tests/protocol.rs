@@ -61,7 +61,6 @@ fn inputs() -> Vec<InputEvent> {
 
 fn settings() -> QualitySettings {
     QualitySettings {
-        display_hz: 0,
         fps: 60,
         bitrate_kbps: 8000,
         max_short: 1080,

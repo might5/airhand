@@ -10,8 +10,6 @@ import { IconInfo } from "./Icons";
 import { Popover } from "./Popover";
 
 const FPS = [15, 24, 30, 60, 90, 120];
-/** 被控端虚拟显示器的刷新率（0 = 自动，跟着帧率走） */
-const HZ = [0, 50, 60, 75, 90, 120];
 /** 没有 label 的是"原始分辨率"（文字随界面语言） */
 const RES: { v: number; label?: string }[] = [
   { v: 720, label: "720p" },
@@ -111,19 +109,6 @@ export function QualityPanel({ s, onClose }: { s: RemoteSession; onClose: () => 
             {FPS.map((f) => (
               <button key={f} className={cur.fps === f ? "active" : ""} onClick={() => apply({ fps: f })}>
                 {f}
-              </button>
-            ))}
-          </div>
-
-          <Label text={t("quality.displayHz")} hint={t("quality.displayHzHint")} />
-          <div className="segmented">
-            {HZ.map((h) => (
-              <button
-                key={h}
-                className={(cur.displayHz ?? 0) === h ? "active" : ""}
-                onClick={() => apply({ displayHz: h })}
-              >
-                {h === 0 ? t("quality.auto") : h}
               </button>
             ))}
           </div>

@@ -34,8 +34,7 @@ export function matchPreset(s: QualitySettings): PresetId | null {
     (p) =>
       p.settings.fps === s.fps &&
       p.settings.bitrateKbps === s.bitrateKbps &&
-      p.settings.maxShort === s.maxShort &&
-      (s.displayHz ?? 0) === 0,
+      p.settings.maxShort === s.maxShort,
   );
   return p?.id ?? null;
 }

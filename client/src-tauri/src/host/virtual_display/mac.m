@@ -81,7 +81,8 @@ static double select_mode(CGDirectDisplayID display, uint32_t width, uint32_t he
         return -1;
     }
     CFRelease(all);
-    code = CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
+    // 必须 Permanently：ForSession 只挂在本次会话的临时配置上，合成节拍不会跟着走（实测切 90 仍跑旧档）。
+    code = CGCompleteDisplayConfiguration(config, kCGConfigurePermanently);
     if (code) {
         snprintf(error, size, "display configuration: %d", code);
         return -1;
@@ -92,10 +93,11 @@ static double select_mode(CGDirectDisplayID display, uint32_t width, uint32_t he
 // 全部可注册档位（与 mac.rs 的 HZ_RATES 对齐）。系统设置 → 显示器 里这块屏能选到哪几档，就看这里注册了几档。
 static const double kAllHz[] = {50.0, 60.0, 75.0, 90.0, 120.0};
 
-// 注册 `count` 个同尺寸模式，把 `hz` 排在**第一个**。
-// 合成节拍（WindowServer 多久更新一次这块屏）跟的是 modes 的第一个元素，不是当前选中的那一个：注册
-// [30,60,90,120] 时不管切到 60/90/120，采集都只有 30 帧。所以当前档必须排首位，其余档只负责让系统设置里
-// 有选项可挑（Crisp 的虚拟屏就是这样：注册 [50,60,75]，声明 75）。
+// 注册 `count` 个同尺寸模式，把 `hz` 排在第一个（`applySettings` 自己会挑一档，通常是最快的，所以建屏之后
+// 还要用 select_mode 拉回 `hz`）。
+// 合成节拍跟的是**当前选中的那一档**，不是 modes 的第一个元素（实测建屏首档 60、系统自选 120 时画面就跑
+// 120；把模式列表重排成首档 75 也不会让节拍变成 75）。要让 系统设置 → 显示器 里有刷新率选项，靠的是把这几档
+// 全注册上；要让某一档真的生效，靠的是 select_mode 的事务（见 ah_vd_set_refresh_rate）。
 static BOOL apply_modes(CGVirtualDisplay *virtualDisplay, uint32_t width, uint32_t height,
                         int hidpi, double hz, size_t count) {
     CGVirtualDisplayMode *first = [[modeClass() alloc] initWithWidth:width height:height refreshRate:hz];
@@ -176,9 +178,12 @@ void *ah_vd_create(uint32_t width, uint32_t height, int hidpi, double hz,
 
 // Switch a display made by ah_vd_create to another refresh rate. The display itself is kept (same
 // CGDirectDisplayID, so the arrangement and the windows' places stay), and this takes effect at once.
-// 两段式：① 先只注册目标档 —— 合成节拍只有这一步才真的换到目标档（多档状态下热重 apply 时节拍死守首次
-// 注册的首档，改不动，实测 120 首档 + 重排 75 首仍是 119 fps）；② 再把其余档补回来（目标档仍排首位）——
-// 系统设置 → 显示器 里才留得住刷新率选项。实测 75 → 74.7 fps、120 → 106.7 fps，选项始终是 50/60/75/90/120。
+//
+// 只走显示器配置事务（CGBeginDisplayConfiguration → CGConfigureDisplayWithDisplayMode →
+// CGCompleteDisplayConfiguration），**不再**热重 `applySettings`：建屏时已经注册了 kAllHz 全部档位，换档只需
+// 选中其中一档。热重 apply 会让合成节拍死在某个值上（实测 120 档建屏后再 apply 首档 75，画面反而跑 120，
+// 之后系统设置里再挑任何档都不动），而事务换档实测精确跟随：60 → 60.0 fps、75 → 75.0 fps、90 → 91.4 fps。
+// 顺带：用户在 系统设置 → 显示器 里自己挑档走的也是同一条事务，所以那条路也照样生效，Airhand 不去覆盖它。
 // Returns the refresh rate now in use, or -1 (reason in `error`).
 double ah_vd_set_refresh_rate(void *display, uint32_t width, uint32_t height, int hidpi, double hz,
                              char *error, size_t size) {
@@ -187,22 +192,15 @@ double ah_vd_set_refresh_rate(void *display, uint32_t width, uint32_t height, in
             snprintf(error, size, "no display");
             return -1;
         }
+        (void)hidpi;  // 档位在建屏时就按这个 hiDPI 注册好了，换档不改它
         CGVirtualDisplay *virtualDisplay = (__bridge CGVirtualDisplay *)display;
-        if (!apply_modes(virtualDisplay, width, height, hidpi, hz, 1)) {
-            snprintf(error, size, "CGVirtualDisplay refused %g Hz", hz);
+        char ignored[128];
+        double picked = select_mode(virtualDisplay.displayID, width, height, hz, ignored, sizeof ignored);
+        if (picked < 0.0) {
+            snprintf(error, size, "%s", ignored);
             return -1;
         }
-        // 补回其余档让系统设置里有得挑；失败不致命（屏幕在、档位也可能已经生效，只是少了几个选项）。
-        apply_modes(virtualDisplay, width, height, hidpi, hz, sizeof(kAllHz) / sizeof(kAllHz[0]));
-        char ignored[128];
-        select_mode(virtualDisplay.displayID, width, height, hz, ignored, sizeof ignored);
-        double got = -1;
-        CGDisplayModeRef now = CGDisplayCopyDisplayMode(virtualDisplay.displayID);
-        if (now) {
-            got = CGDisplayModeGetRefreshRate(now);
-            CFRelease(now);
-        }
-        return got > 0 ? got : hz;
+        return picked;
     }
 }
 

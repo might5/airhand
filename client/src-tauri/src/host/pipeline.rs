@@ -189,8 +189,8 @@ fn drop_encoder(enc: &mut Option<Encoder>) {
 fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out: Outbox) {
     capture::raise_priority();
     let mut settings = *ctrl.settings.lock().unwrap();
-    // 补屏的虚拟显示器按控制端的帧率、刷新率走（见 virtual_display::set_quality）
-    virtual_display::set_quality(settings.fps, settings.display_hz);
+    // 补屏的虚拟显示器建屏那一档刷新率按控制端的帧率走（见 virtual_display::set_quality）
+    virtual_display::set_quality(settings.fps);
     let mut ver = ctrl.settings_ver.load(Ordering::Acquire);
     // 控制端的游戏模式要光标画进画面：读带光标的那一路（见 capture 的"带光标的画面"）
     let mut draw = settings.draw_cursor;
@@ -244,7 +244,7 @@ fn run(ctrl: Arc<Ctrl>, stream: u8, screen: u8, video: mpsc::Sender<Bytes>, out:
             }
             sub.set_fps(settings.fps);
             pacer.set_fps(settings.fps);
-            virtual_display::set_quality(settings.fps, settings.display_hz);
+            virtual_display::set_quality(settings.fps);
             ctrl.flow
                 .set_target(settings.bitrate_kbps, settings.adaptive);
             if let Some(e) = &mut enc {
