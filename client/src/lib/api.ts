@@ -22,11 +22,6 @@ export type Codec = "h264" | "h265" | "av1";
 /** 与 airhand_proto::session::QualitySettings 对应 */
 export interface QualitySettings {
   fps: number;
-  /**
-   * 被控端虚拟显示器的刷新率（Hz），0 或不填 = 自动（跟着 fps 走）。
-   * 只有 macOS 补屏的虚拟显示器用得上（见 virtual_display::set_quality），别的平台忽略
-   */
-  displayHz?: number;
   bitrateKbps: number;
   /** 输出画面短边上限，0 = 原始分辨率 */
   maxShort: number;
