@@ -129,8 +129,8 @@ int ah_vd_supported(void) {
 }
 
 // `width` x `height`: points when `hidpi` (the frame buffer is twice as large), pixels otherwise. Every rate in
-// kAllHz is registered (with `hz` first, see apply_modes) so 系统设置 → 显示器 里能挑刷新率 —— 建屏之后换档
-// 由用户在系统设置里选，客户端不再管刷新率，所以这里也没有"换档"的接口了。
+// kAllHz is registered (with `hz` first, see apply_modes) so 系统设置 → 显示器 里能挑刷新率;
+// ah_vd_set_refresh_rate re-applies them later without rebuilding the display.
 // Returns the display (retained: it exists until ah_vd_destroy) and its CGDirectDisplayID in `display`.
 void *ah_vd_create(uint32_t width, uint32_t height, int hidpi, double hz,
                    double mm_w, double mm_h, uint32_t vendor, uint32_t product, uint32_t serial,
@@ -171,6 +171,38 @@ void *ah_vd_create(uint32_t width, uint32_t height, int hidpi, double hz,
         } @catch (NSException *e) {
             return failure(error, size, [NSString stringWithFormat:@"CGVirtualDisplay: %@", e.reason]);
         }
+    }
+}
+
+// Switch a display made by ah_vd_create to another refresh rate. The display itself is kept (same
+// CGDirectDisplayID, so the arrangement and the windows' places stay), and this takes effect at once.
+// 两段式：① 先只注册目标档 —— 合成节拍只有这一步才真的换到目标档（多档状态下热重 apply 时节拍死守首次
+// 注册的首档，改不动，实测 120 首档 + 重排 75 首仍是 119 fps）；② 再把其余档补回来（目标档仍排首位）——
+// 系统设置 → 显示器 里才留得住刷新率选项。实测 75 → 74.7 fps、120 → 106.7 fps，选项始终是 50/60/75/90/120。
+// Returns the refresh rate now in use, or -1 (reason in `error`).
+double ah_vd_set_refresh_rate(void *display, uint32_t width, uint32_t height, int hidpi, double hz,
+                             char *error, size_t size) {
+    @autoreleasepool {
+        if (!display) {
+            snprintf(error, size, "no display");
+            return -1;
+        }
+        CGVirtualDisplay *virtualDisplay = (__bridge CGVirtualDisplay *)display;
+        if (!apply_modes(virtualDisplay, width, height, hidpi, hz, 1)) {
+            snprintf(error, size, "CGVirtualDisplay refused %g Hz", hz);
+            return -1;
+        }
+        // 补回其余档让系统设置里有得挑；失败不致命（屏幕在、档位也可能已经生效，只是少了几个选项）。
+        apply_modes(virtualDisplay, width, height, hidpi, hz, sizeof(kAllHz) / sizeof(kAllHz[0]));
+        char ignored[128];
+        select_mode(virtualDisplay.displayID, width, height, hz, ignored, sizeof ignored);
+        double got = -1;
+        CGDisplayModeRef now = CGDisplayCopyDisplayMode(virtualDisplay.displayID);
+        if (now) {
+            got = CGDisplayModeGetRefreshRate(now);
+            CFRelease(now);
+        }
+        return got > 0 ? got : hz;
     }
 }
 

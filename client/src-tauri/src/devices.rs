@@ -186,7 +186,15 @@ fn quality_from(item: &Item) -> Option<QualitySettings> {
     let int = |k: &str| t.get(k).and_then(Item::as_integer);
     // 和界面的 JSON 一样的名字（"h264"）；之前的版本写的是 "H264"，也认
     let codec = Codec::from_name(&t.get("codec").and_then(Item::as_str)?.to_ascii_lowercase())?;
+    // 虚拟显示器的刷新率：0 是自动（跟着帧率），旧配置里没有这一项
+    let display_hz = t
+        .get("display_hz")
+        .and_then(Item::as_integer)
+        .and_then(|h| u8::try_from(h).ok())
+        .filter(|h| *h <= 120)
+        .unwrap_or(0);
     Some(QualitySettings {
+        display_hz,
         fps: u8::try_from(int("fps")?)
             .ok()
             .filter(|f| (1..=120).contains(f))?,
@@ -260,6 +268,9 @@ pub fn to_table(d: &Device) -> Option<Table> {
     }
     if let Some(q) = &d.quality {
         let mut it = InlineTable::new();
+        if q.display_hz != 0 {
+            it.insert("display_hz", i64::from(q.display_hz).into());
+        }
         it.insert("fps", i64::from(q.fps).into());
         it.insert("bitrate_kbps", i64::from(q.bitrate_kbps).into());
         it.insert("max_short", i64::from(q.max_short).into());
@@ -359,6 +370,7 @@ mod tests {
             resume: Some([7; 16]),
             last_used,
             quality: Some(QualitySettings {
+                display_hz: 0,
                 fps: 60,
                 bitrate_kbps: 8000,
                 max_short: 1080,
