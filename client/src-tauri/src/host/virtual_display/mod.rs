@@ -353,7 +353,7 @@ pub fn set_quality(fps: u8) {
     #[cfg(target_os = "macos")]
     mac::set_quality(fps);
     #[cfg(not(target_os = "macos"))]
-    let _ = (fps, display_hz);
+    let _ = fps;
 }
 
 /// 本进程补屏的虚拟显示器的像素大小（macOS，见 [`mac`]）；`id` 不是它时为 `None`
