@@ -252,6 +252,12 @@ fn build_menu(app: &AppHandle, st: &AppStatus) -> tauri::Result<Menu<Wry>> {
             tr!("卸载 Airhand…", "Uninstall Airhand…"),
         )?)?;
     }
+    // 改完配置文件要重启才生效（见 crate::config 里的提示），所以「重启」直接放在「退出」上面
+    menu.append(&item(
+        app,
+        "restart",
+        tr!("重启 Airhand", "Restart Airhand"),
+    )?)?;
     menu.append(&item(app, "quit", tr!("退出", "Quit"))?)?;
     Ok(menu)
 }

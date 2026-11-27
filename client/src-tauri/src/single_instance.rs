@@ -16,7 +16,7 @@ pub struct Guard {
 }
 
 #[cfg(windows)]
-pub fn acquire() -> Option<Guard> {
+fn acquire_once() -> Option<Guard> {
     use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::core::w;
@@ -43,7 +43,7 @@ impl Guard {
 }
 
 #[cfg(target_os = "linux")]
-pub fn acquire() -> Option<Guard> {
+fn acquire_once() -> Option<Guard> {
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::{SocketAddr, UnixListener};
 
@@ -63,7 +63,7 @@ pub fn acquire() -> Option<Guard> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn acquire() -> Option<Guard> {
+fn acquire_once() -> Option<Guard> {
     use objc2_core_foundation::{CFMessagePort, CFString};
 
     // 每个用户一个实例（不同用户的 bootstrap 命名空间本来就是分开的，带上 uid 更保险）
@@ -103,18 +103,40 @@ pub fn acquire() -> Option<Guard> {
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-pub fn acquire() -> Option<Guard> {
+fn acquire_once() -> Option<Guard> {
     Some(Guard {})
+}
+
+/// 已经有实例时不要立刻放弃，留一小段余量再试：
+/// 托盘菜单里的「重启 Airhand」走 tauri 的 restart，它是先起新进程再退出自己，新旧两份会同时活过几十毫秒，
+/// 新进程这时被单实例挡住就会白白退出（用户点了重启，Airhand 反而没了）。
+/// 真有一个实例在跑时这里最多多等 3 秒，这时还没创建窗口，用户看不到任何东西。
+pub fn acquire() -> Option<Guard> {
+    if let Some(guard) = acquire_once() {
+        return Some(guard);
+    }
+    const RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+    for _ in 0..60 {
+        std::thread::sleep(RETRY);
+        if let Some(guard) = acquire_once() {
+            return Some(guard);
+        }
+    }
+    None
 }
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     #[test]
     fn only_one_instance() {
+        // 这里用 acquire_once：acquire 会为重试等上几秒，测不出东西来
         let first =
-            super::acquire().expect("第一个实例应该能运行（是不是已经有 Airhand 在运行？）");
-        assert!(super::acquire().is_none(), "第二个实例不应该运行");
+            super::acquire_once().expect("第一个实例应该能运行（是不是已经有 Airhand 在运行？）");
+        assert!(super::acquire_once().is_none(), "第二个实例不应该运行");
         drop(first);
-        assert!(super::acquire().is_some(), "第一个实例退出后应该可以再运行");
+        assert!(
+            super::acquire_once().is_some(),
+            "第一个实例退出后应该可以再运行"
+        );
     }
 }

@@ -370,6 +370,21 @@ fn on_console_destroyed(app: &AppHandle) {
     }
 }
 
+/// 退出、重启之前先把手上的东西收干净：Windows 安装版停掉被控端服务，再放掉两条服务句柄。
+fn shutdown(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    // Windows 安装版：退出 = 被控端也停止（和直接运行时一样，退出后本机不能再被控制）
+    #[cfg(windows)]
+    if state.service_mode
+        && let Err(e) = winsvc::stop()
+    {
+        warn!("can't stop the Airhand service: {e:#}");
+    }
+    let mut sv = state.services.lock().unwrap();
+    sv.host = None;
+    sv.controller = None;
+}
+
 pub(crate) fn on_menu(app: &AppHandle, id: &str) {
     match id {
         // Windows 安装版从被控端模式打开控制台时，也要启动控制端服务，不能只创建窗口。
@@ -509,19 +524,19 @@ pub(crate) fn on_menu(app: &AppHandle, id: &str) {
                 }
             }
         }
-        "quit" => {
-            let state = app.state::<AppState>();
-            // Windows 安装版：退出 = 被控端也停止（和直接运行时一样，退出后本机不能再被控制）
+        // 重启：先按「退出」把手上的东西收干净，再让 Tauri 走一遍正常的退出流程把自己重新拉起来，
+        // 用法上和「退出」之后再打开一次完全一样（改完配置文件不用手动操作；Windows 安装版的被控端服务由新进程重新连上）
+        "restart" => {
+            shutdown(app);
+            // Windows 安装版：等被控端服务真的停下，新进程才能立刻把它重新拉起来
             #[cfg(windows)]
-            if state.service_mode
-                && let Err(e) = winsvc::stop()
-            {
-                warn!("can't stop the Airhand service: {e:#}");
+            if let Err(e) = winsvc::stop_and_wait_ready() {
+                warn!("can't wait for the Airhand service to stop: {e:#}");
             }
-            let mut sv = state.services.lock().unwrap();
-            sv.host = None;
-            sv.controller = None;
-            drop(sv);
+            app.request_restart()
+        }
+        "quit" => {
+            shutdown(app);
             app.exit(0);
         }
         _ => {}
