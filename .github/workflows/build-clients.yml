@@ -64,8 +64,10 @@ jobs:
           PEM="$RUNNER_TEMP/airhand-signing.pem"
           printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$P12"
           # 自签证书必须加入系统信任域，否则 codesign 只认 ad-hoc、find-identity 报 0 valid
+          # 写 System.keychain 需要 root：macos-15 runner 上非 sudo 会报
+          # SecCertificateAddToKeychain: Write permissions error（exit 1）
           openssl pkcs12 -in "$P12" -passin pass:"$APPLE_CERTIFICATE_PASSWORD" -clcerts -nokeys -out "$PEM"
-          security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$PEM"
+          sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$PEM"
           rm -f "$P12" "$PEM"
           echo "enabled=true" >> "$GITHUB_OUTPUT"
           security find-identity -v -p codesigning | head -5
