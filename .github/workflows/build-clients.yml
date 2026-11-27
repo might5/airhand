@@ -101,12 +101,24 @@ jobs:
         if: steps.signing.outputs.enabled == 'true'
         working-directory: client/src-tauri/target/release/bundle/macos
         run: |
-          APP=$(ls -d *.app | head -1)
+          # tauri 打完 dmg 会清理 bundle/macos 下的 .app，此时必须从 dmg 挂载后取 app 校验
+          APP=$(ls -d *.app 2>/dev/null | head -1 || true)
+          MNT=""
+          if [ -z "$APP" ]; then
+            DMG=$(ls ../dmg/*.dmg | head -1)
+            echo "dmg=$DMG"
+            MNT="$RUNNER_TEMP/dmgmnt"
+            mkdir -p "$MNT"
+            hdiutil attach "$DMG" -mountpoint "$MNT" -nobrowse -quiet
+            APP="$MNT/$(ls "$MNT" | grep '\.app$' | head -1)"
+          fi
           echo "app=$APP"
           SIG=$(codesign -dv --verbose=4 "$APP" 2>&1 || true)
           echo "$SIG" | grep -E "Identifier|Authority|TeamIdentifier|flags" || true
-          codesign -d -r- "$APP" 2>&1 | grep designated || true
+          DR=$(codesign -d -r- "$APP" 2>&1 | grep designated || true)
+          echo "$DR"
           codesign --verify --strict --verbose=2 "$APP"
+          [ -z "$MNT" ] || hdiutil detach "$MNT" -quiet || true
           # 不能用 codesign ... | grep -q：grep 命中即退出会让 codesign 收到 SIGPIPE 被误判
           IDENTITY="${{ secrets.APPLE_SIGNING_IDENTITY }}"
           case "$SIG" in
@@ -118,6 +130,13 @@ jobs:
               echo "签名身份校验通过";;
             *)
               echo "::error::签名身份不是预期证书"; exit 1;;
+          esac
+          # DR 必须按根证书固定，TCC 授权才能跨版本沿用
+          case "$DR" in
+            *'certificate root = H"0e7cb37a170f174d9491187cc72a3672a1dd1b2d"'*)
+              echo "Designated Requirement 校验通过";;
+            *)
+              echo "::error::DR 与 A1 根证书不一致"; exit 1;;
           esac
 
       - name: 列出构建产物
