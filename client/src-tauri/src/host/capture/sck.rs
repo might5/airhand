@@ -120,6 +120,9 @@ struct Inbox {
 struct InboxState {
     sample: Option<Sample>,
     stopped: Option<String>,
+    /// 系统最近一次交上来东西的时刻（空样本也算，见模块说明：静止时交的是 `Idle` 空样本）。流静默失效时连空样本
+    /// 都没有，这是唯一能发现"这块屏不再投帧"的信号（见 [`Capturer::stalled`]）
+    seen: Option<Instant>,
 }
 
 pub struct SckCapturer {
@@ -132,6 +135,8 @@ pub struct SckCapturer {
     inbox: Arc<Inbox>,
     fps: u8,
     first: bool,
+    /// 打开的时刻（还没收到任何样本时，"多久没动静"从这里算起，见 [`Capturer::stalled`]）
+    opened: Instant,
     cursor: CursorReader,
     layout_checked: Instant,
     /// 打开时屏幕锁着没有（见 [`macos::screen_locked`]）：变了就重建采集器
@@ -198,13 +203,17 @@ impl SckCapturer {
             &[SCStreamOutputType::Screen],
             "app.airhand.capture",
             move |sb, kind| {
-                if kind != SCStreamOutputType::Screen
-                    || sck::frame_status(sb) != Some(SCFrameStatus::Complete.0)
-                {
+                if kind != SCStreamOutputType::Screen {
                     return;
                 }
+                let complete = sck::frame_status(sb) == Some(SCFrameStatus::Complete.0);
                 let mut st = rx.st.lock().unwrap();
-                st.sample = Some(Sample::retain(sb));
+                // 空样本（画面没变化时系统交的 `Idle`）也算"还活着"：只认 `Complete` 的话，静止的桌面看起来就
+                // 和失效的流一样（见 [`Capturer::stalled`]）
+                st.seen = Some(Instant::now());
+                if complete {
+                    st.sample = Some(Sample::retain(sb));
+                }
                 rx.cv.notify_all();
             },
             move |e| {
@@ -235,6 +244,7 @@ impl SckCapturer {
             inbox,
             fps,
             first: true,
+            opened: Instant::now(),
             cursor: CursorReader::default(),
             layout_checked: Instant::now(),
             locked,
@@ -345,6 +355,19 @@ impl Capturer for SckCapturer {
             unsafe { self.config.setMinimumFrameInterval(frame_interval(fps)) };
             self.stream.update(&self.config);
         }
+    }
+
+    /// ScreenCaptureKit 对这块屏完全不投帧（合盖远程时锁屏之后就是这样：流不报错、什么都不交，连着看这块屏的
+    /// 别的程序也一帧都收不到）。这时候只能把采集器重开、还不行就把这块屏换掉（见 `super::capture_loop`）
+    fn stalled(&self) -> Option<Duration> {
+        let since = self
+            .inbox
+            .st
+            .lock()
+            .unwrap()
+            .seen
+            .unwrap_or(self.opened);
+        Some(since.elapsed())
     }
 }
 

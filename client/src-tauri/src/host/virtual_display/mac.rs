@@ -61,8 +61,8 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::fmt;
 use std::process::{Command, Stdio};
 use std::ptr::NonNull;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -96,7 +96,18 @@ const AC_CHECK: Duration = Duration::from_secs(5);
 /// 建不出来的话过这么久再试
 const RETRY: Duration = Duration::from_secs(10);
 /// 合上盖子、没有别的显示器时把自己换到主位最多试几次（见 [`take_main`]）：系统把它加进配置要一会儿
-const MAIN_TRIES: u8 = 3;
+const MAIN_TRIES: u8 = 8;
+/// 建出来之后先等这么久再抢主位：系统自己也有一串配置要做（把它加进来、撤掉内建屏、把内建屏记回主屏再撤掉），
+/// 撞在一起它就丢我们的请求（日志里的 `Dropped config API request`）
+const MAIN_FIRST: Duration = Duration::from_millis(1200);
+/// 内建屏还在显示器列表里（合盖过渡期，系统还没撤掉它）时先不抢主位，最多等这么久
+const MAIN_GRACE: Duration = Duration::from_secs(4);
+/// 没抢成之后过这么久再试
+const MAIN_RETRY: Duration = Duration::from_secs(2);
+/// 后台换主位最多等它这么久：系统那边的配置一直没做完就不陪它等了（见 [`take_main_later`]）
+const MAIN_TIMEOUT: Duration = Duration::from_secs(6);
+/// 抢完主位（成了、没成）之后这么久不查、不换模式：系统还在处理排队的配置变更
+const MAIN_QUIET: Duration = Duration::from_secs(3);
 /// 打开防窥之后、盖上黑窗口之前多久看一次（盖上了才算开着）
 const STARTING: Duration = Duration::from_millis(100);
 /// 打开防窥之后这么久黑窗口还没盖上（主线程没处理），就算没能打开
@@ -248,6 +259,19 @@ static SEEN: Mutex<Option<Shape>> = Mutex::new(None);
 
 /// 虚拟显示器的模式变过（子进程换过，或者两次查到的不一样）就加一，见 [`mode_generation`]
 static MODE_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// 有人要换一块新的虚拟显示器（见 [`rebuild`]）
+static REBUILD: AtomicBool = AtomicBool::new(false);
+
+/// 撤掉现在的虚拟显示器、马上重建一块。
+///
+/// 系统对这块屏不再投帧时（ScreenCaptureKit 一帧都不交，见 `capture::sck` 的 `Capturer::stalled`；合盖远程时锁屏
+/// 之后就是这样），重开采集流救不回来，只有换一块屏系统才重新出画面——实测建/销一块再建之后帧计数立刻开始涨。
+/// 没有补屏时不做事：重建出来也没人要，管理线程下一轮会把它撤掉
+pub(super) fn rebuild() {
+    REBUILD.store(true, Ordering::Release);
+    HUB.wake.notify_all();
+}
 
 /// 虚拟显示器的模式变过就加一：在这之前打开的、采集它的 ScreenCaptureKit 流停在旧的缩放比例上（例如换回了 HiDPI，
 /// 流还是 1x 的糊画面），要重新打开（见 `capture::sck`）。本进程读不到它的模式（见模块说明），只有管理线程知道
@@ -769,8 +793,32 @@ fn follow_mode(vd: &VirtualDisplay, watch: &mut ModeWatch) {
 struct Filling {
     display: VirtualDisplay,
     _running: power::Running,
+    /// 建出来的时刻：抢主位、查模式都要等系统先把它自己那边的配置做完（见 [`MAIN_FIRST`]）
+    born: Instant,
+    /// 正在后台把它换到主位（见 [`take_main_later`]）：标记（0 还在换、1 换好了、2 没换成）和发起的时刻
+    main_slot: Option<(Arc<AtomicU8>, Instant)>,
     /// 试过几次把它换到主位（见 [`take_main`]）
     main_tries: u8,
+    /// 上次没换成之后，到这个时刻再试
+    main_retry: Instant,
+    /// 上一次换完主位的时刻：这段时间里不查、不换模式（见 [`MAIN_QUIET`]）
+    main_done: Option<Instant>,
+}
+
+impl Filling {
+    /// 正在后台把它换到主位
+    fn busy(&self) -> bool {
+        self.main_slot.is_some()
+    }
+
+    /// 刚建出来，或者刚换完主位：系统还在动显示器配置，不要再去改它
+    fn quiet(&self, now: Instant) -> bool {
+        self.busy()
+            || now.duration_since(self.born) < MAIN_FIRST
+            || self
+                .main_done
+                .is_some_and(|t| now.duration_since(t) < MAIN_QUIET)
+    }
 }
 
 pub(super) fn spawn() {
@@ -853,6 +901,30 @@ fn take_main(ours: CGDirectDisplayID) -> bool {
     true
 }
 
+/// 在后台把它换到主位（见 [`take_main`]）：系统自己还在做显示器配置的时候，`CGCompleteDisplayConfiguration`
+/// 会一直等它做完（日志里的 `Waiting for previous reconfig to complete`，一等十几秒）。管理线程不能陪它等——
+/// 等了就没人看显示器、没人管采集，控制端一直是黑的；而且回来之后又是一轮新的配置请求，接着撞。
+/// 返回的标记：0 还在换、1 换好了、2 没换成；换完会叫醒管理线程
+fn take_main_later(ours: CGDirectDisplayID) -> Arc<AtomicU8> {
+    let slot = Arc::new(AtomicU8::new(0));
+    let done = Arc::clone(&slot);
+    let spawned = std::thread::Builder::new()
+        .name("airhand-take-main".into())
+        .spawn(move || {
+            let ok = take_main(ours);
+            done.store(if ok { 1 } else { 2 }, Ordering::Release);
+            // 叫醒管理线程，马上看结果
+            if let Ok(mut w) = HUB.wants.lock() {
+                w.poke();
+            }
+        });
+    if let Err(e) = spawned {
+        warn!(id = ours, "can't start the thread that takes the main position: {e}");
+        slot.store(2, Ordering::Release);
+    }
+    slot
+}
+
 /// 防窥（见 [`super::curtain`]）：要开着就打开，不要了就关掉（恢复原样）；黑窗口盖上了才算开着
 fn follow_privacy(curtain: &mut Option<(Curtain, Instant)>, wanted: bool, now: Instant) {
     if !wanted {
@@ -911,6 +983,20 @@ fn run() {
             (w.sessions(now), w.ready, w.stopping, privacy)
         };
         follow_privacy(&mut curtain, privacy, now);
+        // 有人要换一块新的虚拟显示器（见 [`rebuild`]）：先撤掉，下一轮按同样的样子重建（`wanted` 还成立的话）
+        if REBUILD.swap(false, Ordering::AcqRel)
+            && let Some(f) = filling.take()
+        {
+            warn!(
+                id = f.display.id,
+                "rebuilding the virtual display on request"
+            );
+            drop(f);
+            // 撤掉的那一刻桌面上没有它了：马上重建，别等重试间隔
+            retry_at = None;
+            unmirrored_since = None;
+            bump();
+        }
         // 控制端改了刷新率、改了帧率：已经在补屏的那块跟着换（不重建，见 VirtualDisplay::sync_refresh_rate）
         if let Some(f) = &mut filling {
             f.display.sync_refresh_rate();
@@ -1017,7 +1103,11 @@ fn run() {
                         filling = Some(Filling {
                             display: vd,
                             _running: power::keep_running(),
+                            born: now,
+                            main_slot: None,
                             main_tries: 0,
+                            main_retry: now + MAIN_FIRST,
+                            main_done: None,
                         });
                         retry_at = None;
                         bump();
@@ -1055,24 +1145,62 @@ fn run() {
         // 合上了盖子：桌面可能留在别人占着的主位上（系统换上的占位屏、远程管理自己生成的那块屏、重启之后系统记着的
         // 那块），自己的屏只是接在边上的扩展屏，采它只有一片空白——用户看到的就是"重启 Airhand 之后黑屏"。
         // 控制端连着的（或者除了自己没别的屏可用）就把它换到主位（见 take_main），窗口跟着回来，控制端就有画面了
-        if let Some(f) = &mut filling
-            && lid
-            && (fill || ready)
-            && f.main_tries < MAIN_TRIES
-            && CGDisplayMirrorsDisplay(f.display.id) == 0
-            && !CGDisplayIsMain(f.display.id)
-        {
-            f.main_tries += 1;
-            if take_main(f.display.id) {
-                f.main_tries = MAIN_TRIES;
-                bump();
+        //
+        // 换主位是改系统的显示器配置，系统自己也在改（把它加进来、撤掉内建屏、把内建屏记回主屏再撤掉）：两边的请求
+        // 撞在一起时系统会把我们的丢掉（`Dropped config API request`）、并且让自己的配置一直等下去
+        // （`Waiting for previous reconfig to complete`）——抬屏的意思落空，采到的还是空白。所以：建出来先等系统把
+        // 自己那边做完（[`MAIN_FIRST`]）；内建屏还在列表里（合盖过渡期）先不抢（[`MAIN_GRACE`] 之后才不管它）；
+        // 换放到后台线程（[`take_main_later`]），管理线程不等它；没换成退后一点再试（[`MAIN_RETRY`]）
+        if let Some(f) = &mut filling {
+            let mut done = None;
+            if let Some((slot, since)) = &f.main_slot {
+                match slot.load(Ordering::Acquire) {
+                    0 if now.duration_since(*since) < MAIN_TIMEOUT => {}
+                    // 系统那边的配置一直没做完：不陪它等了（后台线程自己会结束），退后一点再试
+                    0 => {
+                        warn!(
+                            id = f.display.id,
+                            "the system hasn't finished the last display configuration: not waiting any longer"
+                        );
+                        done = Some(2);
+                    }
+                    r => done = Some(r),
+                }
+            }
+            if let Some(r) = done {
+                f.main_slot = None;
+                f.main_done = Some(now);
+                if r == 1 {
+                    info!(id = f.display.id, "the virtual display took the main position");
+                    f.main_tries = MAIN_TRIES;
+                    bump();
+                } else {
+                    f.main_tries = f.main_tries.saturating_add(1);
+                    f.main_retry = now + MAIN_RETRY;
+                }
+            }
+            let early = now.duration_since(f.born) < MAIN_FIRST;
+            let late = now.duration_since(f.born) >= MAIN_GRACE;
+            if lid
+                && (fill || ready)
+                && !f.busy()
+                && f.main_tries < MAIN_TRIES
+                && now >= f.main_retry
+                && !early
+                && (builtin.is_none() || late)
+                && CGDisplayMirrorsDisplay(f.display.id) == 0
+                && !CGDisplayIsMain(f.display.id)
+            {
+                f.main_slot = Some((take_main_later(f.display.id), now));
             }
         }
         // 自己在（合上了盖子、补着屏，不在镜像里）：系统换上的是它记着的模式，查一查（见模块说明）。开着盖子预备着
         // 的时候不查、不换：在镜像里换模式内建的显示器会一直撕裂
-        let alone = filling
-            .as_ref()
-            .filter(|f| standby.is_none() && CGDisplayMirrorsDisplay(f.display.id) == 0);
+        // 刚建出来、刚换完主位的时候不改模式：换模式同样是改显示器配置，和系统还在排队的那一串撞上就会被丢掉
+        // （见 [`MAIN_QUIET`]）。等它稳下来再查、再换
+        let alone = filling.as_ref().filter(|f| {
+            !f.quiet(now) && standby.is_none() && CGDisplayMirrorsDisplay(f.display.id) == 0
+        });
         match alone {
             None => mode_watch = None,
             Some(f) => {

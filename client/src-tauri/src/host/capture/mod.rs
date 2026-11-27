@@ -446,6 +446,16 @@ trait Capturer {
 
     /// 订阅者期望的最高帧率变化。由系统按帧率推送画面的采集器（macOS）据此调整，其余忽略。
     fn set_fps(&mut self, _fps: u8) {}
+
+    /// 系统有多久没交上来任何东西了（连"没有变化"的空样本都没有）。
+    ///
+    /// macOS 的 ScreenCaptureKit 会在某些时候静默失效：流不报错、只是不再投帧，`next()` 永远超时返回空更新，
+    /// 画面就永久黑着（合盖远程时锁屏之后就是这样，见 `virtual_display` 的模块说明）。静止的桌面不会这样——系统
+    /// 照样每帧都交一个 `Idle` 空样本，所以"一个样本都没有"是真的坏了。其他平台的采集器没有这种推送语义
+    /// （静止时本来就没东西），不给这个信号
+    fn stalled(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// 哪个显示器、采集时的短边上限、系统画不画光标。后两项只影响 macOS，其余平台同一显示器共用一路采集
@@ -559,6 +569,10 @@ pub fn subscribe(index: u8, fps: u8, max_short: u16, draw: bool) -> Subscription
 /// 让正在采集的每一路都把采集器重开一次（控制端的"重启采集"）。
 /// 一路都没有时什么都不做：采集线程本来就会在订阅后自己打开。
 pub fn restart() {
+    // macOS：ScreenCaptureKit 静默失效时，重开采集流往往救不回来（实测：流重开了照样一帧不交），只有把补屏的
+    // 虚拟显示器换一块，系统才重新投帧。用户等着看画面，所以一起做掉
+    #[cfg(target_os = "macos")]
+    super::virtual_display::rebuild();
     let hub = HUB.lock().unwrap();
     for shared in hub.values().filter_map(Weak::upgrade) {
         shared.restart.store(true, Ordering::Release);
@@ -567,6 +581,16 @@ pub fn restart() {
 
 /// 连续打开失败这么多次（每次间隔 250 ms）才算采集失败
 const REPORT_AFTER: u32 = 4;
+
+/// macOS：系统这么久（连空样本都算）什么都没交上来，就当这块屏不再投帧了：重开采集器
+#[cfg(target_os = "macos")]
+const STALL_REOPEN: Duration = Duration::from_secs(2);
+/// macOS：重开这么多次还是没东西，就把补屏的虚拟显示器换一块（见 `virtual_display::rebuild`）
+#[cfg(target_os = "macos")]
+const STALLS_BEFORE_REBUILD: u32 = 2;
+/// macOS：两次重建虚拟显示器至少隔这么久（换屏要闪一下、窗口跟着搬，别太勤）
+#[cfg(target_os = "macos")]
+const REBUILD_QUIET: Duration = Duration::from_secs(30);
 
 fn capture_loop(shared: Arc<CaptureShared>) {
     let (index, max_short, system_cursor) = shared.key;
@@ -592,6 +616,11 @@ fn capture_loop(shared: Arc<CaptureShared>) {
     let mut opened: Option<u32> = None;
     #[cfg(target_os = "macos")]
     let mut checked = Instant::now();
+    // macOS：连续几轮"重开也还是没东西"（见 `STALL_REOPEN`）、上次重建虚拟显示器的时刻
+    #[cfg(target_os = "macos")]
+    let mut stalls = 0u32;
+    #[cfg(target_os = "macos")]
+    let mut rebuilt: Option<Instant> = None;
     while !shared.stop.load(Ordering::Acquire) {
         // 控制端点"重启采集"：把采集器重开一次（编号没变也可能已经不出帧了）
         if shared.restart.swap(false, Ordering::AcqRel) {
@@ -601,6 +630,7 @@ fn capture_loop(shared: Arc<CaptureShared>) {
             #[cfg(target_os = "macos")]
             {
                 opened = None;
+                stalls = 0;
             }
         }
         // 屏换了就重开：不报错的失效流只能靠这个发现
@@ -646,6 +676,10 @@ fn capture_loop(shared: Arc<CaptureShared>) {
                 }
             },
         };
+        // macOS：系统不再投帧（静默失效，见 [`Capturer::stalled`]）：这一轮的 `next()` 只会超时，记下来，
+        // 等这一轮走完再重开（`c` 还借着 `cap`）
+        #[cfg(target_os = "macos")]
+        let stalled = c.stalled().filter(|d| *d >= STALL_REOPEN);
         // 按订阅者中最高的帧率节流（按画面的时间戳，见 pace）；DXGI 会在等待期间累积画面更新
         let max_fps = shared.max_fps();
         if max_fps != fps {
@@ -666,6 +700,11 @@ fn capture_loop(shared: Arc<CaptureShared>) {
                 // 只有光标动了（带光标的画面）也算一帧：鼠标一动就是每秒几百次更新，也要按帧率来
                 if let Some(f) = u.frame.as_ref().or(u.drawn.as_ref()) {
                     pacer.done(f.captured);
+                    // 又有画面了：之前那些"没动静"不算数了
+                    #[cfg(target_os = "macos")]
+                    {
+                        stalls = 0;
+                    }
                 }
                 if u.frame.is_some()
                     || u.drawn.is_some()
@@ -684,6 +723,33 @@ fn capture_loop(shared: Arc<CaptureShared>) {
                 pool = FramePool::default();
                 std::thread::sleep(Duration::from_millis(50));
             }
+        }
+        // macOS：系统不再投帧。重开采集流（ScreenCaptureKit 的流不报错、只是什么都不交，重开了常常还是一样），
+        // 还不行就把补屏的虚拟显示器换一块：系统对这块屏不再投帧时，只有换一块才能让它重新出画面
+        // （合盖远程时锁屏之后就是这样，见 `virtual_display` 的模块说明）
+        #[cfg(target_os = "macos")]
+        if let Some(idle) = stalled {
+            stalls += 1;
+            warn!(
+                screen = index,
+                ?idle,
+                stalls,
+                "the system stopped delivering frames, reopening the capture"
+            );
+            cap = None;
+            pool = FramePool::default();
+            opened = None;
+            if stalls >= STALLS_BEFORE_REBUILD && rebuilt.is_none_or(|t| t.elapsed() >= REBUILD_QUIET) {
+                warn!(
+                    screen = index,
+                    "the capture keeps stalling, rebuilding the virtual display"
+                );
+                super::virtual_display::rebuild();
+                rebuilt = Some(Instant::now());
+                stalls = 0;
+            }
+            // 别在原地空转：重开本身要花一点时间，给系统喘口气
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
     info!(screen = index, "capture stopped");

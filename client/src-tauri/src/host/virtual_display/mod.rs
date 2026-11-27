@@ -385,6 +385,13 @@ pub fn mode_generation() -> u64 {
     mac::mode_generation()
 }
 
+/// 撤掉补屏的虚拟显示器、马上重建一块（macOS，见 [`mac::rebuild`]）。系统对这块屏不再投帧（采集流静默失效）时，
+/// 重开采集流没用，只有换一块屏系统才重新出画面
+#[cfg(target_os = "macos")]
+pub fn rebuild() {
+    mac::rebuild();
+}
+
 /// macOS：被控端起来看、换补屏的虚拟显示器的模式的子进程（本进程做不了，见 [`mac`]）。不是它的命令行时为 `None`，
 /// 否则是退出码
 #[cfg(target_os = "macos")]
