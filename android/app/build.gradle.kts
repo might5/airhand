@@ -5,7 +5,7 @@ plugins {
 }
 
 // 产品版本与桌面客户端一致（client/src-tauri/tauri.conf.json）；发布时 CI 按 tag 改写（.github/scripts/set-version.mjs）
-val appVersion = "0.4.1"
+val appVersion = "0.4.3"
 
 /**
  * versionCode 由版本号算出：主版本 × 1000000 + 次版本 × 10000 + 修订号 × 100 + 后缀（rc.N → N，正式版 → 99）。
