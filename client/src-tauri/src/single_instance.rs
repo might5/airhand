@@ -17,11 +17,13 @@ pub struct Guard {
 
 #[cfg(windows)]
 fn acquire_once() -> Option<Guard> {
-    use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, SetLastError};
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::core::w;
 
     unsafe {
+        // CreateMutexW 只在"已经有了"时设 ERROR_ALREADY_EXISTS，没设时上一次调用留下的错误码还在
+        SetLastError(ERROR_SUCCESS);
         let handle = CreateMutexW(None, true, w!("Local\\Airhand.SingleInstance")).ok()?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return None;

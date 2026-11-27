@@ -14,8 +14,8 @@ use anyhow::{Result, anyhow};
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFRetained, CFString, CFType};
 use objc2_core_graphics::{
     CGDirectDisplayID, CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayIsMain,
-    CGDisplayMirrorsDisplay, CGDisplayMode, CGError, CGGetActiveDisplayList,
-    CGGetOnlineDisplayList, CGSessionCopyCurrentDictionary,
+    CGDisplayMirrorsDisplay, CGDisplayModelNumber, CGDisplayMode, CGDisplayVendorNumber,
+    CGGetActiveDisplayList, CGGetOnlineDisplayList, CGSessionCopyCurrentDictionary, CGError,
 };
 use objc2_core_media::{CMClock, CMTime, CMTimeFlags};
 
@@ -191,6 +191,13 @@ pub fn online_display_ids() -> Vec<CGDirectDisplayID> {
     ids[..(n as usize).min(ids.len())].to_vec()
 }
 
+/// 系统自己换上的占位屏幕：合上盖子、又没有别的显示器可换的时候，WindowServer 拿它顶上（厂商 "unkn"
+/// 0x756e6b6e、型号 "virt" 0x76697274、序列号 0），上面没有桌面内容，采它只有一片空白（见
+/// `virtual_display::mac` 的模块说明）。它不是给人看的显示器，不列给控制端。
+pub fn placeholder(id: CGDirectDisplayID) -> bool {
+    CGDisplayVendorNumber(id) == 0x756e_6b6e && CGDisplayModelNumber(id) == 0x7669_7274
+}
+
 /// 列出所有显示器：主显示器排第一，其余按坐标从左到右。镜像显示器只算一个。
 pub fn displays() -> Vec<Display> {
     let mut ids = [0 as CGDirectDisplayID; 32];
@@ -202,7 +209,7 @@ pub fn displays() -> Vec<Display> {
     }
     let mut list: Vec<Display> = ids[..(n as usize).min(ids.len())]
         .iter()
-        .filter(|&&id| CGDisplayMirrorsDisplay(id) == 0)
+        .filter(|&&id| CGDisplayMirrorsDisplay(id) == 0 && !placeholder(id))
         .map(|&id| {
             let b = CGDisplayBounds(id);
             // 本进程建的虚拟显示器在本进程里读不到显示模式（别的进程读得到）：用管理线程给的大小（建它时定的，或者

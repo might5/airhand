@@ -67,8 +67,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use objc2_core_graphics::{
-    CGDirectDisplayID, CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayIsBuiltin,
-    CGDisplayIsMain, CGDisplayMirrorsDisplay, CGDisplayMode, CGDisplayScreenSize, CGMainDisplayID,
+    CGBeginDisplayConfiguration, CGCancelDisplayConfiguration, CGCompleteDisplayConfiguration,
+    CGConfigureDisplayOrigin, CGConfigureOption, CGDirectDisplayID, CGDisplayBounds,
+    CGDisplayConfigRef,
+    CGDisplayCopyDisplayMode, CGDisplayIsBuiltin, CGDisplayIsMain, CGDisplayMirrorsDisplay,
+    CGDisplayMode, CGDisplayScreenSize, CGError, CGMainDisplayID,
 };
 use tracing::{info, warn};
 
@@ -92,6 +95,8 @@ const MODE_CHECKS: u32 = 4;
 const AC_CHECK: Duration = Duration::from_secs(5);
 /// 建不出来的话过这么久再试
 const RETRY: Duration = Duration::from_secs(10);
+/// 合上盖子、没有别的显示器时把自己换到主位最多试几次（见 [`take_main`]）：系统把它加进配置要一会儿
+const MAIN_TRIES: u8 = 3;
 /// 打开防窥之后、盖上黑窗口之前多久看一次（盖上了才算开着）
 const STARTING: Duration = Duration::from_millis(100);
 /// 打开防窥之后这么久黑窗口还没盖上（主线程没处理），就算没能打开
@@ -764,6 +769,8 @@ fn follow_mode(vd: &VirtualDisplay, watch: &mut ModeWatch) {
 struct Filling {
     display: VirtualDisplay,
     _running: power::Running,
+    /// 试过几次把它换到主位（见 [`take_main`]）
+    main_tries: u8,
 }
 
 pub(super) fn spawn() {
@@ -780,7 +787,8 @@ fn bump() {
     HUB.displays.send_modify(|g| *g = g.wrapping_add(1));
 }
 
-/// 接着的显示器里能用的（不算虚拟显示器 `ours`；合着盖子时不算内建的）
+/// 接着的显示器里能用的（不算虚拟显示器 `ours`；合着盖子时不算内建的；系统换上的占位屏不算——上面没有桌面
+/// 内容，把它算进来就会以为"有显示器"，自己的屏不建，控制端采到的是一片空白）
 fn usable_displays(
     online: &[CGDirectDisplayID],
     ours: Option<CGDirectDisplayID>,
@@ -789,8 +797,60 @@ fn usable_displays(
     online
         .iter()
         .copied()
-        .filter(|&id| Some(id) != ours && !(lid && CGDisplayIsBuiltin(id)))
+        .filter(|&id| {
+            Some(id) != ours
+                && !(lid && CGDisplayIsBuiltin(id))
+                && !macos::placeholder(id)
+        })
         .collect()
+}
+
+/// 除了自己的屏、除了系统换上的占位屏，没有别的显示器可用：合上盖子、又没接显示器的笔记本
+pub(super) fn alone() -> bool {
+    let lid = macos::lid_state().unwrap_or(false);
+    usable_displays(&macos::online_display_ids(), current(), lid).is_empty()
+}
+
+/// 把虚拟显示器换到主位（原点 (0, 0)），原来占着主位的那块挪到它原来的位置：只交换"谁在主位"，别的都不变。
+///
+/// 合上盖子、除了系统换上的占位屏没有别的显示器时，系统把桌面留在占位屏上（它是主屏），再建的虚拟显示器只是接在
+/// 右边的扩展屏：控制端采它只有一片空白，占位屏上才有窗口。换完主位，窗口跟着回到虚拟显示器上，控制端就有画面了。
+/// 只在会话里生效（`ForSession`，不用管理员权限），也不改系统记着的排列。改过返回 true。
+fn take_main(ours: CGDirectDisplayID) -> bool {
+    let main = CGMainDisplayID();
+    if main == ours {
+        return false;
+    }
+    let at = CGDisplayBounds(ours);
+    let mut conf: CGDisplayConfigRef = std::ptr::null_mut();
+    unsafe {
+        if CGBeginDisplayConfiguration(&mut conf) != CGError::Success {
+            warn!(id = ours, "can't begin the display configuration");
+            return false;
+        }
+        // 先把它挪到我们原来的位置，再把我们挪到主位：两块屏不重叠，换的是主位，不是镜像
+        let moved = CGConfigureDisplayOrigin(conf, main, at.origin.x as i32, at.origin.y as i32);
+        let placed = CGConfigureDisplayOrigin(conf, ours, 0, 0);
+        let done = if moved == CGError::Success && placed == CGError::Success {
+            CGCompleteDisplayConfiguration(conf, CGConfigureOption::ForSession)
+        } else {
+            CGCancelDisplayConfiguration(conf);
+            moved
+        };
+        if done != CGError::Success {
+            warn!(
+                id = ours,
+                main,
+                moved = moved.0,
+                placed = placed.0,
+                "can't move the virtual display to the main position: CGError {}",
+                done.0
+            );
+            return false;
+        }
+    }
+    info!(id = ours, main, "the virtual display took the main position");
+    true
 }
 
 /// 防窥（见 [`super::curtain`]）：要开着就打开，不要了就关掉（恢复原样）；黑窗口盖上了才算开着
@@ -923,9 +983,13 @@ fn run() {
         // 合上盖子时 lid 直接参与判断：此时系统会自己换上一块没内容的占位屏（unkn/virt/serial=0）算进 usable 让
         // fill=false，两条件都不成立就会把自建屏撤掉，Clamshell Sleep 随即生效、只剩那块占位屏可采，画面全黑。
         // 所以合盖时无论如何都留着自建屏（万一把它撤了，宁可先不建新的也不撤旧的）
+        // 合着盖子、又没有别的显示器（系统换上的占位屏不算，见 `usable_displays`）时不等会话就建：Airhand 一重启，
+        // 自己的屏就没了，控制端重连上来之前系统只有那块没内容的占位屏，桌面也留在它上面——等控制端连上再建，
+        // 新屏只是接在旁边的扩展屏，采它全是空白（黑屏）。先建好，控制端一连上就有画面。
         let wanted = can_create
             && !stopping
-            && ((sessions && (fill || standby.is_some() || lid))
+            && ((lid && fill)
+                || (sessions && (fill || standby.is_some() || lid))
                 || (ready && (standby.is_some() || lid || (fill && filling.is_some()))));
         match (&filling, wanted) {
             // 照着现在看到的本机显示器建；读不到的话（没见过这样的，兜底）照着最近看到的，什么都没见过才是 1080p：
@@ -953,6 +1017,7 @@ fn run() {
                         filling = Some(Filling {
                             display: vd,
                             _running: power::keep_running(),
+                            main_tries: 0,
                         });
                         retry_at = None;
                         bump();
@@ -986,6 +1051,22 @@ fn run() {
                 _ => unmirrored_since = None,
             },
             _ => {}
+        }
+        // 合上了盖子：桌面可能留在别人占着的主位上（系统换上的占位屏、远程管理自己生成的那块屏、重启之后系统记着的
+        // 那块），自己的屏只是接在边上的扩展屏，采它只有一片空白——用户看到的就是"重启 Airhand 之后黑屏"。
+        // 控制端连着的（或者除了自己没别的屏可用）就把它换到主位（见 take_main），窗口跟着回来，控制端就有画面了
+        if let Some(f) = &mut filling
+            && lid
+            && (fill || ready)
+            && f.main_tries < MAIN_TRIES
+            && CGDisplayMirrorsDisplay(f.display.id) == 0
+            && !CGDisplayIsMain(f.display.id)
+        {
+            f.main_tries += 1;
+            if take_main(f.display.id) {
+                f.main_tries = MAIN_TRIES;
+                bump();
+            }
         }
         // 自己在（合上了盖子、补着屏，不在镜像里）：系统换上的是它记着的模式，查一查（见模块说明）。开着盖子预备着
         // 的时候不查、不换：在镜像里换模式内建的显示器会一直撕裂

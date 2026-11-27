@@ -191,6 +191,9 @@ fn switch_services(app: &AppHandle, mode: Mode) {
                 )));
                 #[cfg(target_os = "macos")]
                 host::macos::request_permissions();
+                // 合着盖子、又没有别的显示器：补屏的虚拟显示器得现在就有（见 virtual_display::mac）
+                #[cfg(target_os = "macos")]
+                host::virtual_display::start_when_alone();
             }
             Mode::Host => {}
             Mode::Controller => {
@@ -374,12 +377,37 @@ fn on_console_destroyed(app: &AppHandle) {
     }
 }
 
-/// 退出、重启之前先把手上的东西收干净：Windows 安装版停掉被控端服务，再放掉两条服务句柄。
-fn shutdown(app: &AppHandle) {
+thread_local! {
+    // 单实例（见 release_instance）：本进程占着，重启时提前放开
+    static INSTANCE: std::cell::RefCell<Option<single_instance::Guard>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 提前放开单实例：重启是先起新进程、再退出自己，占着的名字（Windows 的互斥量、macOS 的 Mach 端口名）得先放开，
+/// 新的那份才能立刻起来——否则它会撞在这份还没退出的身上，重试几次就放弃了（见 `single_instance::acquire`）
+fn release_instance() {
+    INSTANCE.with(|i| {
+        if let Some(guard) = i.borrow_mut().take() {
+            #[cfg(windows)]
+            guard.release();
+            #[cfg(not(windows))]
+            drop(guard);
+        }
+    });
+}
+
+/// 退出、重启之前先把手上的东西收干净：放掉两条服务句柄。`stop_service` 时（退出，不是重启）Windows 安装版
+/// 连被控端服务一起停掉。
+fn shutdown(app: &AppHandle, stop_service: bool) {
+    #[cfg(not(windows))]
+    let _ = stop_service;
     let state = app.state::<AppState>();
-    // Windows 安装版：退出 = 被控端也停止（和直接运行时一样，退出后本机不能再被控制）
+    // Windows 安装版：退出 = 被控端也停止（和直接运行时一样，退出后本机不能再被控制）。
+    // 重启**不能**停服务：托盘起来的这一份只连服务、不会把它拉起来（启动服务的只有 `--install` 和菜单里的
+    // 「启动服务」），停了就再也没人起——用户看到的正是"点了重启，Airhand 全没了"
     #[cfg(windows)]
-    if state.service_mode
+    if stop_service
+        && state.service_mode
         && let Err(e) = winsvc::stop()
     {
         warn!("can't stop the Airhand service: {e:#}");
@@ -553,13 +581,11 @@ pub(crate) fn on_menu(app: &AppHandle, id: &str) {
                 ) {
                     return;
                 }
-                shutdown(&handle);
-                // Windows 安装版：等被控端服务真的停下，新进程才能立刻把它重新拉起来
-                #[cfg(windows)]
-                if let Err(e) = winsvc::stop_and_wait_ready() {
-                    warn!("can't wait for the Airhand service to stop: {e:#}");
-                }
-                handle.request_restart()
+                // 占着的单实例先放开：新的那份要立刻起来，不能撞在这份还没退出的身上
+                release_instance();
+                // 只重启这个进程，被控端服务不动（见 `shutdown`）
+                shutdown(&handle, false);
+                handle.request_restart();
             });
         }
         "quit" => {
@@ -576,7 +602,7 @@ pub(crate) fn on_menu(app: &AppHandle, id: &str) {
                 ) {
                     return;
                 }
-                shutdown(&handle);
+                shutdown(&handle, true);
                 handle.exit(0);
             });
         }
@@ -778,7 +804,8 @@ pub fn run() {
     #[cfg(not(windows))]
     let service_mode = false;
     let Some(instance) = single_instance::acquire() else {
-        // 已经有一个实例在运行（托盘里），直接退出
+        // 已经有一个实例在运行（托盘里），直接退出。留意日志：重启时新的那份本该立刻拿到名字
+        warn!("another Airhand is already running: exiting");
         return;
     };
     // 配置文件由本进程维护（Windows 安装版由服务里的被控端维护，见 winsvc::agent）：
@@ -869,6 +896,10 @@ pub fn run() {
                 Hosting::InProcess(HostService::start(hub.clone(), code))
             };
             app.state::<AppState>().services.lock().unwrap().host = Some(hosting);
+            // 合着盖子、又没有别的显示器：补屏的虚拟显示器得现在就有（见 virtual_display::mac）。重启之后系统只剩
+            // 那块没内容的占位屏，等控制端连上来再建就晚了——那时系统已经 Clamshell Sleep，建的屏采不到画面
+            #[cfg(target_os = "macos")]
+            host::virtual_display::start_when_alone();
             // 仅调试构建：方便开发时直接进入控制端
             let dev_controller =
                 cfg!(debug_assertions) && std::env::var_os("AIRHAND_DEV_CONTROLLER").is_some();
@@ -916,13 +947,13 @@ pub fn run() {
     // 单实例一直占到进程退出。仅为当前用户安装时交给下面的检查：运行中别的用户为所有用户安装了 Airhand 的话，
     // 这一份让开，那时提前放开
     #[cfg(windows)]
-    let instance = if user_install {
+    if user_install {
         watch_service_installed(app.handle().clone(), instance);
-        None
     } else {
-        Some(instance)
-    };
-    let _instance = instance;
+        INSTANCE.with(|i| *i.borrow_mut() = Some(instance));
+    }
+    #[cfg(not(windows))]
+    INSTANCE.with(|i| *i.borrow_mut() = Some(instance));
     // macOS：和其它平台一样启动后只有托盘（菜单栏）图标，程序坞里没有图标；打开控制台时才显示。
     // 打包的 .app 在 Info.plist 里声明了 LSUIElement，这里是给直接运行的可执行文件用的
     #[cfg(target_os = "macos")]

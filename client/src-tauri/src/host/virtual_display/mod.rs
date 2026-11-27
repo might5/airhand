@@ -356,6 +356,23 @@ pub fn set_quality(fps: u8) {
     let _ = fps;
 }
 
+/// 合着盖子、又没接显示器时先把补屏的管理线程拉起来（macOS，见 [`mac`]）：Airhand 重启之后系统只剩那块没内容的
+/// 占位屏，等控制端连上来再建就晚了——那时系统已经 Clamshell Sleep，建的虚拟显示器一帧也采不到
+#[cfg(target_os = "macos")]
+pub fn start_when_alone() {
+    if !mac::usable() || crate::host::macos::lid_state() != Some(true) || !mac::alone() {
+        return;
+    }
+    let mut w = HUB.wants.lock().unwrap();
+    if w.running {
+        return;
+    }
+    w.running = true;
+    w.stopping = false;
+    mac::spawn();
+    w.poke();
+}
+
 /// 本进程补屏的虚拟显示器的像素大小（macOS，见 [`mac`]）；`id` 不是它时为 `None`
 #[cfg(target_os = "macos")]
 pub fn pixels(id: u32) -> Option<(u32, u32)> {

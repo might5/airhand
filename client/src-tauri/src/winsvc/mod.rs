@@ -370,15 +370,6 @@ pub fn stop() -> Result<()> {
     }
 }
 
-/// 重启之前用：请求停止服务，并等它真的停下。
-/// 托盘里的「重启 Airhand」会由新进程立刻把被控端重新拉起来，服务还停在 STOPPING 的话起不来。
-pub fn stop_and_wait_ready() -> Result<()> {
-    let Some(svc) = open_service(SERVICE_STOP | SERVICE_QUERY_STATUS)? else {
-        return Ok(());
-    };
-    stop_and_wait(&svc, Duration::from_secs(20))
-}
-
 /// 停止服务并等它停下来
 fn stop_and_wait(svc: &Sc, timeout: Duration) -> Result<()> {
     let mut st = SERVICE_STATUS::default();
