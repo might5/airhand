@@ -567,6 +567,9 @@ open_enum! {
         PowerMenu = 7 => "powerMenu",
         VolumeUp = 8 => "volumeUp",
         VolumeDown = 9 => "volumeDown",
+        /// 让被控端把采集器重开一次：系统的采集流会静默失效（不报错、只是不再出帧），
+        /// 靠它救画面。桌面被控端才声明这个能力（见 `HostHello::actions`）
+        RestartCapture = 10 => "restartCapture",
     }
 }
 

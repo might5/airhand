@@ -534,6 +534,13 @@ impl Platform for Desktop {
         if !dark {
             power::wake_display();
         }
+        // 锁着屏的时候采集不到画面（见 `power` 模块说明）：记一笔，免得当成采集坏了去查
+        #[cfg(target_os = "macos")]
+        if super::macos::screen_locked() == Some(true) {
+            tracing::warn!(
+                "the screen is locked: the controller sees nothing until it's unlocked on this computer"
+            );
+        }
         let (mut displays, codecs, env_notice, encoder_notice) = tokio::task::spawn_blocking(|| {
             (
                 capture::displays(),
@@ -576,7 +583,9 @@ impl Platform for Desktop {
             current_display: view.first().map_or(0, |v| v.display),
             codecs,
             platform: PLATFORM,
-            // 桌面被控端只有鼠标键盘：不接收触摸，也没有手机那样的系统操作（快捷键由控制端发按键）
+            // 桌面被控端只有鼠标键盘：不接收触摸，也没有手机那样的系统操作（快捷键由控制端发按键）。
+            // "重启采集"不写进 `actions`（那是系统操作，控制端会据此换掉快捷键列表），
+            // 控制端按钮直接发 `InputEvent::System { action: RestartCapture }`
             touch: false,
             actions: Vec::new(),
             shown: view.iter().map(|v| v.display).collect(),

@@ -32,7 +32,12 @@
 //! 合盖之后由虚拟显示器顶上（见 `virtual_display`）。
 //!
 //! **有虚拟显示器期间**（[`keep_running`]）：也要着 `PreventSystemSleep`，最后一个会话结束后等重连的那一会儿
-//! 合着盖子也不睡眠。
+//! 合着盖子也不睡眠。**合着盖子时还定时当作本机有人碰了一下**（每 [`KEEP_UNLOCKED_EVERY`] 一次）：没有人碰本机
+//! 的话屏保十分钟就起来、跟着锁屏，而锁屏之后 ScreenCaptureKit 一帧也采不到，控制端连上来只看得到黑屏——
+//! 先不让它锁上，比锁上之后再想办法省事。开着盖子时不叫（本机的人该有的屏保照旧）。
+//!
+//! 已经锁上的屏、熄灭的屏只能靠声明"本机有人"点亮：真的解锁得输密码，被控端不做这件事，控制端连上锁屏画面
+//! （能采集、能接收键鼠）自己解。
 //!
 //! **不自动睡眠**（托盘菜单，默认关，`config.toml` 的 `prevent_sleep`）：电脑睡眠时进程被冻结，和服务器的连接断开，
 //! 控制端只能看到它离线。打开后被控端运行期间（不只是有会话时，见 [`Hosting`]）一直要着 `PreventUserIdleSystemSleep`
@@ -138,10 +143,14 @@ mod imp {
 #[cfg(target_os = "macos")]
 mod imp {
     use std::ptr::NonNull;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use objc2_core_foundation::{CFRetained, CFString, CFType};
+    use objc2_core_graphics::{
+        CGEvent, CGEventField, CGEventTapLocation, CGEventType, CGMouseButton,
+    };
     use tracing::{debug, info, warn};
 
     /// `IOPMAssertionID`
@@ -261,20 +270,81 @@ mod imp {
                 .all(|id| CGDisplayIsBuiltin(id))
     }
 
-    /// 有虚拟显示器期间不睡眠（见 [`super::keep_running`]）。丢掉时放开
-    pub struct Running(Option<AssertionId>);
+    /// 防锁屏：合着盖子远程值守时多久当作一次"本机有人碰了一下"（见 [`keep_running`]）。屏保的默认空闲时间是
+    /// 10 分钟，这里要远小于它
+    const KEEP_UNLOCKED_EVERY: Duration = Duration::from_secs(60);
+
+    /// 本机"有人碰了一下"：让光标原地动一下。锁屏之后 `IOPMAssertionDeclareUserActivity` 不再重置空闲计时
+    /// （实测 `HIDIdleTime` 照涨，屏保还是会起来、跟着锁屏），真的发一个鼠标移动事件才会把它归零
+    fn nudge_cursor() {
+        let Some(moved) = CGEvent::new(None).map(|e| CGEvent::location(Some(&e))) else {
+            warn!("can't read the cursor position: not keeping the screen unlocked");
+            return;
+        };
+        let Some(ev) = CGEvent::new_mouse_event(
+            None,
+            CGEventType::MouseMoved,
+            moved,
+            CGMouseButton::Left,
+        ) else {
+            warn!("can't make a mouse event: not keeping the screen unlocked");
+            return;
+        };
+        // 位置没动，只为了把系统的空闲计时归零
+        CGEvent::set_integer_value_field(Some(&ev), CGEventField::MouseEventDeltaX, 0);
+        CGEvent::set_integer_value_field(Some(&ev), CGEventField::MouseEventDeltaY, 0);
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&ev));
+    }
+
+    /// 有虚拟显示器期间不睡眠（见 [`super::keep_running`]），合着盖子时还不让屏保起来（见 [`Self`]的说明）。
+    /// 丢掉时放开
+    pub struct Running {
+        /// `PreventSystemSleep`（没要成：`None`）
+        assertion: Option<AssertionId>,
+        /// 丢掉时叫停防锁屏的线程
+        stop: Arc<AtomicBool>,
+    }
 
     pub fn keep_running() -> Running {
         let id = create(NO_SLEEP, "Airhand: a virtual display is in use");
         if id.is_some() {
             info!("preventing sleep while the virtual display is in use");
         }
-        Running(id)
+        // 合着盖子远程值守时没有人碰本机：屏保十分钟就起来，跟着锁屏。锁屏之后 ScreenCaptureKit 一帧也采不到
+        // （见模块说明），控制端连上来只看得到黑屏。定时当作本机有活动，屏保就起不来，也就不会锁屏。
+        // 开着盖子时不叫：本机的人该有的屏保、该锁的屏照旧
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let spawned = std::thread::Builder::new()
+            .name("airhand-unlocked".into())
+            .spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    if crate::host::macos::lid_closed() {
+                        wake_display();
+                        nudge_cursor();
+                    }
+                    // 一秒一秒地睡，`Running` 丢掉时能马上退出
+                    for _ in 0..KEEP_UNLOCKED_EVERY.as_secs() {
+                        if flag.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            warn!("can't keep the screen unlocked: {e}");
+        }
+        Running {
+            assertion: id,
+            stop,
+        }
     }
 
     impl Drop for Running {
         fn drop(&mut self) {
-            if let Some(id) = self.0.take() {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(id) = self.assertion.take() {
                 release(id);
                 info!("the computer may sleep when the lid is closed again");
             }

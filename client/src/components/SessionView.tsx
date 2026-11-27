@@ -113,6 +113,7 @@ type Menu =
   | "audio"
   | "mic"
   | "privacy"
+  | "power"
   | "sessions";
 
 /** 鼠标模式的图标（工具栏的鼠标按钮显示现在的） */
@@ -718,9 +719,42 @@ export function SessionView({ s }: { s: RemoteSession }) {
             {immersive ? <IconShrink size={17} /> : <IconExpand size={17} />}
           </button>
           <span className="tb-sep" />
-          <button className="tb-btn icon danger" title={t("session.disconnect")} onClick={() => closeTab(s.id)}>
-            <IconPower size={17} />
-          </button>
+          {/* 电源按钮：下一级是断开连接，桌面被控端还能让对方重开一次采集（画面静默失效时救画面） */}
+          <div className="menu-anchor">
+            <button
+              className={`tb-btn icon danger ${menu === "power" ? "on" : ""}`}
+              title={t("session.power")}
+              onClick={() => toggleMenu("power")}
+            >
+              <IconPower size={17} />
+            </button>
+            {menu === "power" && (
+              <Dropdown onClose={closeMenu} className="power-menu">
+                {s.hostPlatform !== null && (s.hostPlatform === "mac" || s.hostPlatform === "windows" || s.hostPlatform === "linux") && (
+                  <button
+                    className="dd-item"
+                    onClick={() => {
+                      s.sendSystem("restartCapture");
+                      closeMenu();
+                      setToast(t("session.restartCaptureSent"));
+                      s.focus();
+                    }}
+                  >
+                    {t("session.restartCapture")}
+                  </button>
+                )}
+                <button
+                  className="dd-item"
+                  onClick={() => {
+                    closeMenu();
+                    closeTab(s.id);
+                  }}
+                >
+                  {t("session.disconnect")}
+                </button>
+              </Dropdown>
+            )}
+          </div>
         </div>
       </header>
 

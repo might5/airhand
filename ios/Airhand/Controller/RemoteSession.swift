@@ -678,7 +678,9 @@ final class RemoteSession {
 
     /// 系统操作（只有对方在 Hello 里列出的才发）
     func system(_ a: SystemAction) {
-        if hello?.actions.contains(a) == true { input([Input.system(a)]) }
+        // 「重启采集」是桌面被控端的救援按钮：它不在 `actions` 里（那是系统操作，列出来会顶掉快捷键），
+        // 但始终可发，由被控端自己决定认不认
+        if a == .restartCapture || hello?.actions.contains(a) == true { input([Input.system(a)]) }
     }
 
     func sendClipboard(_ text: String) {

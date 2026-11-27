@@ -112,6 +112,8 @@ struct DisplayInfo: Equatable, Identifiable {
 /// 系统操作，与 Rust 的 `airhand_proto::session::SystemAction` 对应
 enum SystemAction: String, CaseIterable {
     case back, home, recents, notifications, quickSettings, screenshot, lockScreen, powerMenu, volumeUp, volumeDown
+    /// 让被控端把采集器重开一次（系统采集流会静默失效，靠它救画面）
+    case restartCapture
 }
 
 /// 被控端是哪种系统：决定默认的操作方式、快捷键和导航键

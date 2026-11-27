@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use airhand_proto::session::{DisplayInfo, InputEvent, MouseButton};
+use airhand_proto::session::{DisplayInfo, InputEvent, MouseButton, SystemAction};
 use objc2_core_foundation::{CFRetained, CGPoint};
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
@@ -156,8 +156,12 @@ impl MacInjector {
                 }
                 InputEvent::Text { text } => self.type_text(text),
                 InputEvent::ReleaseAll => self.release_all(),
-                // 桌面被控端不声明触摸和系统操作（HostHello），控制端不会发
-                InputEvent::Touch { .. } | InputEvent::System { .. } => {}
+                // 桌面被控端只声明了"重启采集"这一项系统操作，其余是控制端不该发的
+                InputEvent::System { action } => match action {
+                    SystemAction::RestartCapture => crate::host::capture::restart(),
+                    _ => {}
+                },
+                InputEvent::Touch { .. } => {}
             }
         }
     }

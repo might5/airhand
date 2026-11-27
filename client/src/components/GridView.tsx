@@ -3,7 +3,7 @@ import { useT } from "../lib/i18n";
 import { sessionStateText } from "../lib/messages";
 import type { RemoteSession } from "../lib/session";
 import { store, useSession, useSessionTitle, useStore } from "../lib/store";
-import { IconClose, IconPlus } from "./Icons";
+import { IconClose, IconPlus, IconRefresh } from "./Icons";
 import { CanvasHost } from "./SessionView";
 
 /** 多屏总览：所有会话的实时画面，点击进入控制 */
@@ -51,6 +51,19 @@ function Tile({ s }: { s: RemoteSession }) {
         <span className={`dot ${s.state}`} />
         <span className="tile-name">{name}</span>
         <span className="muted small tile-stats">{s.state === "live" ? sessionStateText(s) : fmtCode(s.code)}</span>
+        {/* 桌面被控端：画面静默失效（不报错、只是不再出帧）时让对面把采集器重开一次 */}
+        {(s.hostPlatform === "mac" || s.hostPlatform === "windows" || s.hostPlatform === "linux") && (
+          <button
+            className="icon-btn subtle"
+            title={t("session.restartCapture")}
+            onClick={(e) => {
+              e.stopPropagation();
+              s.sendSystem("restartCapture");
+            }}
+          >
+            <IconRefresh size={14} />
+          </button>
+        )}
         <button
           className="icon-btn subtle"
           title={t("common.disconnect")}

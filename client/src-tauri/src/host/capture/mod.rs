@@ -463,6 +463,9 @@ struct CaptureShared {
     key: Key,
     slot: FrameSlot,
     stop: AtomicBool,
+    /// 控制端点"重启采集"：采集线程看到就把采集器重开一次。系统那边静默失效（不报错、只是不出帧）时，
+    /// 编号没变的流靠不住，得让用户能手动救一下
+    restart: AtomicBool,
     subs: Mutex<HashMap<u64, Want>>,
 }
 
@@ -541,6 +544,7 @@ pub fn subscribe(index: u8, fps: u8, max_short: u16, draw: bool) -> Subscription
         key,
         slot: FrameSlot::new(),
         stop: AtomicBool::new(false),
+        restart: AtomicBool::new(false),
         subs: Mutex::new(HashMap::from([(id, want)])),
     });
     hub.insert(key, Arc::downgrade(&shared));
@@ -550,6 +554,15 @@ pub fn subscribe(index: u8, fps: u8, max_short: u16, draw: bool) -> Subscription
         .spawn(move || capture_loop(thread_shared))
         .expect("spawn capture thread");
     Subscription { shared, id }
+}
+
+/// 让正在采集的每一路都把采集器重开一次（控制端的"重启采集"）。
+/// 一路都没有时什么都不做：采集线程本来就会在订阅后自己打开。
+pub fn restart() {
+    let hub = HUB.lock().unwrap();
+    for shared in hub.values().filter_map(Weak::upgrade) {
+        shared.restart.store(true, Ordering::Release);
+    }
 }
 
 /// 连续打开失败这么多次（每次间隔 250 ms）才算采集失败
@@ -572,7 +585,36 @@ fn capture_loop(shared: Arc<CaptureShared>) {
     let mut failures = 0u32;
     let mut fps = shared.max_fps();
     let mut pacer = Pacer::new(fps);
+    // macOS：打开时那块屏的编号。ScreenCaptureKit 的流绑在具体的一块屏上，那块屏被销毁重建（合盖远程、屏幕共享
+    // 连上又断开时系统会换掉虚拟显示器）之后，旧流不报错、只是不再出帧，`next()` 一直超时返回空更新，画面就永久
+    // 黑着，只能重启进程。这里靠编号变化把流重开
+    #[cfg(target_os = "macos")]
+    let mut opened: Option<u32> = None;
+    #[cfg(target_os = "macos")]
+    let mut checked = Instant::now();
     while !shared.stop.load(Ordering::Acquire) {
+        // 控制端点"重启采集"：把采集器重开一次（编号没变也可能已经不出帧了）
+        if shared.restart.swap(false, Ordering::AcqRel) {
+            info!(screen = index, "restart requested, reopening");
+            cap = None;
+            pool = FramePool::default();
+            #[cfg(target_os = "macos")]
+            {
+                opened = None;
+            }
+        }
+        // 屏换了就重开：不报错的失效流只能靠这个发现
+        #[cfg(target_os = "macos")]
+        if cap.is_some() && checked.elapsed() >= Duration::from_millis(500) {
+            checked = Instant::now();
+            let now = super::macos::display(index).ok().map(|d| d.id);
+            if now != opened {
+                info!(screen = index, ?opened, ?now, "the display changed, reopening");
+                cap = None;
+                pool = FramePool::default();
+                opened = None;
+            }
+        }
         let c = match cap.as_mut() {
             Some(c) => c,
             None => match open(index, shared.max_fps(), max_short, system_cursor) {
@@ -580,6 +622,10 @@ fn capture_loop(shared: Arc<CaptureShared>) {
                     failures = 0;
                     fps = shared.max_fps();
                     pacer.set_fps(fps);
+                    #[cfg(target_os = "macos")]
+                    {
+                        opened = super::macos::display(index).ok().map(|d| d.id);
+                    }
                     cap.insert(c)
                 }
                 Err(e) => {

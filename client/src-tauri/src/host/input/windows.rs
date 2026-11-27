@@ -179,8 +179,12 @@ impl WinInjector {
                     }
                 }
                 InputEvent::ReleaseAll => self.push_release_all(),
-                // 桌面被控端不声明触摸和系统操作（HostHello），控制端不会发
-                InputEvent::Touch { .. } | InputEvent::System { .. } => {}
+                // 「重启采集」是控制端唯一会发的系统操作（HostHello 不声明能力，控制端直接发），其余忽略
+                InputEvent::System { action } => match action {
+                    airhand_proto::session::SystemAction::RestartCapture => crate::host::capture::restart(),
+                    _ => {}
+                },
+                InputEvent::Touch { .. } => {}
             }
         }
         self.flush();

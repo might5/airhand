@@ -313,7 +313,26 @@ impl Default for Shape {
     }
 }
 
+/// 虚拟显示器的固定大小；`None` 就照本机显示器建（原来的行为）。
+///
+/// 屏幕共享（ARD）连上时会把内建屏的显示模式换掉，虚拟显示器照着它建就会变成竖着的怪尺寸（例如 800x1542），
+/// 断开之后虚拟显示器还带着那个尺寸重建，远程画面比例全错，所以这里定死。
+const FIXED_SIZE: Option<(u32, u32)> = Some((1920, 1080));
+
 impl Shape {
+    /// 定死的那个样子（见 [`FIXED_SIZE`]）：按每英寸 110 点估物理尺寸，和 [`Shape::of`] 读不出物理尺寸时一样
+    fn fixed(width: u32, height: u32) -> Self {
+        let per_mm = 110.0 / 25.4;
+        let even = |v: u32| (v & !1).max(2);
+        let (width, height) = (even(width), even(height));
+        Self {
+            width,
+            height,
+            hidpi: false,
+            mm: (width as f64 / per_mm, height as f64 / per_mm),
+        }
+    }
+
     /// 和一块显示器一样：`points` 是它的大小（点），`pixels` 是像素，`mm` 是物理尺寸
     fn of(points: (f64, f64), pixels: (u32, u32), mm: (f64, f64)) -> Self {
         let even = |v: f64| ((v.round() as u32) & !1).max(2);
@@ -879,13 +898,17 @@ fn run() {
             .into_iter()
             .chain(usable.iter().copied())
             .find_map(shape_of);
-        let shape = {
-            let mut last = SEEN.lock().unwrap();
-            if seen.is_some() {
-                *last = seen;
+        let shape = match FIXED_SIZE {
+            // 定死了就照它建，不用跟着本机屏走（见 FIXED_SIZE）
+            Some((w, h)) => Shape::fixed(w, h),
+            None => {
+                let mut last = SEEN.lock().unwrap();
+                if seen.is_some() {
+                    *last = seen;
+                }
+                last.or_else(|| builtin.and_then(shape_of))
+                    .unwrap_or_default()
             }
-            last.or_else(|| builtin.and_then(shape_of))
-                .unwrap_or_default()
         };
         if fill {
             usable_since = None;

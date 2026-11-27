@@ -158,7 +158,7 @@ enum L {
         "combo_paste_mac": "⌘ + V 粘贴", "combo_undo_mac": "⌘ + Z 撤销",
         "action_back": "返回", "action_home": "主页", "action_recents": "最近任务", "action_notifications": "通知栏",
         "action_quickSettings": "快捷设置", "action_screenshot": "截屏", "action_lockScreen": "锁屏", "action_powerMenu": "电源菜单",
-        "action_volumeUp": "音量 +", "action_volumeDown": "音量 −",
+        "action_volumeUp": "音量 +", "action_volumeDown": "音量 −", "menu_restart_capture": "重启采集",
         // 提示
         "notice_no_displays": "对方没有可采集的显示器",
         "notice_wayland": "对方电脑是 Wayland 桌面：目前只能采集和操作 X11（XWayland）程序。请在对方电脑的登录界面改用 X11（Xorg）会话",
@@ -326,7 +326,7 @@ enum L {
         "combo_paste_mac": "⌘ + V paste", "combo_undo_mac": "⌘ + Z undo",
         "action_back": "Back", "action_home": "Home", "action_recents": "Recents", "action_notifications": "Notifications",
         "action_quickSettings": "Quick settings", "action_screenshot": "Screenshot", "action_lockScreen": "Lock screen", "action_powerMenu": "Power menu",
-        "action_volumeUp": "Volume +", "action_volumeDown": "Volume −",
+        "action_volumeUp": "Volume +", "action_volumeDown": "Volume −", "menu_restart_capture": "Restart capture",
         "notice_no_displays": "The remote has no display to capture",
         "notice_wayland": "The remote computer runs a Wayland desktop: only X11 (XWayland) apps can be captured and controlled. Switch to an X11 (Xorg) session at its login screen",
         "notice_capture_failed": "Screen capture failed on the remote, retrying: %@", "notice_audio_failed": "The remote can't capture sound: %@",

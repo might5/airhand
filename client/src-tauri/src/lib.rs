@@ -21,6 +21,7 @@ mod awdl;
 mod clipboard;
 mod clipfiles;
 mod config;
+mod confirm;
 mod console;
 mod devices;
 #[cfg(test)]
@@ -536,19 +537,48 @@ pub(crate) fn on_menu(app: &AppHandle, id: &str) {
             }
         }
         // 重启：先按「退出」把手上的东西收干净，再让 Tauri 走一遍正常的退出流程把自己重新拉起来，
-        // 用法上和「退出」之后再打开一次完全一样（改完配置文件不用手动操作；Windows 安装版的被控端服务由新进程重新连上）
+        // 用法上和「退出」之后再打开一次完全一样（改完配置文件不用手动操作；Windows 安装版的被控端服务由新进程重新连上）。
+        // 会断开正在控制本机的连接，先确认一次：对话框是模态的，等这次菜单事件处理完再在主线程上弹出来
         "restart" => {
-            shutdown(app);
-            // Windows 安装版：等被控端服务真的停下，新进程才能立刻把它重新拉起来
-            #[cfg(windows)]
-            if let Err(e) = winsvc::stop_and_wait_ready() {
-                warn!("can't wait for the Airhand service to stop: {e:#}");
-            }
-            app.request_restart()
+            let handle = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if !confirm::yes_no(
+                    &tr!("重启 Airhand？", "Restart Airhand?"),
+                    &tr!(
+                        "正在控制本机的连接会断开，Airhand 退出后会重新打开。",
+                        "Anyone controlling this computer will be disconnected. Airhand quits and opens again."
+                    ),
+                    &tr!("重启", "Restart"),
+                    false,
+                ) {
+                    return;
+                }
+                shutdown(&handle);
+                // Windows 安装版：等被控端服务真的停下，新进程才能立刻把它重新拉起来
+                #[cfg(windows)]
+                if let Err(e) = winsvc::stop_and_wait_ready() {
+                    warn!("can't wait for the Airhand service to stop: {e:#}");
+                }
+                handle.request_restart()
+            });
         }
         "quit" => {
-            shutdown(app);
-            app.exit(0);
+            let handle = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if !confirm::yes_no(
+                    &tr!("退出 Airhand？", "Quit Airhand?"),
+                    &tr!(
+                        "退出后本机不能再被远程控制，需要手动重新打开 Airhand。\n\n正在控制本机的连接会断开。",
+                        "This computer can't be controlled remotely until Airhand is opened again.\n\nAnyone controlling it will be disconnected."
+                    ),
+                    &tr!("退出", "Quit"),
+                    false,
+                ) {
+                    return;
+                }
+                shutdown(&handle);
+                handle.exit(0);
+            });
         }
         _ => {}
     }

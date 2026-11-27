@@ -1588,7 +1588,8 @@ export class RemoteSession {
 
   /** 系统操作（对方是手机时的返回、主页……；只发对方在 hello 里列出的） */
   sendSystem(action: SystemAction) {
-    if (this.hostActions.includes(action)) this.enqueue([{ type: "system", action }], true);
+    // 「重启采集」不作为能力声明（桌面被控端不声明系统操作），控制端可以无条件发
+    if (action === "restartCapture" || this.hostActions.includes(action)) this.enqueue([{ type: "system", action }], true);
   }
 
   sendText(text: string) {

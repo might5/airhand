@@ -159,6 +159,11 @@ struct SessionMenu: View {
                 tile(session.mouseLock ? "lock.fill" : "lock.open", L.t("menu_mouse_lock"), on: session.mouseLock, height: height) {
                     session.mouseLock.toggle()
                 }
+                // 系统的采集流会静默失效（不报错、只是不再出帧）：画面黑着时靠它把采集重开一次
+                tile("arrow.clockwise", L.t("menu_restart_capture"), height: height) {
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    session.system(.restartCapture)
+                }
             }
             tile("arrow.down.right.and.arrow.up.left", L.t("menu_fit"), height: height) { actions.fit() }
             if let r = actions.rotate { tile("rotate.right", L.t("menu_rotate"), height: height, action: r) }

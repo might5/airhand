@@ -260,7 +260,9 @@ export type SystemAction =
   | "lockScreen"
   | "powerMenu"
   | "volumeUp"
-  | "volumeDown";
+  | "volumeDown"
+  /** 让被控端重开采集器（桌面被控端用它救静默失效的画面） */
+  | "restartCapture";
 
 export type SessionEvent =
   | {
