@@ -36,7 +36,9 @@ import app.airhand.android.controller.Input
 import app.airhand.android.data.GameLayout
 import app.airhand.android.data.GameStick
 import app.airhand.android.data.ScaleMode
+import app.airhand.android.data.WheelMode
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
 
@@ -128,7 +130,7 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         // 按下 / 抬起马上发，移动和别的移动一起合并着发（8 ms 一批）
         override fun touch(id: Int, phase: String, nx: Float, ny: Float) =
             host.onInput(listOf(Input.touch(id, phase, nx, ny)), phase != Gestures.MOVE)
-    }, timers, ViewConfiguration.get(context).scaledTouchSlop.toFloat())
+    }, timers, ViewConfiguration.get(context).scaledTouchSlop.toFloat(), density)
 
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
 
@@ -239,6 +241,44 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
             content.set((width - w) / 2, (height - h) / 2, (width + w) / 2, (height + h) / 2)
         }
         rel = 1f
+        clamp()
+        apply()
+    }
+
+    /** 底部被软键盘和快捷键栏占用的高度（像素）：不压缩画面，竖屏上移居中、横屏或放大时平移跟随光标 */
+    private var keyboardInset = 0f
+
+    private fun visibleHeight(): Float = (height - keyboardInset).coerceAtLeast(1f)
+
+    fun setKeyboardInset(insetPx: Float) {
+        val next = insetPx.coerceAtLeast(0f)
+        if (abs(next - keyboardInset) < 1f) return
+        val grew = next > keyboardInset
+        keyboardInset = next
+        if (width == 0 || height == 0 || content.width() <= 0f) return
+        if (grew && keyboardInset > 0f && content.height() > visibleHeight()) {
+            ensureCursorVisibleAboveKeyboard()
+        } else {
+            clamp()
+            apply()
+        }
+    }
+
+    /** 键盘盖住画面下半部分时，把当前光标位置平移到键盘正上方可视区（不缩小画面） */
+    private fun ensureCursorVisibleAboveKeyboard() {
+        val vh = visibleHeight()
+        if (content.height() <= vh) {
+            clamp()
+            apply()
+            return
+        }
+        val cy = content.top + gestures.cursorY * content.height()
+        val margin = min(24f * density, vh * 0.25f)
+        var dy = 0f
+        if (cy > vh - margin) dy = (vh - margin) - cy
+        else if (cy < margin) dy = margin - cy
+        if (dy != 0f) content.offset(0f, dy)
+        clamp()
         apply()
     }
 
@@ -298,35 +338,40 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         apply()
     }
 
-    /** 画面比视图小的方向居中，比视图大的方向不留黑边 */
+    /** 画面比可视区域小的方向居中，比可视区域大的方向不留黑边（弹键盘时以键盘上方为底边） */
     private fun clamp() {
         val w = width.toFloat()
-        val h = height.toFloat()
+        val vh = visibleHeight()
         if (content.width() <= w) {
             content.offsetTo((w - content.width()) / 2, content.top)
         } else {
             if (content.left > 0) content.offset(-content.left, 0f)
             if (content.right < w) content.offset(w - content.right, 0f)
         }
-        if (content.height() <= h) {
-            content.offsetTo(content.left, (h - content.height()) / 2)
+        if (content.height() <= vh) {
+            content.offsetTo(content.left, (vh - content.height()) / 2)
         } else {
             if (content.top > 0) content.offset(0f, -content.top)
-            if (content.bottom < h) content.offset(0f, h - content.bottom)
+            if (content.bottom < vh) content.offset(0f, vh - content.bottom)
         }
     }
 
-    /** 触控板模式放大时：指针快到边上了就挪动画面 */
+    /** 触控板模式放大时，或弹键盘遮挡画面下半部分时：指针快到可视区边上就挪动画面 */
     private fun followCursor() {
-        if (!zoomed) return
+        val vh = visibleHeight()
+        if (!zoomed && !(keyboardInset > 0f && content.height() > vh)) return
         val cx = content.left + gestures.cursorX * content.width()
         val cy = content.top + gestures.cursorY * content.height()
         val mx = width * 0.15f
-        val my = height * 0.15f
+        val my = min(vh * 0.2f, 32f * density)
         var dx = 0f
         var dy = 0f
-        if (cx < mx) dx = mx - cx else if (cx > width - mx) dx = width - mx - cx
-        if (cy < my) dy = my - cy else if (cy > height - my) dy = height - my - cy
+        if (content.width() > width) {
+            if (cx < mx) dx = mx - cx else if (cx > width - mx) dx = width - mx - cx
+        }
+        if (content.height() > vh) {
+            if (cy < my) dy = my - cy else if (cy > vh - my) dy = vh - my - cy
+        }
         if (dx != 0f || dy != 0f) panBy(dx, dy)
     }
 
@@ -700,17 +745,33 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         return super.onGenericMotionEvent(e)
     }
 
-    /** 外接鼠标的滚轮（方向和速度看设置，[setWheel]） */
+    /** 外接鼠标的滚轮（方向、速度、滚动模式和平滑滚动看设置，[setWheel]） */
     private val wheel = MouseWheel()
+    private var smoothWheel = false
+    private val smooth = SmoothWheel(timers) { dx, dy ->
+        host.onInput(listOf(Input.wheel(dx, dy)), false)
+    }
 
-    fun setWheel(reverse: Boolean, percent: Int) {
+    fun setWheel(reverse: Boolean, percent: Int, mode: WheelMode, smoothEnabled: Boolean) {
         wheel.reverse = reverse
         wheel.percent = percent
+        wheel.mode = mode
+        smoothWheel = smoothEnabled
+        if (!smoothEnabled) smooth.cancel()
+    }
+
+    fun setTouchScroll(percent: Int, fling: Boolean) {
+        gestures.touchScrollPercent = percent
+        gestures.touchScrollFling = fling
     }
 
     private fun scroll(e: MotionEvent) {
-        val (dx, dy) = wheel.steps(e.getAxisValue(MotionEvent.AXIS_HSCROLL), e.getAxisValue(MotionEvent.AXIS_VSCROLL)) ?: return
-        host.onInput(listOf(Input.wheel(dx, dy)), true)
+        val (dx, dy) = wheel.steps(
+            e.getAxisValue(MotionEvent.AXIS_HSCROLL),
+            e.getAxisValue(MotionEvent.AXIS_VSCROLL),
+            e.eventTime,
+        ) ?: return
+        if (smoothWheel) smooth.add(dx, dy) else host.onInput(listOf(Input.wheel(dx, dy)), true)
     }
 
     private fun moveMouse(e: MotionEvent) {
@@ -793,10 +854,17 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
         // 菜单、通知栏、切到后台：游戏按键按着的都松开（手指的抬起不一定会送到这里），切换着的也松开，
         // 不然角色会一直走下去；外接键盘按着的键也一样
         if (!hasWindowFocus) {
+            smooth.cancel()
             game.releaseAll()
             host.keyboard.releaseKeys()
             imeBypass.clear()
         }
+    }
+
+    override fun onDetachedFromWindow() {
+        smooth.cancel()
+        gestures.cancel()
+        super.onDetachedFromWindow()
     }
 
     fun hideKeyboard() {
@@ -866,17 +934,27 @@ class RemoteView(context: Context, private val host: Host) : FrameLayout(context
 
 /**
  * 外接鼠标的滚轮 → 发给对方的滚轮量（120 = 一格，向右 / 向上为正）。高精度滚轮、触控板一次只滚零点几格，
- * 不够 1 的余量留到下一次，换方向时丢掉（和 macOS 被控端一样）。[reverse]、[percent]：设置里的方向和速度
+ * 不够 1 的余量留到下一次，换方向时丢掉（和 macOS 被控端一样）。
+ *
+ * [mode] 为 [WheelMode.ADAPTIVE] 时按拨动速率自动调节增益：慢滚单格 0.5× 精细定位，
+ * 连续快速拨动平滑加速至 2.0×，更贴近 macOS 原生鼠标手感；[WheelMode.LINEAR] 保持固定等距步进。
+ * 这里默认固定（换算本身）；会话里用的是设置里的（[RemoteView.setWheel]）。
  */
 internal class MouseWheel {
     var reverse = false
     var percent = 100
+    var mode = WheelMode.LINEAR
     private var restX = 0f
     private var restY = 0f
+    private var lastTimeMs = 0L
+    private var lastDirX = 0
+    private var lastDirY = 0
+    private var vel = 0f
 
     /** `h` / `v`：AXIS_HSCROLL / AXIS_VSCROLL（一格是 1，向右 / 向上为正）。两个方向都不够 1 时是 null */
-    fun steps(h: Float, v: Float): Pair<Int, Int>? {
-        val k = 120f * percent / 100f * (if (reverse) -1 else 1)
+    fun steps(h: Float, v: Float, nowMs: Long = 0L): Pair<Int, Int>? {
+        val gain = adaptiveGain(h, v, nowMs)
+        val k = 120f * (percent / 100f) * gain * (if (reverse) -1 else 1)
         restX = add(restX, h * k)
         restY = add(restY, v * k)
         val dx = restX.toInt()
@@ -887,5 +965,87 @@ internal class MouseWheel {
         return dx to dy
     }
 
+    private fun adaptiveGain(h: Float, v: Float, nowMs: Long): Float {
+        if (mode != WheelMode.ADAPTIVE) return 1f
+        val mag = max(abs(h), abs(v))
+        val reversed = (h != 0f && lastDirX != 0 && h * lastDirX < 0f) ||
+            (v != 0f && lastDirY != 0 && v * lastDirY < 0f)
+        val dtMs = if (lastTimeMs > 0L && nowMs > lastTimeMs) nowMs - lastTimeMs else ADAPTIVE_RESET_MS + 1L
+        if (reversed || dtMs > ADAPTIVE_RESET_MS) {
+            vel = 0f
+        } else if (mag > 0f) {
+            val rate = (mag * 1000f / dtMs.coerceAtLeast(8L)).coerceAtMost(25f)
+            vel = if (vel == 0f) rate else vel * 0.6f + rate * 0.4f
+        }
+        if (nowMs > 0L) lastTimeMs = nowMs
+        if (h != 0f) lastDirX = if (h > 0f) 1 else -1
+        if (v != 0f) lastDirY = if (v > 0f) 1 else -1
+        return (0.5f + vel * 0.125f).coerceIn(0.5f, 2.0f)
+    }
+
     private fun add(rest: Float, d: Float) = if (rest * d < 0f) d else rest + d
+
+    companion object {
+        /** 两次滚轮超过这个间隔视为重新慢滚，速度归零 */
+        private const val ADAPTIVE_RESET_MS = 300L
+    }
+}
+
+/**
+ * 平滑滚轮插值器：把外接鼠标的离散滚轮量拆成 ~60fps 微步平滑发送（总增量严格守恒，首步立即发出零起手延迟）。
+ * 仅在滚轮滚动时运行，静止后立刻停止定时器；换方向时丢弃反方向余量，避免回弹。
+ */
+internal class SmoothWheel(
+    private val timers: Gestures.Timers,
+    private val emit: (Int, Int) -> Unit,
+) {
+    private var remX = 0f
+    private var remY = 0f
+    private var token: Any? = null
+
+    fun add(dx: Int, dy: Int) {
+        remX = if (remX * dx < 0f) dx.toFloat() else remX + dx
+        remY = if (remY * dy < 0f) dy.toFloat() else remY + dy
+        if (token == null && (abs(remX) >= 1f || abs(remY) >= 1f)) {
+            step()
+        }
+    }
+
+    fun cancel() {
+        timers.cancel(token)
+        token = null
+        remX = 0f
+        remY = 0f
+    }
+
+    private fun step() {
+        val sx = take(remX)
+        val sy = take(remY)
+        remX -= sx
+        remY -= sy
+        if (sx != 0 || sy != 0) emit(sx, sy)
+        if (abs(remX) >= 1f || abs(remY) >= 1f) {
+            token = timers.after(FRAME_MS) {
+                token = null
+                step()
+            }
+        } else {
+            remX = 0f
+            remY = 0f
+            token = null
+        }
+    }
+
+    private fun take(rem: Float): Int {
+        val a = abs(rem)
+        if (a < 1f) return 0
+        val mag = if (a <= SNAP) a.toInt() else ceil(a * FACTOR).toInt().coerceAtMost(a.toInt())
+        return if (rem > 0f) mag else -mag
+    }
+
+    companion object {
+        private const val FRAME_MS = 16L
+        private const val FACTOR = 0.35f
+        private const val SNAP = 4f
+    }
 }

@@ -10,11 +10,14 @@
 //! * 配置和数据只有一个 `config.toml`（见 [`config`]）：服务器设置、本机的控制码、控制台的"我的设备"
 //!   （见 [`devices`]）。Windows 在安装目录，macOS 在 `~/Library/Application Support/app.airhand.client/`，
 //!   Linux 在 `~/.config/airhand/`；被删掉了会自动重新生成。其余运行时产生的文件退出时删除（见 [`ephemeral`]）；
-//! * 界面支持中文 / 英文，默认跟随系统语言，选过的记在 `config.toml` 里（见 [`i18n`]）。
+//! * 界面支持中文 / 英文，默认跟随系统语言，选过的记在 `config.toml` 里（见 [`i18n`]）；
+//! * macOS 可以在远程控制时暂停 AWDL（隔空投送等用的 Wi-Fi 直连），走 Wi-Fi 时不再周期性地卡顿（见 `awdl`）。
 
 // 最先声明：其它模块都要用到 `tr!`
 #[macro_use]
 mod i18n;
+#[cfg(target_os = "macos")]
+mod awdl;
 mod clipboard;
 mod clipfiles;
 mod config;
@@ -489,6 +492,14 @@ pub(crate) fn on_menu(app: &AppHandle, id: &str) {
             app.state::<AppState>().hub.send_modify(|_| {});
         }
         #[cfg(target_os = "macos")]
+        "pause_awdl" => {
+            awdl::toggle(app);
+            // 勾选项被点击时系统会自动翻转勾选状态：先按原来的设置重建菜单，改好了再刷新
+            app.state::<AppState>().hub.send_modify(|_| {});
+        }
+        #[cfg(target_os = "macos")]
+        "repair_awdl" => awdl::repair(app),
+        #[cfg(target_os = "macos")]
         "receive_files" => {
             let handle = app.clone();
             let _ = app.run_on_main_thread(move || clipfiles::macos::choose(&handle));
@@ -705,6 +716,11 @@ pub fn run() {
     if let Some(code) = winsvc::cli() {
         std::process::exit(code);
     }
+    // macOS：被控端起来看、换补屏的虚拟显示器的模式的子进程（见 host::virtual_display）
+    #[cfg(target_os = "macos")]
+    if let Some(code) = host::virtual_display::cli() {
+        std::process::exit(code);
+    }
     init_logging();
     // Windows：为所有用户安装的 Airhand 由系统服务运行被控端；仅为当前用户安装的（没有系统服务）和调试构建直接运行时
     // 一样，被控端在本进程里运行。发布版没有安装时不能运行，提示运行安装程序
@@ -770,6 +786,8 @@ pub fn run() {
     hub.send_modify(|s| s.user_autostart = user_autostart);
     #[cfg(target_os = "macos")]
     clipfiles::macos::init(&hub);
+    #[cfg(target_os = "macos")]
+    awdl::init(&hub);
     let app = tauri::Builder::default()
         .manage(AppState {
             hub: hub.clone(),

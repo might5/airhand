@@ -11,6 +11,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import app.airhand.android.core.Codec
+import app.airhand.android.core.DecoderStats
 import java.nio.ByteBuffer
 
 /** 一帧画面（`airhand_link` 的视频包去掉头），确认回调至多执行一次。 */
@@ -45,12 +46,16 @@ class VideoPacket(
  * * 没有 Surface（应用在后台）时收到的帧直接确认、丢掉；
  * * 画面尺寸超出本机解码器的能力（例如竖屏手机的 1080×2400 之于只到 1080p 的电视）：照样试着解码，
  *   同时通过 `onTooLarge` 让会话请对方缩小画面。
+ *
+ * `onStats`：现在用的解码器和一帧解码要多久（画面上方的状态信息用）。解码器建好、关掉时马上报（关掉时是 null），
+ * 之后解出画面时最多 [STATS_EVERY_MS] 报一次；在解码线程上调用。
  */
 class VideoDecoder(
     private val sync: AvSync,
     private val requestKeyframe: () -> Unit,
     private val onError: (String) -> Unit = {},
     private val onTooLarge: (Codec, Int, Int) -> Unit = { _, _, _ -> },
+    private val onStats: (DecoderStats?) -> Unit = {},
 ) {
     private val thread = HandlerThread("airhand-decode").apply { start() }
     private val handler = Handler(thread.looper)
@@ -58,6 +63,10 @@ class VideoDecoder(
     private var surface: Surface? = null
     private var codec: MediaCodec? = null
     private var config: Triple<Codec, Int, Int>? = null
+
+    /** 现在用的解码器（[onStats] 报的）和上次报的时刻（elapsedRealtime） */
+    private var active: DecoderStats? = null
+    private var statsAt = 0L
     private val pending = ArrayDeque<VideoPacket>()
     private val freeInputs = ArrayDeque<Int>()
     private var needKey = true
@@ -251,6 +260,9 @@ class VideoDecoder(
                 codec = mc
                 config = Triple(p.codec, p.width, p.height)
                 freeInputs.clear()
+                active = DecoderStats(p.codec, mc.name, runCatching { isHardware(mc.codecInfo) }.getOrDefault(false), null)
+                statsAt = 0L
+                onStats(active)
                 Log.i(TAG, "decoder ${mc.name} started: ${p.codec.label} ${p.width}x${p.height}${if (f === lowLatency) " (low latency)" else ""}")
                 return true
             } catch (e: Exception) {
@@ -267,6 +279,10 @@ class VideoDecoder(
         pendingBytes = 0
         decoding.clear()
         decodeAvgNs = 0
+        if (active != null) {
+            active = null
+            onStats(null)
+        }
         val mc = codec ?: return
         codec = null
         config = null
@@ -289,6 +305,12 @@ class VideoDecoder(
                 decoding.remove(info.presentationTimeUs)?.let { sent ->
                     val elapsed = (now - sent).coerceIn(0, 500_000_000)
                     decodeAvgNs = if (decodeAvgNs == 0L) elapsed else decodeAvgNs + (elapsed - decodeAvgNs) / 10
+                    val a = active
+                    val at = SystemClock.elapsedRealtime()
+                    if (a != null && at - statsAt >= STATS_EVERY_MS) {
+                        statsAt = at
+                        onStats(a.copy(decodeMs = decodeAvgNs / 1_000_000f))
+                    }
                 }
                 val render = info.size > 0 || (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) == 0
                 if (render && sync.enabled) codec.releaseOutputBuffer(index, sync.renderTimeNs(info.presentationTimeUs, now))
@@ -314,6 +336,9 @@ class VideoDecoder(
         private const val MAX_PENDING = 12
         private const val MAX_SYNC_PENDING = 120
         private const val MAX_PENDING_BYTES = 32 * 1024 * 1024
+
+        /** [onStats] 最多多久报一次 */
+        private const val STATS_EVERY_MS = 500L
 
         /** 从关键帧里取出参数集，作为 csd-0 / csd-1（有的解码器只认这种方式） */
         fun csd(p: VideoPacket): List<ByteArray> {

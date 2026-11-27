@@ -362,6 +362,19 @@ pub fn pixels(id: u32) -> Option<(u32, u32)> {
     mac::pixels(id)
 }
 
+/// 补屏的虚拟显示器的模式变过就加一（macOS，见 [`mac`]）：在这之前打开的、采集它的流要重新打开
+#[cfg(target_os = "macos")]
+pub fn mode_generation() -> u64 {
+    mac::mode_generation()
+}
+
+/// macOS：被控端起来看、换补屏的虚拟显示器的模式的子进程（本进程做不了，见 [`mac`]）。不是它的命令行时为 `None`，
+/// 否则是退出码
+#[cfg(target_os = "macos")]
+pub fn cli() -> Option<i32> {
+    mac::cli()
+}
+
 /// 防窥模式盖在本机显示器上的黑窗口（macOS，窗口编号，见 [`curtain`]）：采集时去掉它们
 #[cfg(target_os = "macos")]
 pub fn cover_windows() -> Vec<u32> {

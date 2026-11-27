@@ -127,7 +127,11 @@ export type RemoteNotice =
   /** 声音采集恢复：撤下 audioFailed（本身不显示） */
   | { kind: "audioRecovered" }
   /** 被控端（macOS）缺少的系统权限；两项都为 false 表示已经全部授予 */
-  | { kind: "missingPermissions"; screen: boolean; input: boolean };
+  | { kind: "missingPermissions"; screen: boolean; input: boolean }
+  /** 对方 Mac 走 Wi-Fi、AWDL（隔空投送等用的 Wi-Fi 直连）开着，画面可能周期性地卡顿；active 为 false 时撤下 */
+  | { kind: "awdl"; active: boolean }
+  /** 对方电脑（Windows）被标记成了 Windows To Go，系统不给用硬件编码器，画面只能软件编码 */
+  | { kind: "windowsToGo" };
 
 export interface AppInfo {
   version: string;
@@ -284,6 +288,10 @@ export type SessionEvent =
       fps: number;
       kbps: number;
       rttMs: number | null;
+      /** 往返时延前后两次相差多少（平滑过），还没量过两次时为 null */
+      jitterMs: number | null;
+      /** 最近收到的画面里受丢包影响的占百分之几（等重传卡住过的，或者收到了却解不了、跳过的） */
+      stallPct: number;
       width: number;
       height: number;
       frames: number;

@@ -57,6 +57,15 @@ enum class ScaleMode(val id: String) {
     }
 }
 
+/** 外接鼠标滚轮怎么换算：自适应（慢滚一格只走一半、连着快滚加速到两倍，贴近 macOS 的手感）/ 固定（每格一样远） */
+enum class WheelMode(val id: String) {
+    ADAPTIVE("adaptive"), LINEAR("linear");
+
+    companion object {
+        fun of(id: String?) = entries.firstOrNull { it.id == id } ?: ADAPTIVE
+    }
+}
+
 data class Settings(
     /** 中转服务器 host:port */
     val server: String = BuildConfig.DEFAULT_SERVER,
@@ -80,6 +89,12 @@ data class Settings(
     val tvScale: ScaleMode = ScaleMode.FIT,
     /** 控制手机时显示返回 / 主页 / 最近任务按钮 */
     val navKeys: Boolean = true,
+    /** 远程画面上方显示状态信息（走的路、编码格式、帧率、分辨率、码率、解码器、解码耗时、延迟、抖动、卡顿帧） */
+    val showStats: Boolean = false,
+    /** 手机上的远程画面跟着手机的方向（重力感应）横 / 竖；关掉时跟着对方的画面走。菜单里都可以手动换 */
+    val autoRotate: Boolean = true,
+    /** 双击悬浮圆钮直接呼出或收起虚拟键盘（单击仍打开菜单） */
+    val doubleTapKeyboard: Boolean = false,
     /**
      * 对方把光标画进了画面里时（拖动、缩放窗口等）也画本机的光标：跟手，只是和画面里的那个一起有两个。
      * 关掉时只看画面里的（见 [app.airhand.android.ui.session.RemoteView]）
@@ -87,8 +102,19 @@ data class Settings(
     val localCursor: Boolean = true,
     /** 外接鼠标的滚轮反过来滚（屏幕上的双指滑动不变） */
     val reverseWheel: Boolean = false,
-    /** 外接鼠标滚轮的速度：百分比，[WHEEL_SPEEDS] 里的一个 */
+    /** 外接鼠标滚轮的速度：百分比，[WHEEL_SPEED_MIN]..[WHEEL_SPEED_MAX] */
     val wheelSpeed: Int = 100,
+    /** 外接鼠标滚轮怎么换算 */
+    val wheelMode: WheelMode = WheelMode.ADAPTIVE,
+    /** 外接鼠标平滑滚动：每一格拆成几小步、约 16 ms 一步发出去（加起来不变），控制 Mac 时更像触控板 */
+    val smoothWheel: Boolean = false,
+    /**
+     * 屏幕上双指滑动的速度：百分比，100 是每 dp 1.5（见 Gestures.WHEEL_PER_DP），[TOUCH_SCROLL_MIN] 起，
+     * 最多到按 dp 换算之前的速度（每像素 3），能设到多少要看屏幕密度（Gestures.maxScrollPercent）
+     */
+    val touchScrollSpeed: Int = 100,
+    /** 屏幕上双指滑动松手后接着滚一会儿（惯性） */
+    val touchScrollFling: Boolean = false,
     /** 已经看过的手势说明（trackpad / touch / tv） */
     val tipsSeen: Set<String> = emptySet(),
     /**
@@ -117,14 +143,28 @@ data class Settings(
         .put("codec", codec)
         .put("tvScale", tvScale.id)
         .put("navKeys", navKeys)
+        .put("showStats", showStats)
+        .put("autoRotate", autoRotate)
+        .put("doubleTapKeyboard", doubleTapKeyboard)
         .put("localCursor", localCursor)
         .put("reverseWheel", reverseWheel)
         .put("wheelSpeed", wheelSpeed)
+        .put("wheelMode", wheelMode.id)
+        .put("smoothWheel", smoothWheel)
+        .put("touchScrollSpeed", touchScrollSpeed)
+        .put("touchScrollFling", touchScrollFling)
         .put("tipsSeen", JSONArray(tipsSeen.toList()))
         .put("identity", identity)
 
     companion object {
-        val WHEEL_SPEEDS = listOf(50, 75, 100, 150, 200)
+        const val WHEEL_SPEED_MIN = 5
+        const val WHEEL_SPEED_MAX = 200
+        const val WHEEL_SPEED_STEP = 5
+        const val TOUCH_SCROLL_MIN = 5
+        const val TOUCH_SCROLL_STEP = 5
+
+        /** 存着的双指滑动速度认到多少（屏幕密度 5 的上限）；这台能设到多少见 Gestures.maxScrollPercent */
+        const val TOUCH_SCROLL_MAX = 1000
 
         fun parse(o: JSONObject): Settings {
             val d = Settings()
@@ -142,9 +182,16 @@ data class Settings(
                 codec = o.optString("codec", d.codec),
                 tvScale = ScaleMode.of(o.optStringOrNull("tvScale")),
                 navKeys = o.optBoolean("navKeys", d.navKeys),
+                showStats = o.optBoolean("showStats", d.showStats),
+                autoRotate = o.optBoolean("autoRotate", d.autoRotate),
+                doubleTapKeyboard = o.optBoolean("doubleTapKeyboard", d.doubleTapKeyboard),
                 localCursor = o.optBoolean("localCursor", d.localCursor),
                 reverseWheel = o.optBoolean("reverseWheel", d.reverseWheel),
-                wheelSpeed = o.optInt("wheelSpeed", d.wheelSpeed).takeIf { it in WHEEL_SPEEDS } ?: d.wheelSpeed,
+                wheelSpeed = o.optInt("wheelSpeed", d.wheelSpeed).takeIf { it in WHEEL_SPEED_MIN..WHEEL_SPEED_MAX } ?: d.wheelSpeed,
+                wheelMode = WheelMode.of(o.optStringOrNull("wheelMode")),
+                smoothWheel = o.optBoolean("smoothWheel", d.smoothWheel),
+                touchScrollSpeed = o.optInt("touchScrollSpeed", d.touchScrollSpeed).takeIf { it in TOUCH_SCROLL_MIN..TOUCH_SCROLL_MAX } ?: d.touchScrollSpeed,
+                touchScrollFling = o.optBoolean("touchScrollFling", d.touchScrollFling),
                 tipsSeen = if (tips == null) emptySet() else (0 until tips.length()).map { tips.getString(it) }.toSet(),
                 identity = o.optString("identity", ""),
             )

@@ -8,6 +8,7 @@ import android.view.Surface
 import app.airhand.android.AirhandApp
 import app.airhand.android.core.ClipFiles
 import app.airhand.android.core.Codec
+import app.airhand.android.core.DecoderStats
 import app.airhand.android.core.DisplayInfo
 import app.airhand.android.core.EncoderInfo
 import app.airhand.android.core.HostHello
@@ -96,6 +97,7 @@ class RemoteSession(
     val currentDisplay = MutableStateFlow(0)
     val encoder = MutableStateFlow<EncoderInfo?>(null)
     val stats = MutableStateFlow<Stats?>(null)
+    val decoderStats = MutableStateFlow<DecoderStats?>(null)
 
     /** 被控端的提示，按类别（capture / audio / permissions / other）各保留一条 */
     val notices = MutableStateFlow<Map<String, Notice>>(emptyMap())
@@ -181,6 +183,7 @@ class RemoteSession(
         sync,
         requestKeyframe = { command { Commands.keyframe(it) } },
         onTooLarge = { c, w, h -> onTooLarge(c, w, h) },
+        onStats = { decoderStats.value = it },
     )
 
     /** 收到过本机解码器放不下的画面：按画面尺寸算出的短边上限（只对那种格式有效；对方换了屏幕 / 转了屏就作废） */
@@ -269,6 +272,7 @@ class RemoteSession(
                     sid = -1
                     resetPrivacy()
                     decoder.resetStream()
+                    stats.value = null
                     stopAudio()
                     if (closed) break
                     if (!end.second) {
@@ -489,16 +493,21 @@ class RemoteSession(
                 refreshSettings()
             }
             "stats" -> stats.value = Stats(
-                e.optDouble("fps").toFloat(),
-                e.optDouble("kbps").toFloat(),
-                if (e.isNull("rttMs")) null else e.optDouble("rttMs").toFloat(),
-                e.optInt("width"),
-                e.optInt("height"),
-                e.optBoolean("direct"),
+                fps = e.optDouble("fps").toFloat(),
+                kbps = e.optDouble("kbps").toFloat(),
+                rttMs = if (e.isNull("rttMs")) null else e.optDouble("rttMs").toFloat(),
+                width = e.optInt("width"),
+                height = e.optInt("height"),
+                direct = e.optBoolean("direct"),
+                jitterMs = if (e.isNull("jitterMs")) null else e.optDouble("jitterMs").toFloat(),
+                stallPct = e.optDouble("stallPct").toFloat(),
             )
             "notice" -> {
                 val o = e.optJSONObject("notice") ?: return
-                val n = Notice(o.optString("kind"), o.optStringOrNull("detail"), o.optBoolean("screen"), o.optBoolean("input"))
+                val n = Notice(
+                    o.optString("kind"), o.optStringOrNull("detail"), o.optBoolean("screen"), o.optBoolean("input"),
+                    o.optBoolean("active"),
+                )
                 val m = notices.value.toMutableMap()
                 when (n.kind) {
                     "captureRecovered" -> m.remove("capture")
@@ -506,6 +515,8 @@ class RemoteSession(
                     "captureFailed" -> m["capture"] = n
                     "audioFailed" -> m["audio"] = n
                     "missingPermissions" -> if (!n.screen && !n.input) m.remove("permissions") else m["permissions"] = n
+                    // 对方 Mac 走 Wi-Fi、AWDL 开着：插上网线、暂停了 AWDL 时撤下
+                    "awdl" -> if (n.active) m["awdl"] = n else m.remove("awdl")
                     else -> m[n.kind] = n
                 }
                 notices.value = m

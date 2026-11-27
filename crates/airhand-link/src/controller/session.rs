@@ -268,11 +268,14 @@ pub enum SessionEvent {
         shown: Vec<u8>,
     },
     /// 每秒一次。`fps`：最快的那一路的帧率；`kbps`：所有的画面和声音；`width` / `height`：第 0 路画面的大小；
-    /// `frames`：一共收到了几帧（所有的路）
+    /// `frames`：一共收到了几帧（所有的路）；`jitter_ms`：往返时延前后两次差多少（毫秒，平滑过，还没量过两次时没有）；
+    /// `stall_pct`：最近收到的画面里受丢包影响的占百分之几（等重传卡住过的，或者收到了却解不了、跳过的；平滑过）
     Stats {
         fps: f32,
         kbps: f32,
         rtt_ms: Option<f32>,
+        jitter_ms: Option<f32>,
+        stall_pct: f32,
         width: u16,
         height: u16,
         frames: u64,
@@ -331,6 +334,13 @@ pub enum NoticeView {
         screen: bool,
         input: bool,
     },
+    /// 对方 Mac 用 Wi-Fi 联网、AWDL（隔空投送等用的 Wi-Fi 直连）开着，画面可能周期性地卡一下。
+    /// `active` 为 false 表示不再是这样了，控制台撤下之前的提示
+    Awdl {
+        active: bool,
+    },
+    /// 对方电脑（Windows）被标记成了 Windows To Go，系统不给用硬件编码器，画面只能软件编码
+    WindowsToGo,
 }
 
 impl From<Notice> for NoticeView {
@@ -345,6 +355,8 @@ impl From<Notice> for NoticeView {
             Notice::MissingPermissions { screen, input } => {
                 NoticeView::MissingPermissions { screen, input }
             }
+            Notice::Awdl { active } => NoticeView::Awdl { active },
+            Notice::WindowsToGo => NoticeView::WindowsToGo,
         }
     }
 }
@@ -358,6 +370,17 @@ struct Stats {
     w: u16,
     h: u16,
     rtt: Option<f32>,
+    /// 上一个 Pong 量到的往返时延（没平滑过），算抖动用
+    last_rtt_sample: Option<f32>,
+    /// 往返时延的抖动：前后两个 Pong 量到的差多少，平滑过
+    jitter: Option<f32>,
+    /// 这一秒报告给被控端的（[`VideoReport`]，所有的路加起来）：收完的帧、其中等重传卡住过的
+    reported: u32,
+    stalled: u32,
+    /// 这一秒收到了、解不了跳过的帧（收完的时候已经算进 `reported` 了）
+    skipped: u32,
+    /// 受丢包影响的帧占百分之几（[`stall_share`]）
+    stall_pct: f32,
     last_msg: Instant,
     /// 最近一帧画面是从直连来的
     direct: bool,
@@ -372,10 +395,32 @@ impl Default for Stats {
             w: 0,
             h: 0,
             rtt: None,
+            last_rtt_sample: None,
+            jitter: None,
+            reported: 0,
+            stalled: 0,
+            skipped: 0,
+            stall_pct: 0.0,
             last_msg: Instant::now(),
             direct: false,
         }
     }
+}
+
+/// 受丢包影响的帧占百分之几（0..100），每秒算一次，和上一秒的（`prev`）各占一半。`frames`：这一秒收完的帧
+/// （所有的路，和报告给被控端码率控制的是同一个数，见 crate::merge 的"报告"）；`hit`：其中等重传卡住过的，
+/// 加上收到了却解不了、跳过的（它们收完时也算进了 `frames`）。不是丢包率：QUIC 会重传，丢了的包大多照样到了，
+/// 只是那一帧来晚了。这一秒没收到画面（画面静止时被控端不编码）就当 0，慢慢回落
+fn stall_share(prev: f32, frames: u32, hit: u32) -> f32 {
+    // 跳过的是实时数的，收完的每 REPORT_EVERY 才取一次：这一秒可能先数到跳过的
+    let total = frames.max(hit);
+    let now = if total == 0 {
+        0.0
+    } else {
+        hit as f32 * 100.0 / total as f32
+    };
+    let v = prev * 0.5 + now * 0.5;
+    if v < 0.05 { 0.0 } else { v }
 }
 
 /// 每一路画面的 [`Arrivals`]（第 `i` 项是第 `i` 路）
@@ -526,6 +571,7 @@ pub(super) async fn run(
 
     let out = ui.clone();
     let st = stats.clone();
+    let reporter_stats = stats.clone();
     let clip_in = local_clip.clone();
     let keyframe_tx = tx.clone();
     let acker = feedback.clone();
@@ -574,7 +620,10 @@ pub(super) async fn run(
                     match v {
                         // 解不了的增量帧不交给界面，这里替它确认：不然被控端的在途窗口停住，恢复的帧也发不过来
                         Video::Skipped { seq, arrived } => {
-                            st.lock().unwrap().last_msg = Instant::now();
+                            let mut s = st.lock().unwrap();
+                            s.last_msg = Instant::now();
+                            s.skipped += 1;
+                            drop(s);
                             acker.ack(stream, seq, arrived);
                         }
                         // 等不到一帧了：请被控端恢复这一路
@@ -601,6 +650,14 @@ pub(super) async fn run(
                     let rtt = {
                         let mut s = st.lock().unwrap();
                         s.last_msg = Instant::now();
+                        if let Some(prev) = s.last_rtt_sample {
+                            let diff = (sample - prev).abs();
+                            s.jitter = Some(match s.jitter {
+                                Some(j) => j * 0.75 + diff * 0.25,
+                                None => diff,
+                            });
+                        }
+                        s.last_rtt_sample = Some(sample);
                         let rtt = match s.rtt {
                             Some(r) => r * 0.7 + sample * 0.3,
                             None => sample,
@@ -763,10 +820,13 @@ pub(super) async fn run(
                 if s.last_msg.elapsed() > HOST_TIMEOUT {
                     return Err(Problem::HostUnresponsive.into());
                 }
+                s.stall_pct = stall_share(s.stall_pct, s.reported, s.stalled + s.skipped);
                 let e = SessionEvent::Stats {
                     fps: s.frames.iter().copied().max().unwrap_or(0) as f32 / dt,
                     kbps: s.bytes as f32 * 8.0 / 1000.0 / dt,
                     rtt_ms: s.rtt,
+                    jitter_ms: s.jitter,
+                    stall_pct: s.stall_pct,
                     width: s.w,
                     height: s.h,
                     frames: s.total,
@@ -774,6 +834,9 @@ pub(super) async fn run(
                 };
                 s.frames = [0; MAX_STREAMS as usize];
                 s.bytes = 0;
+                s.reported = 0;
+                s.stalled = 0;
+                s.skipped = 0;
                 e
             };
             out.event(event).map_err(|_| ui_closed())?;
@@ -792,6 +855,11 @@ pub(super) async fn run(
             for (stream, stats) in video_stats.iter().enumerate() {
                 let r = stats.take();
                 if !r.is_empty() {
+                    {
+                        let mut s = reporter_stats.lock().unwrap();
+                        s.reported += r.frames;
+                        s.stalled += r.stalled;
+                    }
                     reporter_feedback.report(stream as u8, r);
                 }
             }
@@ -917,6 +985,26 @@ mod tests {
         })
     }
 
+    /// 受丢包影响的帧：和上一秒的各占一半；跳过的先数到了也不超过 100%；没有画面时慢慢回到 0
+    #[test]
+    fn stall_share_is_smoothed_and_bounded() {
+        // 60 帧里 3 帧等过重传、3 帧跳过：这一秒 10%，平滑后 5%
+        let p = stall_share(0.0, 60, 6);
+        assert!((p - 5.0).abs() < 1e-4, "{p}");
+        // 一直这样就接近 10%
+        let mut q = p;
+        for _ in 0..10 {
+            q = stall_share(q, 60, 6);
+        }
+        assert!((q - 10.0).abs() < 0.01, "{q}");
+        // 收完的还没报上来、跳过的先数到了：按 100% 算，不会超过
+        assert!((stall_share(100.0, 0, 4) - 100.0).abs() < 1e-4);
+        // 没有画面（画面静止）：每秒减半，很小了就是 0
+        assert!((stall_share(10.0, 0, 0) - 5.0).abs() < 1e-4);
+        assert_eq!(stall_share(0.08, 0, 0), 0.0);
+        assert_eq!(stall_share(0.0, 60, 0), 0.0);
+    }
+
     /// 画面一直在来时不补发；停了之后每隔 ACK_REPEAT 补一次、最多 ACK_REPEATS 次；旧的、重复的确认不发
     #[test]
     fn acks_are_repeated_only_when_no_new_ones_follow() {
@@ -1024,6 +1112,20 @@ mod tests {
             serde_json::to_value(&n).unwrap(),
             json!({ "type": "notice", "notice": { "kind": "audioRecovered" } })
         );
+        let n = SessionEvent::Notice {
+            notice: Notice::Awdl { active: true }.into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&n).unwrap(),
+            json!({ "type": "notice", "notice": { "kind": "awdl", "active": true } })
+        );
+        let n = SessionEvent::Notice {
+            notice: Notice::WindowsToGo.into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&n).unwrap(),
+            json!({ "type": "notice", "notice": { "kind": "windowsToGo" } })
+        );
         let c = SessionEvent::Closed {
             reason: Problem::from(airhand_proto::session::ByeReason::Kicked),
             retry: false,
@@ -1097,13 +1199,18 @@ mod tests {
             fps: 30.0,
             kbps: 1.0,
             rtt_ms: None,
+            jitter_ms: Some(1.5),
+            stall_pct: 0.0,
             width: 1,
             height: 1,
             frames: 2,
             direct: true,
         };
-        assert_eq!(serde_json::to_value(&s).unwrap()["rttMs"], json!(null));
-        assert_eq!(serde_json::to_value(&s).unwrap()["direct"], json!(true));
+        let sv = serde_json::to_value(&s).unwrap();
+        assert_eq!(sv["rttMs"], json!(null));
+        assert_eq!(sv["jitterMs"], json!(1.5));
+        assert_eq!(sv["stallPct"], json!(0.0));
+        assert_eq!(sv["direct"], json!(true));
         let c = SessionEvent::Closed {
             reason: Problem::from(airhand_proto::session::ByeReason::CodeChanged),
             retry: false,

@@ -192,6 +192,49 @@ class GesturesTest {
         assertTrue(buttons().isEmpty())
     }
 
+    /** 双指滑动按屏幕密度 dp 归一化，且受 touchScrollPercent 和惯性开关控制 */
+    @Test
+    fun twoFingerScrollRespectsDensitySpeedAndFlingToggle() {
+        val highDpi = Gestures(out, timers, slop = 10f, density = 3f)
+        highDpi.mode = Gestures.Mode.TRACKPAD
+        highDpi.touchScrollPercent = 50
+        highDpi.touchScrollFling = false
+        highDpi.down(p(100f, 100f), 0)
+        highDpi.pointerDown(p(200f, 100f, 1), listOf(p(100f, 100f), p(200f, 100f, 1)), 10)
+        highDpi.move(listOf(p(100f, 160f), p(200f, 160f, 1)), 30)
+        highDpi.pointerUp(p(0f, 0f, 1), 1, 40)
+        highDpi.up(p(100f, 160f), 50)
+        val beforeFling = log.filter { it.startsWith("wheel") }.sumOf { it.split(" ")[2].toInt() }
+        // 60px / density(3) * 1.5 * 50% = 15
+        assertEquals(15, beforeFling)
+        timers.advance(500L)
+        val afterFling = log.filter { it.startsWith("wheel") }.sumOf { it.split(" ")[2].toInt() }
+        assertEquals("fling disabled should stop immediately", beforeFling, afterFling)
+    }
+
+    /** 双指滚动速度的上限正好到按 dp 换算之前的速度（每像素 3），再大也不超过 */
+    @Test
+    fun twoFingerScrollTopsOutAtTheOldSpeed() {
+        assertEquals(600, Gestures.maxScrollPercent(3f, 5))
+        assertEquals(525, Gestures.maxScrollPercent(2.625f, 5))
+        assertEquals(550, Gestures.maxScrollPercent(2.75f, 5))
+        // 密度不到 1 的按 1 算
+        assertEquals(200, Gestures.maxScrollPercent(0.75f, 5))
+        for (percent in listOf(600, 1000)) {
+            log.clear()
+            val g = Gestures(out, timers, slop = 10f, density = 3f)
+            g.mode = Gestures.Mode.TRACKPAD
+            g.touchScrollPercent = percent
+            g.down(p(100f, 100f), 0)
+            g.pointerDown(p(200f, 100f, 1), listOf(p(100f, 100f), p(200f, 100f, 1)), 10)
+            g.move(listOf(p(100f, 160f), p(200f, 160f, 1)), 30)
+            g.pointerUp(p(0f, 0f, 1), 1, 40)
+            g.up(p(100f, 160f), 50)
+            // 60 px × 3
+            assertEquals("$percent%", 180, log.filter { it.startsWith("wheel") }.sumOf { it.split(" ")[2].toInt() })
+        }
+    }
+
     @Test
     fun pinchZoomsTheView() {
         g.mode = Gestures.Mode.TOUCH

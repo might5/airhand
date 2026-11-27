@@ -17,14 +17,43 @@ class SettingsTest {
         assertEquals(off, Settings.parse(off.toJson()))
     }
 
-    /** 外接鼠标滚轮：默认不反转、100%，改了记得住；不在可选范围里的速度当 100% */
+    /** 外接鼠标滚轮与双指滑动偏好：默认值、范围校验与持久化 */
     @Test
     fun wheelPreferences() {
         val old = Settings.parse(JSONObject())
         assertFalse(old.reverseWheel)
         assertEquals(100, old.wheelSpeed)
-        val custom = Settings(reverseWheel = true, wheelSpeed = 150)
+        assertEquals(WheelMode.ADAPTIVE, old.wheelMode)
+        assertFalse(old.smoothWheel)
+        assertEquals(100, old.touchScrollSpeed)
+        assertFalse(old.touchScrollFling)
+        val custom = Settings(
+            reverseWheel = true,
+            wheelSpeed = 5,
+            wheelMode = WheelMode.LINEAR,
+            smoothWheel = true,
+            touchScrollSpeed = 10,
+            touchScrollFling = true,
+        )
         assertEquals(custom, Settings.parse(custom.toJson()))
         assertEquals(100, Settings.parse(JSONObject().put("wheelSpeed", 0)).wheelSpeed)
+        assertEquals(100, Settings.parse(JSONObject().put("touchScrollSpeed", 1)).touchScrollSpeed)
+        // 双指滚动能设到按 dp 换算之前的速度（密度 3 的手机是 600%）
+        assertEquals(600, Settings.parse(JSONObject().put("touchScrollSpeed", 600)).touchScrollSpeed)
+    }
+
+    /** 顶部状态浮窗、自动旋转与双击浮标开关键盘：默认值与持久化 */
+    @Test
+    fun displayAndInteractionPreferences() {
+        val def = Settings()
+        assertFalse(def.showStats)
+        assertTrue(def.autoRotate)
+        assertFalse(def.doubleTapKeyboard)
+        val parsedEmpty = Settings.parse(JSONObject())
+        assertFalse(parsedEmpty.showStats)
+        assertTrue(parsedEmpty.autoRotate)
+        assertFalse(parsedEmpty.doubleTapKeyboard)
+        val custom = Settings(showStats = true, autoRotate = false, doubleTapKeyboard = true)
+        assertEquals(custom, Settings.parse(custom.toJson()))
     }
 }

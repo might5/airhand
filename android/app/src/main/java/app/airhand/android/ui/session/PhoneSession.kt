@@ -9,6 +9,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -39,20 +40,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material.icons.outlined.ContentPaste
-import androidx.compose.material.icons.outlined.Crop
 import androidx.compose.material.icons.automirrored.outlined.HelpOutline
 import androidx.compose.material.icons.outlined.HighQuality
-import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.Keyboard
 import androidx.compose.material.icons.outlined.KeyboardCommandKey
 import androidx.compose.material.icons.outlined.KeyboardHide
 import androidx.compose.material.icons.outlined.LinkOff
-import androidx.compose.material.icons.outlined.Monitor
 import androidx.compose.material.icons.outlined.Mouse
-import androidx.compose.material.icons.outlined.Lock
-import androidx.compose.material.icons.outlined.RemoveModerator
-import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.SportsEsports
 import androidx.compose.material.icons.outlined.StayCurrentLandscape
 import androidx.compose.material.icons.outlined.StayCurrentPortrait
@@ -71,6 +65,7 @@ import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -82,8 +77,10 @@ import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -114,13 +111,19 @@ import app.airhand.android.core.OsKind
 import app.airhand.android.core.Preset
 import app.airhand.android.core.PrivacyState
 import app.airhand.android.core.SystemAction
+import app.airhand.android.data.Settings
 import app.airhand.android.data.TouchMode
+import app.airhand.android.data.WheelMode
 import app.airhand.android.ui.ConfirmDialog
 import app.airhand.android.ui.Messages
 import app.airhand.android.ui.OsAvatar
 import app.airhand.android.ui.phone.presetDesc
 import app.airhand.android.ui.phone.presetName
+import app.airhand.android.ui.phone.wheelModeDesc
+import app.airhand.android.ui.phone.wheelModeName
+import app.airhand.android.ui.snapPercent
 import app.airhand.android.ui.theme.Brand
+import java.util.Locale
 import kotlin.math.roundToInt
 
 /** 手机上看到的操作方式：触控板 / 触屏（控制手机时"触屏"就是直通） */
@@ -140,16 +143,19 @@ private fun initialMode(setting: TouchMode, os: OsKind) = when (setting) {
     TouchMode.AUTO -> if (os == OsKind.ANDROID || os == OsKind.IOS) UiMode.TOUCH else UiMode.TRACKPAD
 }
 
-private enum class Page { MAIN, SHORTCUTS, DISPLAYS, QUALITY, CLIPBOARD, PRIVACY, GAME, HELP }
+private enum class Page { MAIN, VIDEO, AUDIO, MOUSE_TOUCH, KEYBOARD, ON_SCREEN_KEYS, HELP }
 
 /**
  * 手机上的远程画面。
  *
  * 画面占满屏幕，只有一个可以拖动的小圆钮（点开是菜单），尽量不挡画面。
- * 打开键盘时上面多一排特殊键（Esc、Tab、Ctrl、方向键……），画面缩到键盘上面，始终能看到全貌。
+ * 打开键盘时上面多一排特殊键（Esc、Tab、Ctrl、方向键……）。画面不缩小：键盘上面放得下就挪到键盘上面，
+ * 放不下（横屏、对方是竖着的手机）就跟着光标挪，光标所在的地方一直在键盘上面（[RemoteView.setKeyboardInset]）。
  * 控制手机时底部有返回 / 主页 / 最近任务三个键。第一次使用某种操作方式时先说明手势。
- * 控制电脑时可以在画面上叠一层游戏按键（菜单 → 游戏按键，见 [GameControls]），编辑方案时盖上 [GameEditOverlay]。
- * 横屏还是竖屏跟着对方画面走，菜单里可以换（[landscape] 是现在的方向，[onRotate] 换到另一个方向）。
+ * 控制电脑时可以在画面上叠一层游戏按键（菜单 → 屏幕按键，见 [GameControls]），编辑方案时盖上 [GameEditOverlay]。
+ * 设置里打开状态信息时画面上方显示它（[StatsHud]）。
+ * 横屏还是竖屏：默认跟着手机的方向，设置里关掉自动旋转则跟着对方画面走，菜单里都可以换
+ * （[landscape] 是现在的方向，[onRotate] 换到另一个方向，见 [SessionActivity]）。
  */
 @OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
@@ -206,7 +212,12 @@ fun PhoneSession(
     LaunchedEffect(cursor) { view.setCursor(cursor) }
     LaunchedEffect(mouseLock) { view.mouseLock = mouseLock }
     LaunchedEffect(settings.localCursor) { view.localCursor = settings.localCursor }
-    LaunchedEffect(settings.reverseWheel, settings.wheelSpeed) { view.setWheel(settings.reverseWheel, settings.wheelSpeed) }
+    LaunchedEffect(settings.reverseWheel, settings.wheelSpeed, settings.wheelMode, settings.smoothWheel) {
+        view.setWheel(settings.reverseWheel, settings.wheelSpeed, settings.wheelMode, settings.smoothWheel)
+    }
+    LaunchedEffect(settings.touchScrollSpeed, settings.touchScrollFling) {
+        view.setTouchScroll(settings.touchScrollSpeed, settings.touchScrollFling)
+    }
     // 相对移动按对方屏幕的像素换算
     LaunchedEffect(displays, currentDisplay) {
         displays.firstOrNull { it.index == currentDisplay }?.let { view.setRemoteSize(it.width, it.height) }
@@ -229,16 +240,20 @@ fun PhoneSession(
     BackHandler(enabled = !menu && editor == null) { confirmExit = true }
 
     val imeBottom = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
-    val keysBar = if (imeVisible) 44.dp else 0.dp
+    val keysBar = if (imeVisible) (if (landscape) 36.dp else 44.dp) else 0.dp
     val navActions = listOf(SystemAction.BACK, SystemAction.HOME, SystemAction.RECENTS).filter { it in actions }
     val navBar = if (navActions.isNotEmpty() && settings.navKeys && !imeVisible) 48.dp else 0.dp
+    // 画面不跟着键盘缩小：键盘和特殊键挡着多高告诉 RemoteView，它把画面（放不下时是光标所在的地方）挪到键盘上面
+    val density = LocalDensity.current
+    val imeInsetPx = if (imeVisible) with(density) { (imeBottom + keysBar).toPx() } else 0f
+    LaunchedEffect(imeInsetPx, landscape) { view.setKeyboardInset(imeInsetPx) }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         AndroidView(
             factory = { view },
             modifier = Modifier
                 .fillMaxSize()
-                .padding(bottom = imeBottom + keysBar + navBar),
+                .padding(bottom = navBar),
         )
 
         val covered = SessionStatus(session, big = false, onExit = onExit)
@@ -259,11 +274,16 @@ fun PhoneSession(
                 Modifier
                     .align(Alignment.TopCenter)
                     .windowInsetsPadding(WindowInsets.safeDrawing)
-                    .padding(top = 8.dp, start = 56.dp, end = 56.dp),
+                    .padding(top = 6.dp, start = 12.dp, end = 12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
+                // 横屏开着键盘时不显示状态信息：本来就没剩多高了
+                if (settings.showStats && !covered && !(imeVisible && landscape)) StatsHud(session)
                 messages.forEach { (key, text) ->
-                    NoticePill(text) { dismissed = dismissed + key }
+                    Box(Modifier.padding(horizontal = 44.dp)) {
+                        NoticePill(text) { dismissed = dismissed + key }
+                    }
                 }
             }
         }
@@ -285,6 +305,7 @@ fun PhoneSession(
             KeysBar(
                 kb,
                 os,
+                compact = landscape,
                 onHide = { keyboardOpen.value = false },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -304,10 +325,12 @@ fun PhoneSession(
         if (!covered && editor == null) {
             MenuHandle(
                 bottomInset = imeBottom + keysBar + navBar,
+                doubleTapKeyboard = settings.doubleTapKeyboard,
                 onClick = {
                     page = Page.MAIN
                     menu = true
                 },
+                onDoubleTap = { keyboardOpen.value = !keyboardOpen.value },
             )
         }
 
@@ -341,16 +364,17 @@ fun PhoneSession(
             sheetState = sheet,
             containerColor = MaterialTheme.colorScheme.surfaceContainer,
         ) {
+            val menuScroll = rememberScrollState()
             BackHandler(enabled = page != Page.MAIN) { page = Page.MAIN }
+            LaunchedEffect(page) { menuScroll.scrollTo(0) }
             Column(
                 Modifier
-                    .verticalScroll(rememberScrollState())
+                    .verticalScroll(menuScroll)
                     .padding(bottom = 16.dp),
             ) {
                 when (page) {
                     Page.MAIN -> MainMenu(
-                        session, view, name, os, mode, landscape, gameOn,
-                        onMode = { mode = it },
+                        session, name, landscape, gameOn,
                         onRotate = {
                             menu = false
                             onRotate()
@@ -366,44 +390,66 @@ fun PhoneSession(
                             confirmExit = true
                         },
                     )
-                    Page.SHORTCUTS -> SubPage(stringResource(R.string.menu_shortcuts), { page = Page.MAIN }) {
-                        if (actions.isNotEmpty()) {
-                            // 手机：系统操作（对方列出的）
-                            SystemActions(actions) { a ->
-                                session.system(a)
-                                menu = false
-                            }
-                        } else {
-                            if (os == OsKind.MAC) SwapCtrlCommand(session)
-                            Shortcuts(os) { codes ->
+                    Page.VIDEO -> SubPage(stringResource(R.string.cat_video), { page = Page.MAIN }) {
+                        VideoCategoryPage(
+                            session = session,
+                            view = view,
+                            os = os,
+                            settings = settings,
+                            onUpdate = { update -> app.updateSettings(update) },
+                            onClose = { menu = false },
+                        )
+                    }
+                    Page.AUDIO -> SubPage(stringResource(R.string.cat_audio), { page = Page.MAIN }) {
+                        AudioCategoryPage(session)
+                    }
+                    Page.MOUSE_TOUCH -> SubPage(stringResource(R.string.cat_mouse_touch), { page = Page.MAIN }) {
+                        MouseTouchCategoryPage(
+                            session = session,
+                            os = os,
+                            mode = mode,
+                            settings = settings,
+                            onMode = { mode = it },
+                            onUpdate = { update -> app.updateSettings(update) },
+                        )
+                    }
+                    Page.KEYBOARD -> SubPage(stringResource(R.string.cat_keyboard), { page = Page.MAIN }) {
+                        KeyboardCategoryPage(
+                            session = session,
+                            os = os,
+                            actions = actions,
+                            settings = settings,
+                            onUpdate = { update -> app.updateSettings(update) },
+                            onSendCombo = { codes ->
                                 kb.chord(codes)
                                 menu = false
-                            }
-                        }
-                    }
-                    Page.DISPLAYS -> SubPage(stringResource(R.string.menu_displays), { page = Page.MAIN }) {
-                        Displays(session) { menu = false }
-                    }
-                    Page.QUALITY -> SubPage(stringResource(R.string.menu_quality), { page = Page.MAIN }) {
-                        Quality(session)
-                    }
-                    Page.CLIPBOARD -> SubPage(stringResource(R.string.menu_clipboard), { page = Page.MAIN }) {
-                        ClipboardActions(session) { menu = false }
-                    }
-                    Page.PRIVACY -> SubPage(stringResource(R.string.privacy_toggle), { page = Page.MAIN }) {
-                        Privacy(session, os)
-                    }
-                    Page.GAME -> SubPage(stringResource(R.string.menu_game), { page = Page.MAIN }) {
-                        GamePage(
-                            session.code,
-                            onEdit = { l ->
+                            },
+                            onSendAction = { a ->
+                                session.system(a)
                                 menu = false
-                                keyboardOpen.value = false
-                                app.games.setDevice(session.code, on = true, layout = l.id)
-                                editor = view.newEditor(l)
                             },
                             onClose = { menu = false },
                         )
+                    }
+                    Page.ON_SCREEN_KEYS -> SubPage(stringResource(R.string.cat_on_screen_keys), { page = Page.MAIN }) {
+                        if (os != OsKind.ANDROID && os != OsKind.IOS) {
+                            GamePage(
+                                session.code,
+                                onEdit = { l ->
+                                    menu = false
+                                    keyboardOpen.value = false
+                                    app.games.setDevice(session.code, on = true, layout = l.id)
+                                    editor = view.newEditor(l)
+                                },
+                                onClose = { menu = false },
+                            )
+                        } else {
+                            ToggleRow(
+                                title = stringResource(R.string.nav_keys),
+                                desc = stringResource(R.string.nav_keys_desc),
+                                checked = settings.navKeys,
+                            ) { v -> app.updateSettings { it.copy(navKeys = v) } }
+                        }
                     }
                     Page.HELP -> SubPage(stringResource(R.string.menu_help), { page = Page.MAIN }) {
                         GestureHelp(gm)
@@ -436,10 +482,17 @@ private const val PRIVACY_NOTICE = "privacy"
 
 // ───────────────────────────── 浮动圆钮 ─────────────────────────────
 
-/** 可以拖动的菜单圆钮，松手后贴到最近的左 / 右边缘 */
+/** 可以拖动的菜单圆钮，松手后贴到最近的左 / 右边缘；开启 [doubleTapKeyboard] 时双击直接开关键盘 */
 @Composable
-private fun MenuHandle(bottomInset: androidx.compose.ui.unit.Dp, onClick: () -> Unit) {
+private fun MenuHandle(
+    bottomInset: androidx.compose.ui.unit.Dp,
+    doubleTapKeyboard: Boolean,
+    onClick: () -> Unit,
+    onDoubleTap: () -> Unit,
+) {
     val density = LocalDensity.current
+    val currentClick by rememberUpdatedState(onClick)
+    val currentDoubleTap by rememberUpdatedState(onDoubleTap)
     var side by rememberSaveable { mutableFloatStateOf(1f) } // 0 左 1 右
     var fy by rememberSaveable { mutableFloatStateOf(0.35f) } // 纵向位置（比例）
     var drag by remember { mutableStateOf<Pair<Float, Float>?>(null) }
@@ -481,7 +534,18 @@ private fun MenuHandle(bottomInset: androidx.compose.ui.unit.Dp, onClick: () -> 
                         drag = (cx + amount.x).coerceIn(0f, wPx - sPx) to (cy + amount.y).coerceIn(0f, hPx - sPx)
                     }
                 }
-                .clickable(onClick = onClick),
+                .then(
+                    if (doubleTapKeyboard) {
+                        Modifier.pointerInput(Unit) {
+                            detectTapGestures(
+                                onTap = { currentClick() },
+                                onDoubleTap = { currentDoubleTap() },
+                            )
+                        }
+                    } else {
+                        Modifier.clickable(onClick = currentClick)
+                    },
+                ),
             contentAlignment = Alignment.Center,
         ) {
             Box(Modifier.size(30.dp).clip(RoundedCornerShape(8.dp)).background(Brand.gradient), contentAlignment = Alignment.Center) {
@@ -491,19 +555,95 @@ private fun MenuHandle(bottomInset: androidx.compose.ui.unit.Dp, onClick: () -> 
     }
 }
 
+// ───────────────────────────── 画面上方的状态信息 ─────────────────────────────
+
+/**
+ * 远程画面上方的状态信息（设置里打开）：走的路、编码格式、帧率、分辨率、码率、解码器、解码耗时、延迟、抖动、卡顿帧；
+ * 还不知道的是 "--"。会话的状态自己取：每秒、每半秒都在变，放在 [PhoneSession] 里取的话整个画面跟着重组（关着也一样）。
+ * 没有接着点击的东西，按在上面照样落到下面的画面上。
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun StatsHud(session: RemoteSession) {
+    val stats by session.stats.collectAsState()
+    val encoder by session.encoder.collectAsState()
+    val decoder by session.decoderStats.collectAsState()
+    val video by session.videoSize.collectAsState()
+    val st = stats
+    val dec = decoder
+    val none = "--"
+    val (w, h) = video ?: st?.takeIf { it.width > 0 }?.let { it.width to it.height } ?: (0 to 0)
+    // 走的路：收到画面之后才知道
+    val link = st?.takeIf { w > 0 }?.let { stringResource(if (it.direct) R.string.hud_path_direct else R.string.hud_path_relayed) } ?: none
+    val codec = (dec?.codec ?: encoder?.codec)?.label ?: none
+    val fps = st?.let { "%.1f fps".format(Locale.US, it.fps) } ?: none
+    val resolution = if (w > 0) "$w×$h" else none
+    val bitrate = st?.kbps?.takeIf { it > 0f }?.let {
+        if (it >= 1000f) "%.1f Mbps".format(Locale.US, it / 1000f) else "${it.roundToInt()} kbps"
+    } ?: none
+    val hardware = dec?.let { stringResource(if (it.hardware) R.string.hud_decoder_hw else R.string.hud_decoder_sw) } ?: none
+    val decodeTime = dec?.decodeMs?.let { "%.1f ms".format(Locale.US, it) } ?: none
+    val rtt = st?.rttMs?.let { "${it.roundToInt()} ms" } ?: none
+    val jitter = st?.jitterMs?.let { "%.1f ms".format(Locale.US, it) } ?: none
+    val stall = st?.let { "%.1f%%".format(Locale.US, it.stallPct) } ?: none
+
+    Box(
+        Modifier
+            .widthIn(max = 680.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(Color.Black.copy(alpha = 0.65f))
+            .border(1.dp, Color.White.copy(alpha = 0.22f), RoundedCornerShape(10.dp))
+            .padding(horizontal = 12.dp, vertical = 7.dp),
+    ) {
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            HudItem(stringResource(R.string.hud_connection), link)
+            HudItem(stringResource(R.string.hud_codec), codec)
+            HudItem(stringResource(R.string.hud_fps), fps)
+            HudItem(stringResource(R.string.hud_resolution), resolution)
+            HudItem(stringResource(R.string.hud_bitrate), bitrate)
+            HudItem(stringResource(R.string.hud_decoder), hardware)
+            HudItem(stringResource(R.string.hud_decode_time), decodeTime)
+            HudItem(stringResource(R.string.hud_rtt), rtt)
+            HudItem(stringResource(R.string.hud_jitter), jitter)
+            HudItem(stringResource(R.string.hud_stall), stall)
+        }
+    }
+}
+
+@Composable
+private fun HudItem(label: String, value: String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            "$label: ",
+            color = Color.White.copy(alpha = 0.7f),
+            fontSize = 11.sp,
+            lineHeight = 14.sp,
+            maxLines = 1,
+        )
+        Text(
+            value,
+            color = Color.White,
+            fontSize = 11.sp,
+            lineHeight = 14.sp,
+            fontWeight = FontWeight.SemiBold,
+            style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+            maxLines = 1,
+        )
+    }
+}
+
 // ───────────────────────────── 菜单 ─────────────────────────────
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun MainMenu(
     session: RemoteSession,
-    view: RemoteView,
     name: String,
-    os: OsKind,
-    mode: UiMode,
     landscape: Boolean,
     gameOn: Boolean,
-    onMode: (UiMode) -> Unit,
     onRotate: () -> Unit,
     onKeyboard: () -> Unit,
     onPage: (Page) -> Unit,
@@ -511,8 +651,8 @@ private fun MainMenu(
     onDisconnect: () -> Unit,
 ) {
     val stats by session.stats.collectAsState()
+    val video by session.videoSize.collectAsState()
     val encoder by session.encoder.collectAsState()
-    val displays by session.displays.collectAsState()
     val audioOn by session.audioOn.collectAsState()
     val avSyncOn by session.avSyncOn.collectAsState()
     val mouseLock by session.mouseLock.collectAsState()
@@ -527,6 +667,7 @@ private fun MainMenu(
             Text(name.ifBlank { Code.format(session.code) }, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
             val parts = listOfNotNull(
                 encoder?.codec?.label,
+                (video ?: stats?.takeIf { it.width > 0 }?.let { it.width to it.height })?.let { "${it.first}×${it.second}" },
                 stats?.let { "${it.fps.roundToInt()} fps" },
                 stats?.rttMs?.let { stringResource(R.string.latency_ms, it.roundToInt()) },
                 stats?.let { if (it.kbps >= 1000) "%.1f Mbps".format(it.kbps / 1000) else "${it.kbps.roundToInt()} kbps" },
@@ -551,72 +692,42 @@ private fun MainMenu(
     }
     Spacer(Modifier.height(8.dp))
 
-    // 操作方式：两个大按钮，一眼看出当前是哪种
-    Row(Modifier.padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        ModeCard(Icons.Outlined.Mouse, stringResource(R.string.mode_trackpad), stringResource(R.string.mode_trackpad_short), mode == UiMode.TRACKPAD, Modifier.weight(1f)) {
-            onMode(UiMode.TRACKPAD)
-        }
-        ModeCard(
-            Icons.Outlined.TouchApp,
-            stringResource(R.string.mode_touch),
-            stringResource(if (os == OsKind.ANDROID) R.string.mode_touch_phone_short else R.string.mode_touch_short),
-            mode == UiMode.TOUCH,
-            Modifier.weight(1f),
-        ) { onMode(UiMode.TOUCH) }
-    }
-    Spacer(Modifier.height(12.dp))
-
+    // 4 个最高频单步快捷动作
     FlowRow(
         Modifier.padding(horizontal = 8.dp),
         maxItemsInEachRow = 4,
     ) {
         val cell = Modifier.weight(1f)
         Action(Icons.Outlined.Keyboard, stringResource(R.string.menu_keyboard), cell, onClick = onKeyboard)
-        Action(Icons.Outlined.KeyboardCommandKey, stringResource(R.string.menu_shortcuts), cell) { onPage(Page.SHORTCUTS) }
-        Action(if (audioOn) Icons.AutoMirrored.Outlined.VolumeUp else Icons.AutoMirrored.Outlined.VolumeOff, stringResource(if (audioOn) R.string.menu_sound_on else R.string.menu_sound_off), cell, active = audioOn) {
-            session.setAudio(!audioOn)
-        }
-        Action(Icons.Outlined.Sync, stringResource(if (avSyncOn) R.string.menu_av_sync_on else R.string.menu_av_sync_off), cell, active = avSyncOn, enabled = audioOn) {
-            session.setAvSync(!avSyncOn)
-        }
-        Action(Icons.Outlined.HighQuality, stringResource(R.string.menu_quality), cell) { onPage(Page.QUALITY) }
-        Action(Icons.Outlined.ContentPaste, stringResource(R.string.menu_clipboard), cell) { onPage(Page.CLIPBOARD) }
-        if (displays.size > 1) {
-            Action(Icons.Outlined.Monitor, stringResource(R.string.menu_displays), cell) { onPage(Page.DISPLAYS) }
-        }
-        // 防窥模式：对方（Windows、Mac）说了它的状态才有；点开是开关和说明（开不了时写着为什么）
-        privacy?.let { p ->
-            Action(
-                if (p.active) Icons.Outlined.Shield else Icons.Outlined.RemoveModerator,
-                stringResource(if (p.active) R.string.menu_privacy_on else R.string.menu_privacy_off),
-                cell,
-                active = p.active,
-            ) { onPage(Page.PRIVACY) }
-        }
-        // 锁定鼠标（控制电脑时）：鼠标一直只发移动了多少，游戏里转视角用；游戏按键：画面上的按钮和摇杆
-        val lockable = os != OsKind.ANDROID && os != OsKind.IOS
-        if (lockable) {
-            Action(Icons.Outlined.Lock, stringResource(if (mouseLock) R.string.menu_mouse_lock_on else R.string.menu_mouse_lock_off), cell, active = mouseLock) {
-                session.mouseLock.value = !mouseLock
-            }
-            Action(Icons.Outlined.SportsEsports, stringResource(R.string.menu_game), cell, active = gameOn) { onPage(Page.GAME) }
-        }
-        Action(Icons.Outlined.Crop, stringResource(R.string.menu_fit), cell, enabled = view.zoomed) {
-            view.fit()
-            onClose()
-        }
-        // 横屏 / 竖屏：显示现在的方向，点一下换到另一个
         Action(
-            if (landscape) Icons.Outlined.StayCurrentLandscape else Icons.Outlined.StayCurrentPortrait,
-            stringResource(if (landscape) R.string.menu_landscape else R.string.menu_portrait),
+            if (audioOn) Icons.AutoMirrored.Outlined.VolumeUp else Icons.AutoMirrored.Outlined.VolumeOff,
+            stringResource(if (audioOn) R.string.menu_sound_on else R.string.menu_sound_off),
+            cell,
+            active = audioOn,
+        ) { session.setAudio(!audioOn) }
+        Action(
+            if (landscape) Icons.Outlined.StayCurrentPortrait else Icons.Outlined.StayCurrentLandscape,
+            stringResource(if (landscape) R.string.menu_to_portrait else R.string.menu_to_landscape),
             cell,
             onClick = onRotate,
         )
-        Action(Icons.AutoMirrored.Outlined.HelpOutline, stringResource(R.string.menu_help), cell) { onPage(Page.HELP) }
         Action(Icons.Outlined.LinkOff, stringResource(R.string.disconnect), cell, danger = true, onClick = onDisconnect)
-        // 补齐最后一行，保持格子宽度一致
-        val items = 10 + (if (displays.size > 1) 1 else 0) + (if (privacy != null) 1 else 0) + (if (lockable) 2 else 0)
-        repeat((4 - items % 4) % 4) { Spacer(cell) }
+    }
+
+    HorizontalDivider(Modifier.padding(horizontal = 20.dp, vertical = 6.dp))
+
+    // 固定 6 个一级分类（2×3），与首页「设置」完全对齐，后续新增细分项不再膨胀主菜单
+    FlowRow(
+        Modifier.padding(horizontal = 12.dp),
+        maxItemsInEachRow = 3,
+    ) {
+        val cell = Modifier.weight(1f)
+        Action(Icons.Outlined.HighQuality, stringResource(R.string.cat_video), cell, active = privacy?.active == true) { onPage(Page.VIDEO) }
+        Action(Icons.AutoMirrored.Outlined.VolumeUp, stringResource(R.string.cat_audio), cell, active = avSyncOn && audioOn) { onPage(Page.AUDIO) }
+        Action(Icons.Outlined.Mouse, stringResource(R.string.cat_mouse_touch), cell, active = mouseLock) { onPage(Page.MOUSE_TOUCH) }
+        Action(Icons.Outlined.KeyboardCommandKey, stringResource(R.string.cat_keyboard), cell) { onPage(Page.KEYBOARD) }
+        Action(Icons.Outlined.SportsEsports, stringResource(R.string.cat_on_screen_keys), cell, active = gameOn) { onPage(Page.ON_SCREEN_KEYS) }
+        Action(Icons.AutoMirrored.Outlined.HelpOutline, stringResource(R.string.menu_help), cell) { onPage(Page.HELP) }
     }
 }
 
@@ -858,6 +969,244 @@ private fun Quality(session: RemoteSession) {
     }
 }
 
+/** 分类 1：视频与画面（状态浮窗、自动旋转、适应屏幕、画质/编码、多屏切换、防窥模式） */
+@Composable
+private fun VideoCategoryPage(
+    session: RemoteSession,
+    view: RemoteView,
+    os: OsKind,
+    settings: Settings,
+    onUpdate: ((Settings) -> Settings) -> Unit,
+    onClose: () -> Unit,
+) {
+    val displays by session.displays.collectAsState()
+    val privacy by session.privacyState.collectAsState()
+
+    ToggleRow(
+        title = stringResource(R.string.show_stats),
+        desc = stringResource(R.string.show_stats_desc),
+        checked = settings.showStats,
+    ) { v -> onUpdate { it.copy(showStats = v) } }
+    ToggleRow(
+        title = stringResource(R.string.auto_rotate),
+        desc = stringResource(R.string.auto_rotate_desc),
+        checked = settings.autoRotate,
+    ) { v -> onUpdate { it.copy(autoRotate = v) } }
+    if (view.zoomed) {
+        MenuRow(stringResource(R.string.menu_fit), stringResource(R.string.menu_fit_desc)) {
+            view.fit()
+            onClose()
+        }
+    }
+
+    MenuSection(stringResource(R.string.menu_quality))
+    Quality(session)
+
+    if (displays.size > 1) {
+        MenuSection(stringResource(R.string.menu_displays))
+        Displays(session, onDone = onClose)
+    }
+
+    if (privacy != null) {
+        MenuSection(stringResource(R.string.privacy_toggle))
+        Privacy(session, os)
+    }
+}
+
+/** 分类 2：音频（声音开关、音画同步） */
+@Composable
+private fun AudioCategoryPage(session: RemoteSession) {
+    val audioOn by session.audioOn.collectAsState()
+    val avSyncOn by session.avSyncOn.collectAsState()
+    ToggleRow(
+        title = stringResource(R.string.play_audio),
+        desc = stringResource(R.string.play_audio_desc),
+        checked = audioOn,
+    ) { v -> session.setAudio(v) }
+    ToggleRow(
+        title = stringResource(R.string.av_sync),
+        desc = stringResource(R.string.av_sync_desc),
+        checked = avSyncOn,
+        enabled = audioOn,
+    ) { v -> session.setAvSync(v) }
+}
+
+/** 分类 3：鼠标与触控（操作方式、锁定鼠标、本地光标、外接鼠标滚轮、屏幕双指滑动） */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun MouseTouchCategoryPage(
+    session: RemoteSession,
+    os: OsKind,
+    mode: UiMode,
+    settings: Settings,
+    onMode: (UiMode) -> Unit,
+    onUpdate: ((Settings) -> Settings) -> Unit,
+) {
+    val mouseLock by session.mouseLock.collectAsState()
+    val lockable = os != OsKind.ANDROID && os != OsKind.IOS
+
+    Row(Modifier.padding(horizontal = 16.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        ModeCard(Icons.Outlined.Mouse, stringResource(R.string.mode_trackpad), stringResource(R.string.mode_trackpad_short), mode == UiMode.TRACKPAD, Modifier.weight(1f)) {
+            onMode(UiMode.TRACKPAD)
+        }
+        ModeCard(
+            Icons.Outlined.TouchApp,
+            stringResource(R.string.mode_touch),
+            stringResource(if (os == OsKind.ANDROID) R.string.mode_touch_phone_short else R.string.mode_touch_short),
+            mode == UiMode.TOUCH,
+            Modifier.weight(1f),
+        ) { onMode(UiMode.TOUCH) }
+    }
+    Spacer(Modifier.height(6.dp))
+    if (lockable) {
+        ToggleRow(
+            title = stringResource(if (mouseLock) R.string.menu_mouse_lock_on else R.string.menu_mouse_lock_off),
+            desc = stringResource(R.string.menu_mouse_lock_desc),
+            checked = mouseLock,
+        ) { v -> session.mouseLock.value = v }
+    }
+    ToggleRow(
+        title = stringResource(R.string.local_cursor),
+        desc = stringResource(R.string.local_cursor_desc),
+        checked = settings.localCursor,
+    ) { v -> onUpdate { it.copy(localCursor = v) } }
+
+    MenuSection(stringResource(R.string.scroll_section_mouse))
+    PercentSliderRow(
+        label = stringResource(R.string.wheel_speed),
+        value = settings.wheelSpeed,
+        min = Settings.WHEEL_SPEED_MIN,
+        max = Settings.WHEEL_SPEED_MAX,
+        step = Settings.WHEEL_SPEED_STEP,
+    ) { v -> onUpdate { it.copy(wheelSpeed = v) } }
+    Text(
+        stringResource(R.string.wheel_mode),
+        style = MaterialTheme.typography.bodyMedium,
+        modifier = Modifier.padding(start = 24.dp, end = 24.dp, top = 6.dp, bottom = 4.dp),
+    )
+    FlowRow(Modifier.padding(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        WheelMode.entries.forEach { m ->
+            FilterChip(
+                selected = settings.wheelMode == m,
+                onClick = { onUpdate { it.copy(wheelMode = m) } },
+                label = { Text(wheelModeName(m)) },
+            )
+        }
+    }
+    Text(
+        wheelModeDesc(settings.wheelMode),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(horizontal = 24.dp, vertical = 2.dp),
+    )
+    ToggleRow(
+        title = stringResource(R.string.smooth_wheel),
+        desc = stringResource(R.string.smooth_wheel_desc),
+        checked = settings.smoothWheel,
+    ) { v -> onUpdate { it.copy(smoothWheel = v) } }
+    ToggleRow(
+        title = stringResource(R.string.reverse_wheel),
+        desc = stringResource(R.string.reverse_wheel_desc),
+        checked = settings.reverseWheel,
+    ) { v -> onUpdate { it.copy(reverseWheel = v) } }
+
+    MenuSection(stringResource(R.string.scroll_section_touch))
+    PercentSliderRow(
+        label = stringResource(R.string.touch_scroll_speed),
+        value = settings.touchScrollSpeed,
+        min = Settings.TOUCH_SCROLL_MIN,
+        max = Gestures.maxScrollPercent(LocalDensity.current.density, Settings.TOUCH_SCROLL_STEP),
+        step = Settings.TOUCH_SCROLL_STEP,
+    ) { v -> onUpdate { it.copy(touchScrollSpeed = v) } }
+    ToggleRow(
+        title = stringResource(R.string.touch_scroll_fling),
+        desc = stringResource(R.string.touch_scroll_fling_desc),
+        checked = settings.touchScrollFling,
+    ) { v -> onUpdate { it.copy(touchScrollFling = v) } }
+}
+
+/** 分类 4：键盘与输入（双击浮标开关键盘、剪贴板、Mac 互换 Ctrl/⌘、快捷键/系统操作） */
+@Composable
+private fun KeyboardCategoryPage(
+    session: RemoteSession,
+    os: OsKind,
+    actions: List<SystemAction>,
+    settings: Settings,
+    onUpdate: ((Settings) -> Settings) -> Unit,
+    onSendCombo: (List<String>) -> Unit,
+    onSendAction: (SystemAction) -> Unit,
+    onClose: () -> Unit,
+) {
+    ToggleRow(
+        title = stringResource(R.string.double_tap_keyboard),
+        desc = stringResource(R.string.double_tap_keyboard_desc),
+        checked = settings.doubleTapKeyboard,
+    ) { v -> onUpdate { it.copy(doubleTapKeyboard = v) } }
+
+    MenuSection(stringResource(R.string.menu_clipboard))
+    ClipboardActions(session, onDone = onClose)
+
+    MenuSection(stringResource(R.string.menu_shortcuts))
+    if (actions.isNotEmpty()) {
+        SystemActions(actions, onSendAction)
+    } else {
+        if (os == OsKind.MAC) SwapCtrlCommand(session)
+        Shortcuts(os, onSendCombo)
+    }
+}
+
+/** 菜单二级页里的一节：分隔线加标题 */
+@Composable
+private fun MenuSection(title: String) {
+    HorizontalDivider(Modifier.padding(vertical = 8.dp, horizontal = 16.dp))
+    Text(
+        title,
+        style = MaterialTheme.typography.titleSmall,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
+    )
+}
+
+/**
+ * 百分比滑块（[min]..[max]，按 [step] 取整）。拖动时只改显示的值，松手才交给 [onChange]：
+ * 设置每改一次就写一次文件，拖一下不该写几十次
+ */
+@Composable
+private fun PercentSliderRow(label: String, value: Int, min: Int, max: Int, step: Int, onChange: (Int) -> Unit) {
+    var shown by remember(value, min, max) { mutableIntStateOf(value.coerceIn(min, max)) }
+    Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 4.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text(label, style = MaterialTheme.typography.bodyMedium)
+            Text(
+                stringResource(R.string.percent, shown),
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+        Slider(
+            value = shown.toFloat(),
+            onValueChange = { shown = snapPercent(it, min, max, step) },
+            onValueChangeFinished = { if (shown != value) onChange(shown) },
+            valueRange = min.toFloat()..max.toFloat(),
+        )
+    }
+}
+
+@Composable
+private fun ToggleRow(title: String, desc: String, checked: Boolean, enabled: Boolean = true, onChange: (Boolean) -> Unit) {
+    ListItem(
+        headlineContent = { Text(title) },
+        supportingContent = { Text(desc) },
+        trailingContent = { Switch(checked = checked, onCheckedChange = onChange, enabled = enabled) },
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        modifier = Modifier
+            .fillMaxWidth()
+            .alpha(if (enabled) 1f else 0.45f)
+            .clickable(enabled = enabled) { onChange(!checked) }
+            .padding(horizontal = 8.dp),
+    )
+}
+
 @Composable
 private fun ClipboardActions(session: RemoteSession, onDone: () -> Unit) {
     val app = AirhandApp.instance
@@ -1033,7 +1382,7 @@ private fun GestureTips(mode: Gestures.Mode, onDone: () -> Unit) {
 // ───────────────────────────── 键盘上方的特殊键 / 手机导航键 ─────────────────────────────
 
 @Composable
-private fun KeysBar(kb: KeyboardController, os: OsKind, onHide: () -> Unit, modifier: Modifier) {
+private fun KeysBar(kb: KeyboardController, os: OsKind, compact: Boolean = false, onHide: () -> Unit, modifier: Modifier) {
     val meta = if (os == OsKind.MAC) "⌘" else if (os == OsKind.ANDROID) "◯" else "Win"
     Row(
         modifier
@@ -1048,52 +1397,54 @@ private fun KeysBar(kb: KeyboardController, os: OsKind, onHide: () -> Unit, modi
                 .padding(horizontal = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Key("Esc") { kb.press("Escape") }
-            Key("Tab") { kb.press("Tab") }
-            ModKey("Ctrl", kb, KeyboardController.Mod.CTRL)
-            ModKey(if (os == OsKind.MAC) "⌥" else "Alt", kb, KeyboardController.Mod.ALT)
-            ModKey("⇧", kb, KeyboardController.Mod.SHIFT)
-            ModKey(meta, kb, KeyboardController.Mod.META)
-            Key("←") { kb.press("ArrowLeft") }
-            Key("↑") { kb.press("ArrowUp") }
-            Key("↓") { kb.press("ArrowDown") }
-            Key("→") { kb.press("ArrowRight") }
-            Key("Del") { kb.press("Delete") }
-            Key("Home") { kb.press("Home") }
-            Key("End") { kb.press("End") }
-            Key("PgUp") { kb.press("PageUp") }
-            Key("PgDn") { kb.press("PageDown") }
-            for (i in 1..12) Key("F$i") { kb.press("F$i") }
+            Key("Esc", compact) { kb.press("Escape") }
+            Key("Tab", compact) { kb.press("Tab") }
+            ModKey("Ctrl", kb, KeyboardController.Mod.CTRL, compact)
+            ModKey(if (os == OsKind.MAC) "⌥" else "Alt", kb, KeyboardController.Mod.ALT, compact)
+            ModKey("⇧", kb, KeyboardController.Mod.SHIFT, compact)
+            ModKey(meta, kb, KeyboardController.Mod.META, compact)
+            Key("←", compact) { kb.press("ArrowLeft") }
+            Key("↑", compact) { kb.press("ArrowUp") }
+            Key("↓", compact) { kb.press("ArrowDown") }
+            Key("→", compact) { kb.press("ArrowRight") }
+            Key("Del", compact) { kb.press("Delete") }
+            Key("Home", compact) { kb.press("Home") }
+            Key("End", compact) { kb.press("End") }
+            Key("PgUp", compact) { kb.press("PageUp") }
+            Key("PgDn", compact) { kb.press("PageDown") }
+            for (i in 1..12) Key("F$i", compact) { kb.press("F$i") }
         }
-        IconButton(onClick = onHide) { Icon(Icons.Outlined.KeyboardHide, stringResource(R.string.hide_keyboard), tint = Color.White) }
+        IconButton(onClick = onHide, modifier = Modifier.size(if (compact) 36.dp else 44.dp)) {
+            Icon(Icons.Outlined.KeyboardHide, stringResource(R.string.hide_keyboard), tint = Color.White)
+        }
     }
 }
 
 @Composable
-private fun Key(label: String, onClick: () -> Unit) {
+private fun Key(label: String, compact: Boolean = false, onClick: () -> Unit) {
     Box(
         Modifier
-            .padding(horizontal = 2.dp, vertical = 4.dp)
-            .widthIn(min = 44.dp)
-            .height(36.dp)
+            .padding(horizontal = 2.dp, vertical = if (compact) 3.dp else 4.dp)
+            .widthIn(min = if (compact) 40.dp else 44.dp)
+            .height(if (compact) 30.dp else 36.dp)
             .clip(RoundedCornerShape(8.dp))
             .background(Color(0xFF2C3244))
             .clickable(onClick = onClick)
-            .padding(horizontal = 10.dp),
+            .padding(horizontal = if (compact) 8.dp else 10.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Text(label, color = Color.White, fontSize = 14.sp)
+        Text(label, color = Color.White, fontSize = if (compact) 13.sp else 14.sp)
     }
 }
 
 @Composable
-private fun ModKey(label: String, kb: KeyboardController, m: KeyboardController.Mod) {
+private fun ModKey(label: String, kb: KeyboardController, m: KeyboardController.Mod, compact: Boolean = false) {
     val st = kb.state(m)
     Box(
         Modifier
-            .padding(horizontal = 2.dp, vertical = 4.dp)
-            .widthIn(min = 48.dp)
-            .height(36.dp)
+            .padding(horizontal = 2.dp, vertical = if (compact) 3.dp else 4.dp)
+            .widthIn(min = if (compact) 44.dp else 48.dp)
+            .height(if (compact) 30.dp else 36.dp)
             .clip(RoundedCornerShape(8.dp))
             .background(
                 when (st) {
@@ -1104,10 +1455,10 @@ private fun ModKey(label: String, kb: KeyboardController, m: KeyboardController.
             )
             .then(if (st == KeyboardController.Sticky.LOCK) Modifier.border(2.dp, Color.White.copy(alpha = 0.7f), RoundedCornerShape(8.dp)) else Modifier)
             .clickable { kb.toggle(m) }
-            .padding(horizontal = 10.dp),
+            .padding(horizontal = if (compact) 8.dp else 10.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Text(label, color = Color.White, fontSize = 14.sp, fontWeight = if (st != KeyboardController.Sticky.OFF) FontWeight.Bold else FontWeight.Normal)
+        Text(label, color = Color.White, fontSize = if (compact) 13.sp else 14.sp, fontWeight = if (st != KeyboardController.Sticky.OFF) FontWeight.Bold else FontWeight.Normal)
     }
 }
 

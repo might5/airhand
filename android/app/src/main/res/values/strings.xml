@@ -150,6 +150,14 @@
     <string name="notification_connecting">Connecting to the server…</string>
 
     <!-- Settings -->
+    <string name="cat_video">Video &amp; display</string>
+    <string name="cat_audio">Audio</string>
+    <string name="cat_mouse_touch">Mouse &amp; touch</string>
+    <string name="cat_keyboard">Keyboard &amp; input</string>
+    <string name="cat_on_screen_keys">On-screen keys</string>
+    <string name="cat_network_device">Network &amp; device</string>
+    <string name="cat_about_data">About &amp; data</string>
+    <string name="on_screen_keys_game_note">Game keys for computers are in the session menu → On-screen keys, remembered for each computer</string>
     <string name="settings_server">Server</string>
     <string name="server_address">Server address</string>
     <string name="server_address_hint">The relay server\'s host:port, e.g. relay.example.com:4433</string>
@@ -165,7 +173,6 @@
     <string name="settings_current_code">Now %1$s · the old code stops working right away</string>
     <string name="settings_no_code">No control code yet (assigned the first time you share)</string>
     <string name="settings_code_reset">You\'ll get a new control code the next time you share</string>
-    <string name="settings_remote">Remote control</string>
     <string name="default_quality">Default quality</string>
     <string name="touch_mode">Touch input</string>
     <string name="mode_auto">Automatic (recommended)</string>
@@ -181,8 +188,12 @@
     <string name="play_audio_desc">Turn on sound when connected</string>
     <string name="av_sync">A/V sync</string>
     <string name="av_sync_desc">Align picture and sound for videos, with extra control latency. Active while sound is playing.</string>
-    <string name="menu_av_sync_on">A/V sync on</string>
-    <string name="menu_av_sync_off">A/V sync off</string>
+    <string name="show_stats">Show stats overlay</string>
+    <string name="show_stats_desc">Show the path, codec, frame rate, resolution, bitrate, decoder, latency and stalled frames above the remote screen</string>
+    <string name="auto_rotate">Auto-rotate screen</string>
+    <string name="auto_rotate_desc">Follow your phone\'s physical orientation automatically; you can still rotate manually in the menu</string>
+    <string name="double_tap_keyboard">Double-tap menu button for keyboard</string>
+    <string name="double_tap_keyboard_desc">Double-tap the floating button to toggle the keyboard (single-tap still opens the menu)</string>
     <string name="nav_keys">Navigation keys for phones</string>
     <string name="nav_keys_desc">Back, Home and Recents below the screen when controlling a phone</string>
     <string name="local_cursor">Local cursor while dragging windows</string>
@@ -190,15 +201,35 @@
     <string name="reverse_wheel">Reverse mouse wheel</string>
     <string name="reverse_wheel_desc">A connected mouse\'s wheel scrolls the other way. Two-finger scrolling on the screen doesn\'t change</string>
     <string name="wheel_speed">Mouse wheel speed</string>
+    <string name="wheel_mode">Mouse scroll mode</string>
+    <string name="wheel_mode_adaptive">Adaptive (recommended)</string>
+    <string name="wheel_mode_adaptive_desc">Precise on slow single notches, accelerates smoothly when spinning fast</string>
+    <string name="wheel_mode_linear">Linear</string>
+    <string name="wheel_mode_linear_desc">Fixed distance per notch</string>
+    <string name="smooth_wheel">Smooth mouse scrolling</string>
+    <string name="smooth_wheel_desc">Split discrete wheel clicks into smooth micro-steps (great for macOS)</string>
+    <string name="touch_scroll_speed">Two-finger scroll speed</string>
+    <string name="touch_scroll_fling">Two-finger scroll inertia</string>
+    <string name="touch_scroll_fling_desc">Keep gliding briefly after lifting two fingers; off stops immediately</string>
     <string name="percent" translatable="false">%1$d%%</string>
     <string name="settings_data">Data</string>
     <string name="clear_devices">Clear saved devices</string>
     <string name="clear_devices_desc">%1$d saved</string>
     <string name="clear_devices_confirm">All devices in My devices will be removed.</string>
-    <string name="data_note">All data (settings, saved devices, this phone\'s control code) stays in the app\'s private folder. It is never backed up elsewhere and is deleted when you uninstall the app.</string>
+    <string name="data_note">All data (settings, saved devices, this phone\'s control code, crash log) stays in the app\'s private folder. It is never backed up elsewhere and is deleted when you uninstall the app.</string>
     <string name="settings_about">About</string>
     <string name="version">Version</string>
     <string name="version_value">%1$s · protocol %2$d</string>
+    <string name="crash_log">Crash log</string>
+    <string name="crash_log_none">Nothing recorded</string>
+    <plurals name="crash_log_count">
+        <item quantity="one">%1$d record · last one %2$s</item>
+        <item quantity="other">%1$d records · last one %2$s</item>
+    </plurals>
+    <string name="crash_log_text">Recorded when Airhand crashes, stops responding or is closed by the system while you\'re using it: the app version, phone model, system version and where it went wrong, without screen content or anything you typed. Paste it into a GitHub issue to help fix the problem. It stays in the app\'s private folder and is deleted when you uninstall.</string>
+    <string name="crash_log_cleared">Crash log cleared</string>
+    <string name="crash_log_notice">Airhand closed unexpectedly. To report it, copy the crash log in Settings → About &amp; data</string>
+    <string name="crash_log_view">View</string>
 
     <!-- Quality presets (same as the desktop console) -->
     <string name="preset_saver">Data saver</string>
@@ -228,6 +259,20 @@
     <!-- 画面走的路：直连不经过服务器，中转经过服务器 -->
     <string name="path_direct">Direct</string>
     <string name="path_relayed">Relayed</string>
+    <string name="hud_connection">Link</string>
+    <string name="hud_path_direct">Direct UDP</string>
+    <string name="hud_path_relayed">Relayed UDP</string>
+    <string name="hud_codec">Codec</string>
+    <string name="hud_fps">FPS</string>
+    <string name="hud_resolution">Resolution</string>
+    <string name="hud_bitrate">Bitrate</string>
+    <string name="hud_decoder">Decoder</string>
+    <string name="hud_decoder_hw">Hardware</string>
+    <string name="hud_decoder_sw">Software</string>
+    <string name="hud_decode_time">Decode</string>
+    <string name="hud_rtt">RTT</string>
+    <string name="hud_jitter">Jitter</string>
+    <string name="hud_stall">Stalled</string>
     <string name="clipboard_received">Copied the remote clipboard</string>
     <string name="audio_playback_failed">Can\'t play the sound: %1$s</string>
     <string name="menu_keyboard">Keyboard</string>
@@ -238,12 +283,16 @@
     <string name="menu_sound_off">Sound off</string>
     <string name="menu_mouse_lock_on">Mouse lock on</string>
     <string name="menu_mouse_lock_off">Mouse lock off</string>
+    <string name="menu_mouse_lock_desc">Keep sending relative mouse movement for 3D camera control in games</string>
     <string name="menu_quality">Quality</string>
+    <string name="scroll_section_mouse">External mouse wheel</string>
+    <string name="scroll_section_touch">Two-finger touch scroll</string>
     <string name="menu_clipboard">Clipboard</string>
     <string name="menu_displays">Displays</string>
     <string name="menu_fit">Fit screen</string>
-    <string name="menu_landscape">Landscape</string>
-    <string name="menu_portrait">Portrait</string>
+    <string name="menu_fit_desc">Reset zoomed view to fit the screen</string>
+    <string name="menu_to_landscape">To landscape</string>
+    <string name="menu_to_portrait">To portrait</string>
     <string name="menu_help">Gestures</string>
     <string name="hide_keyboard">Hide keyboard</string>
     <string name="display_n">Display %1$d</string>
@@ -255,8 +304,6 @@
     <string name="clipboard_type_desc">Types the text you copied into the focused field on the other side</string>
 
     <!-- Privacy mode (Windows and Mac hosts): the remote monitors go blank and its keyboard and mouse stop working, only you see and control it -->
-    <string name="menu_privacy_on">Privacy mode on</string>
-    <string name="menu_privacy_off">Privacy mode off</string>
     <string name="privacy_toggle">Privacy mode</string>
     <string name="privacy_off">Blanks all of the remote computer\'s monitors and disables its keyboard and mouse, so only you can see and control it (the picture moves to a virtual display). Turns off by itself after you disconnect</string>
     <string name="privacy_off_mac">Blanks all of the remote Mac\'s displays and disables its keyboard, mouse and trackpad, so only you can see and control it. Turns off by itself after you disconnect</string>
@@ -270,7 +317,6 @@
     <string name="privacy_note">Someone at the remote computer can end privacy mode by disconnecting it from the network or restarting it</string>
 
     <!-- Game keys: buttons and a joystick over the picture when controlling a computer -->
-    <string name="menu_game">Game keys</string>
     <string name="game_show">Show on the screen</string>
     <string name="game_show_desc">Hold a button to hold its key. Everywhere else works as usual; when a game hides the cursor, dragging turns the view</string>
     <string name="game_layouts">Layouts</string>
@@ -431,6 +477,8 @@
     <string name="notice_android_no_input">Remote control (the accessibility service) is off on the other phone: you can watch but not operate it</string>
     <string name="notice_mac_no_screen_input">The other Mac hasn\'t allowed Airhand “Screen &amp; System Audio Recording” and “Accessibility”: no picture, no sound and no control</string>
     <string name="notice_mac_no_input">The other Mac hasn\'t allowed Airhand “Accessibility”, so the keyboard and mouse can\'t be controlled</string>
+    <string name="notice_mac_awdl">The other Mac is on Wi-Fi, and AirDrop, AirPlay and similar features keep borrowing its wireless card, so the picture may stutter now and then. Plug it into Ethernet, or turn on “Pause AirDrop during remote control” in Airhand\'s menu bar menu on that Mac</string>
+    <string name="notice_windows_to_go">The other computer\'s Windows is marked as Windows To Go, so Windows won\'t let apps use the graphics card to encode: the picture is software-encoded, with a low frame rate. If it doesn\'t boot from a USB drive (setup tools and cloned systems often leave this mark), set PortableOperatingSystem under HKLM\\SYSTEM\\CurrentControlSet\\Control to 0 in its registry, then restart it</string>
     <string name="notice_mac_no_screen">The other Mac hasn\'t allowed Airhand “Screen &amp; System Audio Recording”: no picture and no sound</string>
 
     <!-- Problems (types, see problem.rs in Rust) -->

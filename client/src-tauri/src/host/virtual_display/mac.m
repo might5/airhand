@@ -6,6 +6,7 @@
 #import <Foundation/Foundation.h>
 #include <math.h>
 #include <stdio.h>
+#include <unistd.h>
 
 @interface CGVirtualDisplayDescriptor : NSObject
 @property(retain, nonatomic) dispatch_queue_t queue;
@@ -208,6 +209,93 @@ double ah_vd_set_refresh_rate(void *display, uint32_t width, uint32_t height, in
 void ah_vd_destroy(void *display) {
     @autoreleasepool {
         (void)CFBridgingRelease(display);
+    }
+}
+
+// The current mode of `display`: its size in points and in pixels (`out`: width, height, pixel width, pixel height).
+// Returns 0 if it can't be read. The process that created a virtual display can't read (or set) its mode, other
+// processes can (see mac.rs).
+int ah_vd_mode(uint32_t display, uint32_t out[4]) {
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display);
+    if (!mode) return 0;
+    out[0] = (uint32_t)CGDisplayModeGetWidth(mode);
+    out[1] = (uint32_t)CGDisplayModeGetHeight(mode);
+    out[2] = (uint32_t)CGDisplayModeGetPixelWidth(mode);
+    out[3] = (uint32_t)CGDisplayModeGetPixelHeight(mode);
+    CGDisplayModeRelease(mode);
+    return 1;
+}
+
+// How long a detour mode stays before switching to the wanted one (see ah_vd_set_mode; 50 ms was enough in testing)
+static const useconds_t DETOUR_WAIT_US = 100000;
+
+// Switch `display` to `mode`, remembered by macOS or for this login session only (`option`). Returns a CGError.
+static CGError configure_mode(uint32_t display, CGDisplayModeRef mode, CGConfigureOption option) {
+    CGDisplayConfigRef config;
+    CGError error = CGBeginDisplayConfiguration(&config);
+    if (error) return error;
+    error = CGConfigureDisplayWithDisplayMode(config, display, mode, NULL);
+    if (error) {
+        CGCancelDisplayConfiguration(config);
+        return error;
+    }
+    return CGCompleteDisplayConfiguration(config, option);
+}
+
+// `mode` is `width` x `height` points
+static int has_points(CGDisplayModeRef mode, uint32_t width, uint32_t height) {
+    return CGDisplayModeGetWidth(mode) == width && CGDisplayModeGetHeight(mode) == height;
+}
+
+// `mode` is `width` x `height` points and `pixel_width` x `pixel_height` pixels
+static int is_mode(CGDisplayModeRef mode, uint32_t width, uint32_t height, uint32_t pixel_width,
+                   uint32_t pixel_height) {
+    return has_points(mode, width, height) && CGDisplayModeGetPixelWidth(mode) == pixel_width &&
+           CGDisplayModeGetPixelHeight(mode) == pixel_height;
+}
+
+// Switch `display` to its mode of `width` x `height` points and `pixel_width` x `pixel_height` pixels (the low
+// resolution twins of HiDPI modes included), remembered by macOS: the next time this display is in the same set of
+// displays, macOS picks this mode again. Returns a CGError, kCGErrorIllegalArgument if there's no such mode.
+//
+// WindowServer may skip the switch. Issue #40 (macOS 15.6): the virtual display, taken out of the mirror set when the
+// lid closed, was put in its mode 0 (800x520 1x; the mode remembered for leaving the mirror set was an invalid 1x1),
+// while WindowServer still had the wanted mode down as the current one, so switching to it was "desired mode change
+// 9 -> 9", "No change between prior and requested configuration". So if the display isn't in the wanted mode
+// afterwards, it goes through another mode first (for this login session only), then to the wanted one: one of the
+// same size in points (the 1x twin of a HiDPI mode or the other way round: windows stay where they are; this is what
+// fixed it on that Mac), or else the mode it's actually in (nothing changes on the screen). Never a mode of another
+// size: macOS would squeeze the windows into it and leave them like that.
+int ah_vd_set_mode(uint32_t display, uint32_t width, uint32_t height, uint32_t pixel_width, uint32_t pixel_height) {
+    @autoreleasepool {
+        NSDictionary *options = @{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes : @YES};
+        CFArrayRef modes = CGDisplayCopyAllDisplayModes(display, (__bridge CFDictionaryRef)options);
+        if (!modes) return kCGErrorIllegalArgument;
+        CGDisplayModeRef wanted = NULL, twin = NULL;
+        for (CFIndex i = 0; i < CFArrayGetCount(modes); i++) {
+            CGDisplayModeRef mode = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+            if (!CGDisplayModeIsUsableForDesktopGUI(mode)) continue;
+            if (is_mode(mode, width, height, pixel_width, pixel_height)) {
+                if (!wanted) wanted = mode;
+            } else if (!twin && has_points(mode, width, height)) {
+                twin = mode;
+            }
+        }
+        CGError error = kCGErrorIllegalArgument;
+        if (wanted) {
+            error = configure_mode(display, wanted, kCGConfigurePermanently);
+            CGDisplayModeRef now = error ? NULL : CGDisplayCopyDisplayMode(display);
+            if (now && !is_mode(now, width, height, pixel_width, pixel_height)) {
+                error = configure_mode(display, twin ? twin : now, kCGConfigureForSession);
+                if (!error) {
+                    usleep(DETOUR_WAIT_US);
+                    error = configure_mode(display, wanted, kCGConfigurePermanently);
+                }
+            }
+            if (now) CGDisplayModeRelease(now);
+        }
+        CFRelease(modes);
+        return error;
     }
 }
 

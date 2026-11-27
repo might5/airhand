@@ -2,6 +2,7 @@ package app.airhand.android.ui.session
 
 import app.airhand.android.controller.Input
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -16,7 +17,7 @@ import kotlin.math.min
  * * 单击 = 左键单击；双击 = 双击
  * * 长按 = 右键
  * * 点一下再按住拖动（双击不松开）= 按住左键拖动（选文字、拖窗口）
- * * 双指点击 = 右键；双指拖动 = 滚动（松手后惯性滚动）
+ * * 双指点击 = 右键；双指拖动 = 滚动（速度、松手后的惯性见 [touchScrollPercent]、[touchScrollFling]）
  * * 双指捏合 = 放大画面（放大后画面跟着指针走）
  *
  * **触屏**（电脑也可以选）：点哪里就是哪里
@@ -40,7 +41,12 @@ import kotlin.math.min
  * 快速点一下照样是左键；手指停着不动不算长按、慢慢松开也不算点击（转视角时拇指常常搭在屏幕上不动，
  * 不能因此开镜或者开枪）。被控端显示着光标时（游戏菜单）和平时一样操作
  */
-class Gestures(private val out: Out, private val timers: Timers, private val slop: Float) {
+class Gestures(
+    private val out: Out,
+    private val timers: Timers,
+    private val slop: Float,
+    private val density: Float = 1f,
+) {
 
     interface Out {
         /** 视图坐标 → 远端归一化坐标（0..1）；还没有画面时返回 null */
@@ -85,6 +91,16 @@ class Gestures(private val out: Out, private val timers: Timers, private val slo
 
     /** 转视角的灵敏度（见类的说明）；null 表示没开游戏按键 */
     var lookGain: Float? = null
+
+    /** 双指滚动的速度：百分比，100 是每 dp [WHEEL_PER_DP]，再大也不超过每像素 [WHEEL_PER_PX_MAX]（见 [maxScrollPercent]） */
+    var touchScrollPercent = 100
+
+    /** 双指滚动松手后接着滚一会儿（惯性）；关掉时正在滚的马上停 */
+    var touchScrollFling = false
+        set(v) {
+            field = v
+            if (!v) stopFling()
+        }
 
     /** 按着左键拖动着（触屏拖动、触控板的"点一下再按住拖动"） */
     val pressing: Boolean
@@ -376,9 +392,11 @@ class Gestures(private val out: Out, private val timers: Timers, private val slo
         val dt = max(1L, t - lastT)
         when (twoKind) {
             1 -> {
-                // 自然滚动：内容跟着手指走。手指往下 = 往上滚（滚轮为正）
-                wheelAccY += dy * WHEEL_PER_PX
-                wheelAccX -= dx * WHEEL_PER_PX
+                // 自然滚动：内容跟着手指走。手指往下 = 往上滚（滚轮为正）。
+                // 按屏幕密度（dp）归一化后再乘用户速度百分比，避免高分屏（3x DPI）下双指滑太快
+                val scale = wheelScale()
+                wheelAccY += dy * scale
+                wheelAccX -= dx * scale
                 flushWheel()
                 velX = 0.6f * velX + 0.4f * (dx / dt)
                 velY = 0.6f * velY + 0.4f * (dy / dt)
@@ -483,6 +501,7 @@ class Gestures(private val out: Out, private val timers: Timers, private val slo
     }
 
     fun cancel() {
+        stopFling()
         looking = false
         for (id in touchIds.keys.toList()) touchUp(P(id, touchPos[id]?.first ?: 0f, touchPos[id]?.second ?: 0f), CANCEL)
         timers.cancel(longTimer)
@@ -517,18 +536,25 @@ class Gestures(private val out: Out, private val timers: Timers, private val slo
 
     // ───────────── 惯性滚动 ─────────────
 
+    /** 双指滚动：移动一个像素对应多少滚轮单位 */
+    private fun wheelScale(): Float =
+        min(WHEEL_PER_DP / density.coerceAtLeast(1f) * (touchScrollPercent / 100f), WHEEL_PER_PX_MAX)
+
     private fun startFling() {
-        if (hypot(velX, velY) < FLING_MIN) return
+        if (!touchScrollFling) return
+        val d = density.coerceAtLeast(1f)
+        if (hypot(velX, velY) / d < FLING_MIN_DP) return
         val tick = object : () -> Unit {
             override fun invoke() {
                 velX *= FLING_DECAY
                 velY *= FLING_DECAY
-                if (hypot(velX, velY) < FLING_STOP) {
+                if (!touchScrollFling || hypot(velX, velY) / d < FLING_STOP_DP) {
                     flingTimer = null
                     return
                 }
-                wheelAccY += velY * FRAME_MS * WHEEL_PER_PX
-                wheelAccX -= velX * FRAME_MS * WHEEL_PER_PX
+                val scale = wheelScale()
+                wheelAccY += velY * FRAME_MS * scale
+                wheelAccX -= velX * FRAME_MS * scale
                 flushWheel()
                 flingTimer = timers.after(FRAME_MS.toLong(), this)
             }
@@ -565,12 +591,25 @@ class Gestures(private val out: Out, private val timers: Timers, private val slo
         const val THREE_TAP_MS = 400L
         const val PASSTHROUGH_DELAY_MS = 60L
 
-        /** 双指滚动：每像素多少滚轮单位（120 = 一格，约 40 像素一格） */
-        const val WHEEL_PER_PX = 3f
+        /** 双指滚动：每 dp 多少滚轮单位（120 = 一格，约 80 dp 滑动一格），再乘 [touchScrollPercent] */
+        const val WHEEL_PER_DP = 1.5f
+
+        /** 双指滚动最快：每像素 3（约 40 px 一格），按 dp 换算之前就是这么快 */
+        const val WHEEL_PER_PX_MAX = 3f
+
+        /**
+         * 屏幕密度是 [density] 的这台，[touchScrollPercent] 设到多少就到 [WHEEL_PER_PX_MAX] 了（往上取到 [step] 的整数倍）：
+         * 设置里双指滚动速度的上限。例如密度 3 的手机是 600%
+         */
+        fun maxScrollPercent(density: Float, step: Int): Int {
+            val exact = WHEEL_PER_PX_MAX * density.coerceAtLeast(1f) / WHEEL_PER_DP * 100f
+            // 去掉浮点误差，不然 525 可能算成 530
+            return ceil(exact / step - 1e-3f).toInt() * step
+        }
         private const val FRAME_MS = 16f
-        private const val FLING_MIN = 0.6f
-        private const val FLING_STOP = 0.05f
-        private const val FLING_DECAY = 0.93f
+        private const val FLING_MIN_DP = 0.45f
+        private const val FLING_STOP_DP = 0.04f
+        private const val FLING_DECAY = 0.90f
 
         /** 指针加速：慢慢移动时精细（0.7×），快速划过时更远（最多 2.4×） */
         fun accel(pxPerMs: Float): Float = min(2.4f, max(0.7f, 0.7f + (pxPerMs - 0.2f) * 0.9f))

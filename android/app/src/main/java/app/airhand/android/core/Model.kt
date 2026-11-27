@@ -158,11 +158,19 @@ enum class SystemAction(val wire: String) {
 
 data class EncoderInfo(val codec: Codec, val name: String, val hardware: Boolean, val width: Int, val height: Int)
 
-/** 被控端发来的提示（`NoticeView`） */
-data class Notice(val kind: String, val detail: String? = null, val screen: Boolean = false, val input: Boolean = false)
+/** 被控端发来的提示（`NoticeView`）。`active`：`awdl` 的（对方 Mac 走 Wi-Fi、AWDL 开着；false 是撤下） */
+data class Notice(
+    val kind: String,
+    val detail: String? = null,
+    val screen: Boolean = false,
+    val input: Boolean = false,
+    val active: Boolean = false,
+)
 
 /**
  * `direct`：画面是从直连来的（两台设备之间打通的路，不经过服务器），否则经过中转。
+ * `jitterMs`：往返时延前后两次相差多少（平滑过），还没量过两次时为 null；
+ * `stallPct`：最近收到的画面里受丢包影响的占百分之几（等重传卡住过的，或者收到了却解不了、跳过的）。
  */
 data class Stats(
     val fps: Float,
@@ -171,6 +179,16 @@ data class Stats(
     val width: Int,
     val height: Int,
     val direct: Boolean,
+    val jitterMs: Float?,
+    val stallPct: Float,
+)
+
+/** 本机的视频解码器（画面上方的状态信息用）：`hardware` 是不是硬件解码；`decodeMs` 一帧解码要多久（平滑过），还没解出来时为 null */
+data class DecoderStats(
+    val codec: Codec,
+    val name: String,
+    val hardware: Boolean,
+    val decodeMs: Float?,
 )
 
 /**

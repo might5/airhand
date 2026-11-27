@@ -62,6 +62,7 @@ import app.airhand.android.core.OsKind
 import app.airhand.android.core.ServerState
 import app.airhand.android.ui.theme.Brand
 import app.airhand.android.ui.theme.Mono
+import kotlin.math.roundToInt
 
 /** 应用标志：渐变圆角方块 + 光标 */
 @Composable
@@ -126,6 +127,9 @@ fun ServerPill(state: ServerState, onClick: (() -> Unit)? = null) {
         }
     }
 }
+
+/** 百分比滑块的值：按 [step] 取整，限制在 [min]..[max] */
+fun snapPercent(raw: Float, min: Int, max: Int, step: Int): Int = ((raw / step).roundToInt() * step).coerceIn(min, max)
 
 @Composable
 fun SectionTitle(text: String, modifier: Modifier = Modifier) {
@@ -226,7 +230,6 @@ fun EditTextDialog(
     var text by remember { mutableStateOf(TextFieldValue(initial, TextRange(initial.length))) }
     val error = validate(text.text)
     val focus = remember { FocusRequester() }
-    LaunchedEffect(Unit) { focus.requestFocus() }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
@@ -245,6 +248,11 @@ fun EditTextDialog(
                     modifier = Modifier.fillMaxWidth().focusRequester(focus),
                 )
             }
+            // 打开时让输入框拿到焦点（弹出键盘）。要放在对话框自己的内容里：对话框是另一个窗口，它的内容挂上之前
+            // focus 还没有对应的输入框，在外面请求的话 Compose 1.7 直接抛 IllegalStateException
+            // （FocusRequester is not initialized），应用闪退。标准 Android 上对话框的窗口一般赶在前面挂上，
+            // 别的系统上不一定（怀疑是第一次连接、弹出配对码对话框时偶尔闪退的原因）
+            LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
         },
         confirmButton = {
             TextButton(onClick = { onSave(text.text) }, enabled = error == null) { Text(stringResource(R.string.save)) }
